@@ -93,7 +93,59 @@ VERB_REGISTRY: tuple[VerbSpec, ...] = (
         pattern=r"^status\s*$",
         handler="status",
     ),
+    # Tier 2 verbs: queued, single-approval. The handler runs after the
+    # principal replies "yes" / "approve" / "go" with the matching token.
+    VerbSpec(
+        name="block",
+        tier=2,
+        pattern=r"^block\s+(?P<contact>\S+)\s*$",
+        handler="block",
+    ),
+    VerbSpec(
+        name="unblock",
+        tier=2,
+        pattern=r"^unblock\s+(?P<contact>\S+)\s*$",
+        handler="unblock",
+    ),
+    VerbSpec(
+        name="forget",
+        tier=2,
+        pattern=r"^forget\s+(?P<contact>\S+)\s*$",
+        handler="forget",
+    ),
+    # Tier 4 verbs: queued, double-confirm. The principal must reply
+    # "YES IRREVERSIBLE" (uppercase, exact phrase) with the matching
+    # token. add and remove rewrite nightjar.conf, which is an
+    # authentication-surface change, so they sit at tier 4 by code.
+    VerbSpec(
+        name="add",
+        tier=4,
+        # Email is the args. We accept anything with an @ and a dot to
+        # let the executor do the strict parse, since RFC 5322 is wide.
+        pattern=r"^add\s+(?P<email>\S+@\S+\.\S+)\s*$",
+        handler="add",
+    ),
+    VerbSpec(
+        name="remove",
+        tier=4,
+        pattern=r"^remove\s+(?P<contact>\S+)\s*$",
+        handler="remove",
+    ),
 )
+
+
+# Approval verdict words. The principal types these as the entire
+# subject (after the [123456] prefix) when responding to a [Nightjar
+# #abc123] approval ping. Strict matching: any decoration around the
+# word, or any extra trailing words, classifies as a free-form reply
+# instead of a verdict. This prevents accidental approval from a
+# principal who quoted the previous email's body.
+_APPROVE_WORDS = ("yes", "approve", "go")
+_DENY_WORDS = ("no", "deny", "stop")
+# Tier-4 double-confirm phrase. UPPERCASE EXACT, no leading code is
+# stripped before this match (so the strict-uppercase test catches
+# sloppy approvals).
+_TIER4_CONFIRM = "YES IRREVERSIBLE"
 
 
 # Approval-token subjects look like:  re: [Nightjar #a4f2c1] approval needed
@@ -121,7 +173,14 @@ class ParsedCommand:
 
     Exactly one classification is populated:
       - verb + tier + args: a recognised tier-1+ verb
-      - approval_token: a reply to a pending approval ping
+      - approval_token + approval_verdict: a reply to a pending
+        approval ping. verdict is one of APPROVE, DENY, IRREVERSIBLE,
+        UNCLEAR (token recognised but the verdict word didn't match).
+      - interpret_choice: the principal replied to a free-form
+        clarification with "yes interpret" or "no". Surfaces as
+        INTERPRET, NO_INTERPRET, or None. Mutually exclusive with
+        verb / approval_token because they live in different reply
+        threads.
       - is_free_form=True: anything else, deferred to the LLM gate
     """
     raw_subject: str
@@ -129,6 +188,8 @@ class ParsedCommand:
     tier: int | None = None
     args: dict[str, str] = field(default_factory=dict)
     approval_token: str | None = None
+    approval_verdict: str | None = None  # APPROVE | DENY | IRREVERSIBLE | UNCLEAR
+    interpret_choice: str | None = None  # INTERPRET | NO_INTERPRET
     is_free_form: bool = False
     handler: str | None = None
     # The subject after stripping the code prefix and "Nightjar," lead-in.
@@ -159,9 +220,22 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
 
     token_match = _APPROVAL_TOKEN_RE.search(no_reply_prefix)
     if token_match:
+        # Verdict-word extraction: the principal's verdict is the rest of
+        # the subject after the [Nightjar #token] tag is stripped, plus
+        # any leading [123456] code. We classify into APPROVE / DENY /
+        # IRREVERSIBLE / UNCLEAR. UNCLEAR is preserved (rather than
+        # falling back to free-form) because the resolver needs to email
+        # the principal a "your reply didn't parse" hint instead of the
+        # generic free-form prompt.
+        token = token_match.group("token").lower()
+        # Remove the [Nightjar #token] tag, then strip leading code.
+        leftover = _APPROVAL_TOKEN_RE.sub("", no_reply_prefix, count=1)
+        leftover = _LEADING_CODE_RE.sub("", leftover).strip()
+        verdict = _classify_verdict(leftover)
         return ParsedCommand(
             raw_subject=raw,
-            approval_token=token_match.group("token").lower(),
+            approval_token=token,
+            approval_verdict=verdict,
             payload=no_reply_prefix.strip(),
         )
 
@@ -173,7 +247,25 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
     if not payload:
         return ParsedCommand(raw_subject=raw, is_free_form=True, payload="")
 
+    # Free-form clarification reply: "yes interpret" or "no" arrives as
+    # the entire post-code subject after the principal replies to the
+    # interpret-with-LLM prompt. We catch these BEFORE the verb registry
+    # because "no" would otherwise hit the free-form fallback. Strict
+    # match: trailing decoration disqualifies, same as verbs.
     lowered = payload.lower()
+    if lowered == "yes interpret":
+        return ParsedCommand(
+            raw_subject=raw,
+            interpret_choice="INTERPRET",
+            payload=payload,
+        )
+    if lowered == "no":
+        return ParsedCommand(
+            raw_subject=raw,
+            interpret_choice="NO_INTERPRET",
+            payload=payload,
+        )
+
     for spec in VERB_REGISTRY:
         m = re.match(spec.pattern, lowered, re.IGNORECASE)
         if m:
@@ -190,6 +282,31 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
     return ParsedCommand(raw_subject=raw, is_free_form=True, payload=payload)
 
 
+def _classify_verdict(leftover: str) -> str:
+    """Classify the post-token text of an approval reply.
+
+    Returns one of APPROVE, DENY, IRREVERSIBLE, UNCLEAR. The leftover
+    has already had Re:, the [Nightjar #token] tag, and the [123456]
+    code stripped, so what remains should be just the verdict word.
+
+    Strict match: extra trailing words make it UNCLEAR. The principal
+    might think "yes please" is approval, but we want explicit single
+    verdict words to keep the audit trail clean.
+    """
+    if not leftover:
+        return "UNCLEAR"
+    # Tier-4 confirm is case-sensitive on purpose; lowercase "yes
+    # irreversible" must NOT pass.
+    if leftover == _TIER4_CONFIRM:
+        return "IRREVERSIBLE"
+    word = leftover.lower()
+    if word in _APPROVE_WORDS:
+        return "APPROVE"
+    if word in _DENY_WORDS:
+        return "DENY"
+    return "UNCLEAR"
+
+
 def describe_grammar() -> str:
     """Operator-facing reference. Used in the 'didn't recognise this' reply.
 
@@ -203,9 +320,14 @@ def describe_grammar() -> str:
     by_tier: dict[int, list[VerbSpec]] = {}
     for spec in VERB_REGISTRY:
         by_tier.setdefault(spec.tier, []).append(spec)
+    tier_label = {
+        1: "Tier 1 (auto-execute):",
+        2: "Tier 2 (single approval):",
+        4: "Tier 4 (double-confirm: reply YES IRREVERSIBLE):",
+    }
     lines = ["Subject format: [code] <verb>", ""]
     for tier in sorted(by_tier):
-        lines.append(f"Tier {tier} (auto-execute):" if tier == 1 else f"Tier {tier}:")
+        lines.append(tier_label.get(tier, f"Tier {tier}:"))
         for spec in by_tier[tier]:
             lines.append(f"  - {spec.name}")
     return "\n".join(lines)
