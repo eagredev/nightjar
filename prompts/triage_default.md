@@ -59,7 +59,17 @@ Exactly one call to `draft_plan` with these fields:
   schema below.
 
 - **reasoning** (string, 1-3 sentences): why you chose this verb and
-  these args. Speak to the principal, not the contact.
+  these args. Speak to the principal, not the contact. Ground every
+  sentence in something the email actually says or in the contact's
+  stated relationship. Do not generate threat narratives, security
+  speculation, or "this could leak / this might suggest" framing
+  unless `prompt_injection_attempted` or `identity_claim` is in your
+  risk_flags. Routine questions from known collaborators (project
+  status, file requests, schedule queries, line counts, how things
+  are going) are not security probes. If you find yourself
+  speculating about what the contact "might know" or "could be
+  trying to find out," delete that sentence and stick to what the
+  email plainly asks.
 
 - **risk_flags** (array of strings, possibly empty): tag any of the
   following that apply. The daemon shows these to the principal in

@@ -47,6 +47,7 @@ def make_config(tmp_path: Path) -> Config:
         imap_user="bot@example.com",
         imap_password="secret",
         allowed_contacts=("principal", "composer"),
+        trusted_authserv="mx.google.com",
     )
     security = SecurityConfig(
         totp_secret="JBSWY3DPEHPK3PXP",
@@ -218,6 +219,7 @@ def write_baseline_conf(tmp_path: Path) -> Path:
         imap_port = 993
         imap_user = bot@example.com
         imap_password = secret
+        trusted_authserv = mx.google.com
         allowed_contacts = principal, composer
         """).lstrip(),
         encoding="utf-8",
@@ -375,7 +377,7 @@ def test_unknown_verb_returns_error(tmp_path: Path) -> None:
 def test_executor_catches_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """If a verb body raises, the executor surfaces the failure
     rather than crashing the watcher."""
-    def boom(*, args, config, state, now, config_path):
+    def boom(*, args, config, state, now, config_path, jlogger=None):
         raise RuntimeError("simulated boom")
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
@@ -386,3 +388,131 @@ def test_executor_catches_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert result.ok is False
     assert "RuntimeError" in result.summary
     assert "simulated boom" in result.body
+
+
+# ---- reply (tier 3) -------------------------------------------------------
+
+
+class _StubSendResult:
+    """Mimics notifier.SendResult for monkeypatched send_to_contact."""
+    def __init__(self, *, primary_sent=True, audit_sent=True,
+                 audit_queued=False, audit_id=None, error=None):
+        self.primary_message_id = "<stub@example.com>"
+        self.primary_sent = primary_sent
+        self.audit_sent = audit_sent
+        self.audit_queued = audit_queued
+        self.audit_id = audit_id
+        self.error = error
+
+
+def test_reply_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    captured: dict = {}
+
+    def fake_send(*, smtp, state, principal_addr, contact_addr, subject, related_message_id=None,
+                  body, jlogger=None, in_reply_to=None, references=None,
+                  approval_token=None):
+        captured.update(dict(
+            principal=principal_addr, contact=contact_addr,
+            subject=subject, body=body, in_reply_to=in_reply_to,
+        ))
+        return _StubSendResult()
+
+    monkeypatch.setattr(executor.notifier, "send_to_contact", fake_send)
+    result = executor.execute(
+        verb="reply",
+        args={
+            "contact_id": "composer",
+            "body": "Thanks, I'll follow up shortly.",
+            "subject": "Re: track ready?",
+            "in_reply_to": "<orig@composer.test>",
+        },
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is True
+    assert "replied to 'composer'" in result.summary
+    assert captured["contact"] == "composer@example.com"
+    assert captured["principal"] == "me@example.com"
+    assert captured["subject"] == "Re: track ready?"
+    assert captured["body"].startswith("Thanks")
+    assert captured["in_reply_to"] == "<orig@composer.test>"
+
+
+def test_reply_rejects_missing_contact_id(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="reply", args={"body": "hi"},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "missing 'contact_id'" in result.summary
+
+
+def test_reply_rejects_empty_body(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="reply",
+        args={"contact_id": "composer", "body": "   "},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "missing or empty" in result.summary
+
+
+def test_reply_rejects_unknown_contact(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="reply",
+        args={"contact_id": "ghost", "body": "hi"},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "no contact 'ghost'" in result.summary
+
+
+def test_reply_reports_send_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+
+    def fake_send(*, smtp, state, principal_addr, contact_addr, subject, related_message_id=None,
+                  body, jlogger=None, in_reply_to=None, references=None,
+                  approval_token=None):
+        return _StubSendResult(
+            primary_sent=False, audit_sent=False,
+            error="SMTPRecipientsRefused: no such mailbox",
+        )
+
+    monkeypatch.setattr(executor.notifier, "send_to_contact", fake_send)
+    result = executor.execute(
+        verb="reply",
+        args={"contact_id": "composer", "body": "hi", "subject": "s"},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "send to 'composer' failed" in result.summary
+    assert "SMTPRecipientsRefused" in result.body
+
+
+def test_reply_warns_when_audit_failed_but_primary_sent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+
+    def fake_send(*, smtp, state, principal_addr, contact_addr, subject, related_message_id=None,
+                  body, jlogger=None, in_reply_to=None, references=None,
+                  approval_token=None):
+        return _StubSendResult(primary_sent=True, audit_sent=False, audit_queued=True, audit_id=42)
+
+    monkeypatch.setattr(executor.notifier, "send_to_contact", fake_send)
+    result = executor.execute(
+        verb="reply",
+        args={"contact_id": "composer", "body": "hi", "subject": "s"},
+        config=cfg, state=s, now=1,
+    )
+    # Primary sent ok, so this is reported as ok=True with a note in
+    # the body about the audit-copy gap.
+    assert result.ok is True
+    assert "audit copy did NOT reach" in result.body

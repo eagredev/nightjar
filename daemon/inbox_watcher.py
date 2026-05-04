@@ -25,13 +25,23 @@ import random
 import secrets
 import time
 from email.header import decode_header, make_header
+from pathlib import Path
 
 from aioimaplib import aioimaplib
 
-from . import auth, executor, notifier, principal_commands, principal_handlers
+from . import auth, dmarc, executor, notifier, principal_commands, principal_handlers, triage
 from .config import InboxConfig, Config
+from .dmarc import (
+    DMARC_FAIL,
+    DMARC_MISSING,
+    DMARC_NONE,
+    DMARC_NO_TRUSTED_HEADER,
+    DMARC_PASS,
+    DMARC_TEMPERROR,
+)
 from .log import JSONLLogger
 from .state import State
+from .triage import TriageError, TriagePlan
 
 
 # Token format for approval pings. Hex, 8 chars, generated from
@@ -48,6 +58,25 @@ IDLE_REFRESH_SECONDS = 27 * 60
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 300.0
 
+# Max plaintext body bytes the watcher will hand to triage. Anything
+# longer is truncated and a "body_truncated" flag is added to the plan's
+# notes. 32 KiB is well above a normal email and below the prompt-token
+# budget per call: ~8000 input tokens budgeted, ~4 chars per token, so
+# ~32 KiB is the natural ceiling.
+MAX_TRIAGE_BODY_BYTES = 32 * 1024
+
+# Directory holding common.md and triage_default.md. Resolved relative
+# to this module so the daemon doesn't depend on the cwd at start time.
+# nightjar/daemon/inbox_watcher.py -> nightjar/prompts/.
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+# Rate-limit window for the in-daemon spend cap. The first line of cost
+# defence is the Anthropic console's monthly cap; this is the second:
+# even if a single daemon goes haywire (loop, bad state machine), it
+# cannot burn more than [claude].per_hour_max_invocations calls in any
+# rolling hour. 1 hour matches DESIGN.md's cost model.
+RATE_LIMIT_WINDOW_SECONDS = 3600
+
 
 class InboxWatcher:
     def __init__(
@@ -58,6 +87,7 @@ class InboxWatcher:
         state: State,
         logger: JSONLLogger,
         on_panic: "callable | None" = None,
+        claude_client: "object | None" = None,
     ) -> None:
         self.inbox = inbox
         self.config = config
@@ -68,6 +98,12 @@ class InboxWatcher:
         # Called with (reason: str) when the dead-man's-switch trips.
         # main.py uses this to trigger a clean daemon shutdown.
         self._on_panic = on_panic
+        # Anthropic Messages API client for contact-mail triage. None
+        # when [claude] is missing from config or when triage is
+        # otherwise disabled. The watcher checks this BEFORE issuing a
+        # body fetch so an unconfigured daemon doesn't waste a round
+        # trip pulling bodies it can't triage.
+        self._claude_client = claude_client
 
     async def run(self) -> None:
         """Run forever (until stop() is called or asyncio cancels us)."""
@@ -279,7 +315,44 @@ class InboxWatcher:
 
         panic_trip_reason: str | None = None
 
-        if contact_id is None:
+        # DMARC gate (Step 5b hardening). The trusted authserv stamps an
+        # Authentication-Results header on every message it accepts. We
+        # require dmarc=pass before any inbound contact path runs, so an
+        # attacker who spoofs a known contact's address cannot reach
+        # triage with attacker-controlled content. Per operator decision
+        # (2026-05-04), dmarc=none / missing / temperror / no_trusted_header
+        # are ALL treated as adversarial: the alternative (trust senders
+        # whose domain doesn't publish DMARC) gives spoofers a free pass
+        # for any sender on a non-compliant domain.
+        verdict = dmarc.parse_authentication_results(
+            msg, trusted_authserv=self.inbox.trusted_authserv,
+        )
+        # Cross-check: the verdict applies to the domain in
+        # `header.from=`, but the visible From: header could differ.
+        # An attacker who controls attacker.com can get dmarc=pass for
+        # attacker.com while spoofing a From of composer@hotmail.co.uk.
+        # We require the verdict's domain to match the From header's
+        # domain.
+        from_domain = dmarc.from_header_domain(msg)
+        verdict_domain_matches = (
+            verdict.header_from_domain is not None
+            and from_domain is not None
+            and verdict.header_from_domain == from_domain
+        )
+
+        dmarc_dropped = False
+        dmarc_disposition: str | None = None
+        if not verdict.authenticated:
+            dmarc_dropped = True
+            dmarc_disposition = f"dmarc_{verdict.verdict}"
+        elif not verdict_domain_matches:
+            dmarc_dropped = True
+            dmarc_disposition = "dmarc_from_mismatch"
+
+        if dmarc_dropped:
+            state = "DROPPED"
+            detail = dmarc_disposition
+        elif contact_id is None:
             state = "DROPPED"
             detail = "stranger"
         else:
@@ -332,6 +405,22 @@ class InboxWatcher:
                 disposition=detail,
                 subject_preview=(subject or "")[:80],
             )
+            # Impersonation alert: if DMARC dropped the message AND the
+            # claimed sender matches one of our known contacts (or the
+            # principal), the principal should know someone tried to
+            # spoof them. Silent on stranger spoofing because spam is
+            # high-volume and would drown the principal in pings.
+            if (
+                dmarc_dropped
+                and contact_id is not None
+            ):
+                self._notify_principal_of_impersonation(
+                    message_id=message_id,
+                    from_addr=from_addr,
+                    contact_id=contact_id,
+                    subject=subject,
+                    verdict=verdict,
+                )
 
         # Step 4a: post-auth dispatch for authenticated principal mail.
         # We only run dispatch when auth succeeded (state == RECEIVED on
@@ -344,6 +433,28 @@ class InboxWatcher:
         ):
             self._dispatch_principal_command(
                 message_id=message_id, subject=subject, from_addr=from_addr
+            )
+
+        # Step 5b: triage for non-principal contact mail. Only runs when
+        # the contact-mail branch produced RECEIVED (i.e. allowlisted,
+        # not blocked, not the principal) AND the daemon has a Claude
+        # client configured. Strangers, blocked contacts, and principals
+        # all bypass this branch.
+        if (
+            inserted
+            and state == "RECEIVED"
+            and contact_id is not None
+            and not self.config.contacts[contact_id].is_principal
+        ):
+            await self._handle_contact_triage(
+                client=client,
+                uid=uid,
+                message_id=message_id,
+                contact_id=contact_id,
+                from_addr=from_addr,
+                from_header=from_header,
+                subject=subject,
+                date_header=msg.get("Date", ""),
             )
 
         if panic_trip_reason is not None:
@@ -907,7 +1018,7 @@ class InboxWatcher:
                 principal_addr=from_addr,
                 subject=subject,
                 body=body,
-                jlogger=self.logger,
+                jlogger=self.logger, state=self.state, related_message_id=message_id,
                 in_reply_to=message_id,
             )
         except Exception as e:
@@ -1000,3 +1111,629 @@ class InboxWatcher:
             return str(make_header(decode_header(value)))
         except Exception:
             return value
+
+    async def _handle_contact_triage(
+        self,
+        *,
+        client: aioimaplib.IMAP4_SSL,
+        uid: str,
+        message_id: str,
+        contact_id: str,
+        from_addr: str,
+        from_header: str,
+        subject: str | None,
+        date_header: str,
+    ) -> None:
+        """Run a triage call on contact mail, queue an approval if a
+        plan came back, transition the message accordingly.
+
+        Outcomes (with the message state transition recorded for each):
+
+        - No claude_client wired:        RECEIVED -> TRIAGE_SKIPPED
+        - Rate-limit cap hit:            RECEIVED -> TRIAGE_FAILED
+        - Body fetch failed:             RECEIVED -> TRIAGE_FAILED
+        - SDK error:                     RECEIVED -> TRIAGE_FAILED
+        - Plan validation error:         RECEIVED -> TRIAGE_FAILED
+        - Plan with verb=noop:           RECEIVED -> TRIAGED (no approval queued)
+        - Plan with action verb:         RECEIVED -> TRIAGED + approval queued
+
+        Failures ping the principal so they know an email arrived but
+        triage didn't complete; they can act manually if needed.
+        """
+        # 1. Bail early if no client (no [claude] section).
+        if self._claude_client is None:
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="TRIAGE_SKIPPED",
+                detail="no_claude_config",
+            )
+            self.logger.event(
+                "triage_skipped",
+                inbox=self.inbox.name, message_id=message_id,
+                contact_id=contact_id, reason="no_claude_config",
+            )
+            return
+
+        claude_cfg = self.config.claude
+        assert claude_cfg is not None  # client is non-None iff claude config is set
+
+        # 2. Rate limit (in-daemon, second-line defence after console cap).
+        now = int(time.time())
+        recent = self.state.count_claude_invocations_since(
+            since_ts=now - RATE_LIMIT_WINDOW_SECONDS
+        )
+        if recent >= claude_cfg.per_hour_max_invocations:
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="TRIAGE_FAILED",
+                detail="cap_blocked",
+            )
+            self.logger.event(
+                "triage_cap_blocked",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                contact_id=contact_id,
+                recent_invocations=recent,
+                cap=claude_cfg.per_hour_max_invocations,
+            )
+            self._notify_principal_of_triage_problem(
+                message_id=message_id, contact_id=contact_id, from_addr=from_addr,
+                from_header=from_header, subject=subject, date_header=date_header,
+                body_text=None, body_truncated=False,
+                reason="cap_blocked",
+                detail=(
+                    f"Triage cap of {claude_cfg.per_hour_max_invocations}/hour\n"
+                    f"reached. The email is preserved in the inbox; respond\n"
+                    f"manually or wait for the rate window to reopen.\n"
+                ),
+            )
+            return
+
+        # 3. Body fetch (second IMAP round trip, only for triage-eligible mail).
+        body_result = await self._fetch_body_text(client, uid)
+        if body_result is None:
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="TRIAGE_FAILED",
+                detail="body_fetch_failed",
+            )
+            self._notify_principal_of_triage_problem(
+                message_id=message_id, contact_id=contact_id, from_addr=from_addr,
+                from_header=from_header, subject=subject, date_header=date_header,
+                body_text=None, body_truncated=False,
+                reason="body_fetch_failed",
+                detail="Could not extract a plaintext body from the email.\n"
+                       "It may be HTML-only or use an unrecognised encoding.\n",
+            )
+            return
+        body_text, body_truncated = body_result
+
+        # 4. The triage call itself.
+        contact = self.config.contacts[contact_id]
+        plan_or_err = await triage.triage_contact_mail(
+            contact=contact,
+            sender=from_addr,
+            subject=subject or "",
+            body=body_text,
+            config=claude_cfg,
+            client=self._claude_client,
+            prompts_dir=PROMPTS_DIR,
+        )
+
+        # 5. Ledger row regardless of outcome (audit trail, rate counter).
+        if isinstance(plan_or_err, TriagePlan):
+            self.state.record_claude_invocation(
+                purpose="triage",
+                contact_id=contact_id,
+                model=claude_cfg.default_model,
+                input_tokens=plan_or_err.raw_input_tokens,
+                output_tokens=plan_or_err.raw_output_tokens,
+                ok=True,
+                ts=now,
+            )
+        else:
+            self.state.record_claude_invocation(
+                purpose="triage",
+                contact_id=contact_id,
+                model=claude_cfg.default_model,
+                input_tokens=0, output_tokens=0,
+                ok=False,
+                error_reason=plan_or_err.reason,
+                ts=now,
+            )
+
+        # 6. Failure path.
+        if isinstance(plan_or_err, TriageError):
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="TRIAGE_FAILED",
+                detail=plan_or_err.reason,
+            )
+            self.logger.event(
+                "triage_failed",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                contact_id=contact_id,
+                reason=plan_or_err.reason,
+                detail=plan_or_err.detail,
+            )
+            self._notify_principal_of_triage_problem(
+                message_id=message_id, contact_id=contact_id, from_addr=from_addr,
+                from_header=from_header, subject=subject, date_header=date_header,
+                body_text=body_text, body_truncated=body_truncated,
+                reason=plan_or_err.reason,
+                detail=(
+                    f"Triage failed: {plan_or_err.reason}\n"
+                    f"Detail: {plan_or_err.detail}\n"
+                ),
+            )
+            return
+
+        # 7. Success path.
+        plan = plan_or_err
+        self.logger.event(
+            "triage_complete",
+            inbox=self.inbox.name, message_id=message_id,
+            contact_id=contact_id,
+            verb=plan.verb, tier=plan.tier,
+            risk_flags=list(plan.risk_flags),
+            input_tokens=plan.raw_input_tokens,
+            output_tokens=plan.raw_output_tokens,
+        )
+        self.state.transition(
+            message_id=message_id,
+            from_state="RECEIVED",
+            to_state="TRIAGED",
+            detail=f"verb={plan.verb}",
+        )
+
+        # noop / forward / flag don't queue an executor verb. They still
+        # need a human-visible ping so the principal sees the triage
+        # output.
+        if plan.verb in ("noop", "forward_to_principal", "flag_for_review"):
+            self._send_triage_summary_to_principal(
+                message_id=message_id, contact_id=contact_id,
+                from_addr=from_addr, from_header=from_header,
+                subject=subject, date_header=date_header,
+                plan=plan, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+            return
+
+        # `reply` queues an approval. The args carry everything the
+        # tier-3 _exec_reply needs (contact_id, body, subject,
+        # in_reply_to). Subject is built from the inbound subject so
+        # the reply threads correctly.
+        if plan.verb == "reply":
+            reply_subject = self._build_reply_subject(subject)
+            args = {
+                "contact_id": contact_id,
+                "body": plan.args["body"],
+                "subject": reply_subject,
+                "in_reply_to": message_id,
+            }
+            self._queue_triage_approval(
+                message_id=message_id, contact_id=contact_id,
+                from_addr=from_addr, from_header=from_header,
+                subject=subject, date_header=date_header,
+                plan=plan, verb="reply",
+                args=args, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+            return
+
+        # Defensive: unreachable given TRIAGE_VERBS, but if a future
+        # prompt revision adds a verb without wiring it, fail loud.
+        self.logger.event(
+            "triage_unhandled_verb",
+            level="error",
+            inbox=self.inbox.name, message_id=message_id,
+            verb=plan.verb,
+        )
+
+    def _send_triage_summary_to_principal(
+        self,
+        *,
+        message_id: str,
+        contact_id: str,
+        from_addr: str,
+        from_header: str,
+        subject: str | None,
+        date_header: str,
+        plan: TriagePlan,
+        body_text: str | None,
+        body_truncated: bool,
+    ) -> None:
+        """For verbs that don't queue an executor (noop, forward, flag),
+        ping the principal with the triage output so they're not blind
+        to the email. Always appends the verbatim original email so the
+        principal can verify the LLM's reading."""
+        flags_line = (
+            f"Risk flags: {', '.join(plan.risk_flags)}"
+            if plan.risk_flags else "Risk flags: (none)"
+        )
+        notes_line = f"\nNotes from triage:\n  {plan.notes}\n" if plan.notes else ""
+        body = (
+            f"Triage of inbound mail from {contact_id} ({from_addr}).\n"
+            f"\n"
+            f"Verb proposed:    {plan.verb}\n"
+            f"{flags_line}\n"
+            f"\n"
+            f"Summary from triage:\n  {plan.summary}\n"
+            f"\n"
+            f"Reasoning:\n  {plan.reasoning}\n"
+            f"{notes_line}"
+            + self._format_original_email_block(
+                from_header=from_header, subject=subject,
+                date_header=date_header, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+        )
+        send = notifier.notify_principal(
+            smtp=self.config.smtp,
+            principal_addr=self._principal_addr(),
+            subject=f"[Nightjar] triage: {plan.verb} from {contact_id}",
+            body=body,
+            jlogger=self.logger, state=self.state, related_message_id=message_id,
+        )
+        if not send.primary_sent:
+            self.logger.event(
+                "triage_summary_send_failed",
+                level="warn",
+                message_id=message_id, contact_id=contact_id,
+                error=send.error,
+            )
+
+    def _queue_triage_approval(
+        self,
+        *,
+        message_id: str,
+        contact_id: str,
+        from_addr: str,
+        from_header: str,
+        subject: str | None,
+        date_header: str,
+        plan: TriagePlan,
+        verb: str,
+        args: dict,
+        body_text: str | None,
+        body_truncated: bool,
+    ) -> None:
+        """Queue a triage-derived approval row + ping the principal.
+
+        Mirrors `_queue_tier2_plus` but the args come from the LLM,
+        not the deterministic principal-command parser. The approval
+        row is normal; the existing `_resolve_approval_reply` handles
+        principal yes/no. The executor (`_exec_reply`) runs the verb
+        once approved. Appends the verbatim original email at the
+        bottom so the principal can read what the contact actually
+        sent before approving.
+        """
+        token = self._generate_approval_token()
+        self.state.queue_approval(
+            token=token,
+            message_id=message_id,
+            verb=verb,
+            args=args,
+            tier=plan.tier,
+        )
+        flags_line = (
+            f"Risk flags: {', '.join(plan.risk_flags)}\n"
+            if plan.risk_flags else ""
+        )
+        notes_line = f"\nNotes from triage:\n  {plan.notes}\n" if plan.notes else ""
+        confirm_phrase = "yes"  # triage caps at tier 3, single-confirm.
+        approval_body = (
+            f"Triage of inbound mail from {contact_id} ({from_addr}).\n"
+            f"\n"
+            f"Verb proposed:  {verb} (tier {plan.tier})\n"
+            f"Triage summary:\n  {plan.summary}\n"
+            f"\n"
+            f"Reasoning:\n  {plan.reasoning}\n"
+            f"{notes_line}"
+            f"{flags_line}"
+            f"\n"
+            f"Drafted reply (will be sent if approved):\n"
+            f"---\n"
+            f"{args.get('body', '')}\n"
+            f"---\n"
+            f"\n"
+            f"To approve, reply with:\n"
+            f"  Subject: [<code>] [Nightjar #{token}] {confirm_phrase}\n"
+            f"\n"
+            f"To deny, reply with:\n"
+            f"  Subject: [<code>] [Nightjar #{token}] no\n"
+            f"\n"
+            f"Approval expires in 7 days.\n"
+            + self._format_original_email_block(
+                from_header=from_header, subject=subject,
+                date_header=date_header, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+        )
+        send = notifier.notify_principal(
+            smtp=self.config.smtp,
+            principal_addr=self._principal_addr(),
+            subject=f"[Nightjar #{token}] approval needed: {verb} (triage)",
+            body=approval_body,
+            jlogger=self.logger, state=self.state, related_message_id=message_id,
+        )
+        if send.primary_sent:
+            self.state.transition(
+                message_id=message_id,
+                from_state="TRIAGED",
+                to_state="AWAITING_APPROVAL",
+                detail=f"verb={verb} tier={plan.tier} token={token}",
+            )
+            self.logger.event(
+                "triage_approval_queued",
+                inbox=self.inbox.name, message_id=message_id,
+                contact_id=contact_id, verb=verb, tier=plan.tier,
+                token=token,
+            )
+        else:
+            self.logger.event(
+                "triage_approval_send_failed",
+                level="warn",
+                message_id=message_id, contact_id=contact_id,
+                error=send.error,
+            )
+            # Approval row remains queued; if the principal manages
+            # to find the token through the log they can still approve.
+
+    def _notify_principal_of_impersonation(
+        self,
+        *,
+        message_id: str,
+        from_addr: str,
+        contact_id: str,
+        subject: str | None,
+        verdict,
+    ) -> None:
+        """Ping the principal when a DMARC-failing message claimed to
+        come from a known contact (or the principal themselves). This
+        is the impersonation-attempt signal."""
+        is_principal_target = (
+            contact_id in self.config.contacts
+            and self.config.contacts[contact_id].is_principal
+        )
+        target_label = "you (the principal)" if is_principal_target else f"contact '{contact_id}'"
+        body = (
+            f"DMARC verdict failed for inbound mail claiming to come from\n"
+            f"{target_label}.\n"
+            f"\n"
+            f"From header: {from_addr}\n"
+            f"Subject:     {subject or '(no subject)'}\n"
+            f"Verdict:     {verdict.verdict}\n"
+            f"Reason:      {verdict.reason or '(none recorded)'}\n"
+            f"\n"
+            f"The message was DROPPED. No triage ran, no auth was attempted,\n"
+            f"no further action will be taken.\n"
+            f"\n"
+            f"This is the signal that someone has attempted to impersonate\n"
+            f"{target_label} via inbound mail. The trusted authserv\n"
+            f"({self.inbox.trusted_authserv!r}) refused to authenticate the\n"
+            f"sender's domain.\n"
+            f"\n"
+            f"You do NOT need to take action. This is informational so that\n"
+            f"sustained impersonation attempts are visible.\n"
+        )
+        try:
+            send = notifier.notify_principal(
+                smtp=self.config.smtp,
+                principal_addr=self._principal_addr(),
+                subject=f"[Nightjar] DMARC failed for {from_addr}",
+                body=body,
+                jlogger=self.logger, state=self.state, related_message_id=message_id,
+            )
+            if not send.primary_sent:
+                self.logger.event(
+                    "impersonation_notify_failed",
+                    level="warn",
+                    message_id=message_id, error=send.error,
+                )
+        except Exception as e:
+            # Best-effort: never let the notify path break message
+            # processing.
+            self.logger.event(
+                "impersonation_notify_error",
+                level="warn",
+                message_id=message_id, error=type(e).__name__, message=str(e),
+            )
+
+    def _notify_principal_of_triage_problem(
+        self,
+        *,
+        message_id: str,
+        contact_id: str,
+        from_addr: str,
+        from_header: str,
+        subject: str | None,
+        date_header: str,
+        body_text: str | None,
+        body_truncated: bool,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Best-effort principal ping when triage couldn't produce a
+        plan. Failures here are logged but don't escalate further.
+        Appends the verbatim original email when one was available so
+        the principal can decide whether to respond manually."""
+        body = (
+            f"An email arrived from {contact_id} ({from_addr}) but triage\n"
+            f"could not produce a plan.\n\n"
+            f"Reason: {reason}\n\n"
+            f"{detail}\n"
+            f"The original email is still in the inbox. You can reply\n"
+            f"manually or block the contact via Nightjar if appropriate.\n"
+            + self._format_original_email_block(
+                from_header=from_header, subject=subject,
+                date_header=date_header, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+        )
+        send = notifier.notify_principal(
+            smtp=self.config.smtp,
+            principal_addr=self._principal_addr(),
+            subject=f"[Nightjar] triage failed for {contact_id}",
+            body=body,
+            jlogger=self.logger, state=self.state, related_message_id=message_id,
+        )
+        if not send.primary_sent:
+            self.logger.event(
+                "triage_problem_notify_failed",
+                level="warn",
+                message_id=message_id, error=send.error,
+            )
+
+    def _principal_addr(self) -> str:
+        """Resolve the principal's first address. Fails loud if there
+        is no principal — the daemon shouldn't have started."""
+        for c in self.config.contacts.values():
+            if c.is_principal and c.addresses:
+                return c.addresses[0]
+        raise RuntimeError("no principal configured (config validation should have caught this)")
+
+    @staticmethod
+    def _format_original_email_block(
+        *,
+        from_header: str,
+        subject: str | None,
+        date_header: str,
+        body_text: str | None,
+        body_truncated: bool,
+    ) -> str:
+        """Render the verbatim original email for the principal-side
+        audit ping. Goes at the bottom of every triage-related email so
+        the principal can verify the LLM read what was actually there.
+
+        body_text=None covers cases where the body never made it: the
+        block still appears, with a placeholder, so the structure is
+        consistent and the audit log is auditable even on failures.
+        """
+        body_part: str
+        if body_text is None:
+            body_part = "(body was not available to triage)\n"
+        else:
+            body_part = body_text
+            if not body_part.endswith("\n"):
+                body_part += "\n"
+            if body_truncated:
+                body_part += "\n[TRUNCATED at 32 KiB; see raw mail for the rest]\n"
+
+        return (
+            "\n========== ORIGINAL EMAIL ==========\n"
+            f"From:    {from_header or '(missing)'}\n"
+            f"Subject: {subject or '(no subject)'}\n"
+            f"Date:    {date_header or '(missing)'}\n"
+            "----------\n"
+            f"{body_part}"
+            "========== END ORIGINAL ==========\n"
+        )
+
+    @staticmethod
+    def _build_reply_subject(inbound_subject: str | None) -> str:
+        """Build a Re:-prefixed subject for the reply, deduplicating
+        existing Re:/Fwd: prefixes."""
+        s = (inbound_subject or "").strip()
+        if not s:
+            return "Re: (no subject)"
+        # Don't double-prefix Re:.
+        lower = s.lower()
+        if lower.startswith("re:") or lower.startswith("fwd:") or lower.startswith("fw:"):
+            return s
+        return f"Re: {s}"
+
+    async def _fetch_body_text(
+        self, client: aioimaplib.IMAP4_SSL, uid: str
+    ) -> tuple[str, bool] | None:
+        """Fetch the full message for `uid` and return its plaintext body.
+
+        Returns `(body_text, was_truncated)` on success, or None if no
+        usable body could be extracted (multipart with no text part,
+        decode failure, IMAP error). Body is capped at MAX_TRIAGE_BODY_BYTES
+        and `was_truncated` reflects whether the cap fired.
+
+        Body fetch is a SECOND round-trip (after the headers fetch) and
+        is gated on the message being triage-eligible. Strangers,
+        blocked contacts, and principal mail never trigger a body fetch
+        because they don't need triage.
+        """
+        result, data = await client.uid("fetch", uid, "(BODY.PEEK[])")
+        if result != "OK" or not data:
+            self.logger.event(
+                "body_fetch_failed",
+                inbox=self.inbox.name, level="warn", uid=uid, result=result,
+            )
+            return None
+        blob = self._extract_literal(data)
+        if blob is None:
+            self.logger.event(
+                "body_fetch_no_literal",
+                inbox=self.inbox.name, level="warn", uid=uid,
+            )
+            return None
+        try:
+            msg = email.message_from_bytes(blob)
+            text, truncated = self._extract_plain_text(msg)
+        except Exception as e:
+            self.logger.event(
+                "body_decode_failed",
+                inbox=self.inbox.name, level="warn", uid=uid, error=str(e),
+            )
+            return None
+        if text is None:
+            return None
+        return text, truncated
+
+    @staticmethod
+    def _extract_plain_text(msg: email.message.Message) -> tuple[str | None, bool]:
+        """Walk a parsed email and return its plaintext body.
+
+        Strategy: find the first `text/plain` part (or use the message
+        body itself if not multipart). Decode using the part's stated
+        charset, falling back to utf-8 with replacement so a single
+        bad byte doesn't drop the whole body. Cap at
+        MAX_TRIAGE_BODY_BYTES; returns `truncated=True` if we cut.
+
+        Returns (None, False) if no plaintext part is found at all.
+        Multipart/alternative messages where only HTML is present are
+        intentionally rejected: we don't HTML-strip in v1, because
+        getting that wrong is a triage-quality regression and we'd
+        rather drop to TRIAGE_FAILED than feed garbage to the LLM.
+        """
+        chosen: email.message.Message | None = None
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain" and not part.is_multipart():
+                    chosen = part
+                    break
+        else:
+            if msg.get_content_type() == "text/plain":
+                chosen = msg
+
+        if chosen is None:
+            return None, False
+
+        payload = chosen.get_payload(decode=True)
+        if not isinstance(payload, (bytes, bytearray)):
+            return None, False
+
+        charset = chosen.get_content_charset() or "utf-8"
+        try:
+            text = bytes(payload).decode(charset, errors="replace")
+        except (LookupError, TypeError):
+            text = bytes(payload).decode("utf-8", errors="replace")
+
+        truncated = False
+        if len(text.encode("utf-8")) > MAX_TRIAGE_BODY_BYTES:
+            text = text.encode("utf-8")[:MAX_TRIAGE_BODY_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            truncated = True
+
+        return text, truncated

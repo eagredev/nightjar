@@ -28,8 +28,10 @@ from typing import Callable
 
 from . import config as config_module
 from . import config_writer
+from . import notifier
 from .config import Config
 from .config_writer import AddRequest, ConfigWriteError
+from .log import JSONLLogger
 from .state import State
 
 
@@ -55,12 +57,17 @@ def execute(
     state: State,
     now: int | None = None,
     config_path: Path | None = None,
+    jlogger: JSONLLogger | None = None,
 ) -> ExecutionResult:
     """Dispatch one approved verb to its implementation.
 
     `config_path` is only consulted by verbs that mutate nightjar.conf
     (add, remove). It defaults to the live config path. Tests inject a
     tmp path so the live file is never touched.
+
+    `jlogger` is consulted by verbs that send mail (`reply`) so the
+    notifier can record send failures. None is fine for tests; the
+    notifier will skip its own logging in that case.
     """
     fn = _DISPATCH.get(verb)
     if fn is None:
@@ -78,6 +85,7 @@ def execute(
         return fn(
             args=args, config=config, state=state,
             now=now or int(time.time()), config_path=cfg_path,
+            jlogger=jlogger,
         )
     except Exception as e:
         return ExecutionResult(
@@ -96,7 +104,7 @@ def execute(
 # Each takes (args, config, state, now) and returns ExecutionResult.
 
 
-def _exec_block(*, args: dict, config: Config, state: State, now: int, config_path: Path) -> ExecutionResult:
+def _exec_block(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
     """Mark a contact as blocked. Idempotent: blocking an already-
     blocked contact is reported as a no-op rather than a failure."""
     contact_id = args.get("contact")
@@ -139,7 +147,7 @@ def _exec_block(*, args: dict, config: Config, state: State, now: int, config_pa
     )
 
 
-def _exec_unblock(*, args: dict, config: Config, state: State, now: int, config_path: Path) -> ExecutionResult:
+def _exec_unblock(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
     """Lift a contact's block. Reports clearly if the contact wasn't
     blocked in the first place, since 'unblock' on a non-blocked
     contact is almost always a typo."""
@@ -171,7 +179,7 @@ def _exec_unblock(*, args: dict, config: Config, state: State, now: int, config_
     )
 
 
-def _exec_forget(*, args: dict, config: Config, state: State, now: int, config_path: Path) -> ExecutionResult:
+def _exec_forget(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
     """Delete a contact's rapport-notes file.
 
     Notes live at config.daemon.notes_dir / <contact>.md. The notes
@@ -260,7 +268,7 @@ def _pick_inbox_for_add(config: Config) -> str | None:
     return sorted(config.inboxes.keys())[0]
 
 
-def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path: Path) -> ExecutionResult:
+def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
     """Add a new contact: append a [contact:*] block to nightjar.conf,
     extend the inbox's allowed_contacts list, and refresh the in-memory
     Config so the daemon picks up the change without a restart.
@@ -328,7 +336,7 @@ def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path
     )
 
 
-def _exec_remove(*, args: dict, config: Config, state: State, now: int, config_path: Path) -> ExecutionResult:
+def _exec_remove(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
     """Remove a contact: strip its [contact:*] block from nightjar.conf,
     remove it from any allowed_contacts list, and refresh the in-memory
     Config. Refuses to remove the principal."""
@@ -386,10 +394,128 @@ def _exec_remove(*, args: dict, config: Config, state: State, now: int, config_p
     )
 
 
+def _exec_reply(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
+    """Send a triage-drafted reply to a contact.
+
+    This executor is the post-approval terminus of the contact-triage
+    flow. The watcher queued a tier-3 approval with these args:
+      - contact_id: str. Resolved at queue time from the inbound
+        message's sender. We re-resolve it here as a sanity check.
+      - body: str. The plaintext reply the LLM drafted, already
+        validated by daemon.triage. The notifier appends the standard
+        contact footer; we don't add it here.
+      - in_reply_to: str | None. Optional Message-ID for proper
+        threading.
+      - subject: str. The subject line for the reply.
+
+    Sends through `notifier.send_to_contact`, which handles both the
+    primary send and the audit copy. On primary failure we report
+    EXECUTION_FAILED so the principal sees that no mail reached the
+    contact. On audit-only failure we still report ok=True (primary
+    delivered) and the audit retry loop drains the queue.
+    """
+    contact_id = args.get("contact_id")
+    body = args.get("body")
+    subject = args.get("subject", "")
+    in_reply_to = args.get("in_reply_to")
+
+    if not contact_id:
+        return ExecutionResult(
+            ok=False,
+            summary="reply: missing 'contact_id' arg",
+            body="Internal error: 'reply' executor invoked without a contact_id.\n",
+        )
+    if not body or not isinstance(body, str) or not body.strip():
+        return ExecutionResult(
+            ok=False,
+            summary="reply: missing or empty 'body' arg",
+            body="Internal error: 'reply' executor invoked without a body.\n",
+        )
+    if contact_id not in config.contacts:
+        return ExecutionResult(
+            ok=False,
+            summary=f"reply: no contact '{contact_id}'",
+            body=(
+                f"Contact '{contact_id}' is no longer configured. The reply\n"
+                "was approved earlier but the contact has since been\n"
+                "removed. No mail was sent.\n"
+            ),
+        )
+    contact = config.contacts[contact_id]
+    if not contact.addresses:
+        return ExecutionResult(
+            ok=False,
+            summary=f"reply: contact '{contact_id}' has no addresses",
+            body="Internal error: contact has no addresses to reply to.\n",
+        )
+
+    # Reply to the first address (canonical). If the contact has
+    # multiple addresses they're aliases; sending to the canonical one
+    # is the operator-supplied default.
+    contact_addr = contact.addresses[0]
+
+    # Find the principal address for the audit copy.
+    principal = next(
+        (c for c in config.contacts.values() if c.is_principal), None
+    )
+    if principal is None or not principal.addresses:
+        return ExecutionResult(
+            ok=False,
+            summary="reply: no principal configured for audit",
+            body="Internal error: cannot send reply because no principal is\n"
+                 "configured to receive the audit copy.\n",
+        )
+
+    reply_subject = subject or f"Re: (no subject)"
+
+    result = notifier.send_to_contact(
+        smtp=config.smtp,
+        state=state,
+        principal_addr=principal.addresses[0],
+        contact_addr=contact_addr,
+        subject=reply_subject,
+        body=body,
+        jlogger=jlogger,
+        in_reply_to=in_reply_to,
+        related_message_id=in_reply_to,
+    )
+
+    if not result.primary_sent:
+        return ExecutionResult(
+            ok=False,
+            summary=f"reply: send to '{contact_id}' failed",
+            body=(
+                f"Failed to send reply to {contact_addr}.\n"
+                f"Reason: {result.error}\n"
+                "\n"
+                "The audit copy may still have been attempted; check the\n"
+                "principal's inbox for a (SEND FAILED) banner.\n"
+            ),
+        )
+
+    audit_note = ""
+    if not result.audit_sent:
+        audit_note = (
+            "\n"
+            "Note: the audit copy did NOT reach the principal inbox.\n"
+            "It has been queued in pending_audits and will retry.\n"
+        )
+
+    return ExecutionResult(
+        ok=True,
+        summary=f"replied to '{contact_id}'",
+        body=(
+            f"Reply sent to {contact_addr} (subject: {reply_subject!r}).\n"
+            f"{audit_note}"
+        ),
+    )
+
+
 _DISPATCH: dict[str, Callable] = {
     "block": _exec_block,
     "unblock": _exec_unblock,
     "forget": _exec_forget,
     "add": _exec_add,
     "remove": _exec_remove,
+    "reply": _exec_reply,
 }

@@ -178,6 +178,37 @@ CREATE INDEX IF NOT EXISTS idx_claude_invocations_ts ON claude_invocations(ts);
 CREATE INDEX IF NOT EXISTS idx_claude_invocations_contact ON claude_invocations(contact_id);
 """
 
+# V8 adds outbound_log, the consolidated audit register of every email
+# Nightjar sends. Two functions:
+#   1. Verifiable record. The principal can answer "what did Nightjar
+#      say to who" without trawling JSONL. Every send is one row.
+#   2. Forensic surface. After-the-fact review of an incident: did the
+#      audit copy reach the principal? When was the SMTP failure?
+#      What body did Nightjar send to whom?
+# Body is stored verbatim. The api_key, HOTP secret, SMTP password are
+# never in any rendered email body, so this table cannot leak them
+# absent an upstream bug. notify_principal sends nothing sensitive
+# (it's the principal's own outbound channel); send_to_contact also
+# sends nothing sensitive (the LLM is prompted to never produce
+# sensitive content, and the operator approves before any send).
+SCHEMA_V8 = """
+CREATE TABLE IF NOT EXISTS outbound_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  INTEGER NOT NULL,
+    channel             TEXT NOT NULL,
+    to_addr             TEXT NOT NULL,
+    subject             TEXT NOT NULL,
+    body                TEXT NOT NULL,
+    smtp_message_id     TEXT,
+    related_message_id  TEXT,
+    ok                  INTEGER NOT NULL,
+    error               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_log_ts ON outbound_log(ts);
+CREATE INDEX IF NOT EXISTS idx_outbound_log_channel ON outbound_log(channel);
+CREATE INDEX IF NOT EXISTS idx_outbound_log_related ON outbound_log(related_message_id);
+"""
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -211,12 +242,14 @@ class State:
             conn.executescript(SCHEMA_V6)
             # V7: claude_invocations table. Same pattern.
             conn.executescript(SCHEMA_V7)
+            # V8: outbound_log table. Same pattern.
+            conn.executescript(SCHEMA_V8)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (7)")
-            elif row["version"] < 7:
-                conn.execute("UPDATE schema_version SET version = 7")
+                conn.execute("INSERT INTO schema_version (version) VALUES (8)")
+            elif row["version"] < 8:
+                conn.execute("UPDATE schema_version SET version = 8")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -721,3 +754,68 @@ class State:
                 (int(limit),),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ---- Outbound log (V8) -----------------------------------------------
+
+    def record_outbound(
+        self,
+        *,
+        channel: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        smtp_message_id: str | None,
+        related_message_id: str | None,
+        ok: bool,
+        error: str | None = None,
+        ts: int | None = None,
+    ) -> int:
+        """Append one row to the outbound register. Returns the row id.
+
+        `channel` is "notify_principal" or "send_to_contact" (or "audit"
+        for the audit copy in send_to_contact). `related_message_id` is
+        the inbound message that triggered the send, when applicable
+        (None for daemon-initiated sends like panic notifications).
+
+        Body is stored verbatim. The footer added by send_to_contact is
+        included in the stored body because it's part of what the
+        contact actually saw. The principal can grep their own audit
+        log to find every send Nightjar made.
+        """
+        ts = ts if ts is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO outbound_log "
+                "(ts, channel, to_addr, subject, body, "
+                " smtp_message_id, related_message_id, ok, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ts, channel, to_addr, subject, body,
+                    smtp_message_id, related_message_id,
+                    1 if ok else 0, error,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_recent_outbound(self, *, limit: int = 50) -> list[dict]:
+        """Most recent outbound rows, newest first. For `tail outbound`
+        diagnostic surfaces."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, channel, to_addr, subject, body, "
+                "       smtp_message_id, related_message_id, ok, error "
+                "FROM outbound_log "
+                "ORDER BY ts DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_outbound_since(self, *, since_ts: int) -> int:
+        """How many outbound sends in the window starting at since_ts.
+        For future rate limits / digest counts."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM outbound_log WHERE ts >= ?",
+                (int(since_ts),),
+            ).fetchone()
+            return int(row["n"]) if row is not None else 0

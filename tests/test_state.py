@@ -481,3 +481,128 @@ def test_claude_ledger_does_not_store_prompt_or_key(tmp_path: Path) -> None:
     row = s.list_recent_claude_invocations()[0]
     forbidden_keys = {"api_key", "prompt", "system", "user", "response", "tool_input"}
     assert not (set(row.keys()) & forbidden_keys)
+
+
+# ---- V8: outbound_log register --------------------------------------------
+
+
+def test_outbound_log_starts_empty(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.list_recent_outbound() == []
+    assert s.count_outbound_since(since_ts=0) == 0
+
+
+def test_record_outbound_returns_row_id(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    rid = s.record_outbound(
+        channel="notify_principal",
+        to_addr="me@example.com",
+        subject="hi",
+        body="hello there",
+        smtp_message_id="<abc@example.com>",
+        related_message_id=None,
+        ok=True,
+        ts=1_000,
+    )
+    assert rid >= 1
+
+
+def test_outbound_log_records_failure(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.record_outbound(
+        channel="send_to_contact",
+        to_addr="contact@example.com",
+        subject="reply",
+        body="text",
+        smtp_message_id="<x@y>",
+        related_message_id="<inbound@x>",
+        ok=False,
+        error="SMTPRecipientsRefused",
+        ts=1_000,
+    )
+    rows = s.list_recent_outbound()
+    assert len(rows) == 1
+    assert rows[0]["ok"] == 0
+    assert rows[0]["error"] == "SMTPRecipientsRefused"
+    assert rows[0]["channel"] == "send_to_contact"
+
+
+def test_outbound_log_orders_newest_first(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    for i, addr in enumerate(["a", "b", "c"]):
+        s.record_outbound(
+            channel="notify_principal", to_addr=f"{addr}@x", subject="s",
+            body="b", smtp_message_id=None, related_message_id=None,
+            ok=True, ts=1_000 + i,
+        )
+    rows = s.list_recent_outbound()
+    assert [r["to_addr"] for r in rows] == ["c@x", "b@x", "a@x"]
+
+
+def test_outbound_log_respects_limit(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    for i in range(5):
+        s.record_outbound(
+            channel="notify_principal", to_addr=f"{i}@x", subject="s",
+            body="b", smtp_message_id=None, related_message_id=None,
+            ok=True, ts=1_000 + i,
+        )
+    rows = s.list_recent_outbound(limit=2)
+    assert len(rows) == 2
+
+
+def test_count_outbound_since_window(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    for ts in (10, 20, 1_000, 2_000):
+        s.record_outbound(
+            channel="notify_principal", to_addr="x@y", subject="s",
+            body="b", smtp_message_id=None, related_message_id=None,
+            ok=True, ts=ts,
+        )
+    assert s.count_outbound_since(since_ts=500) == 2
+    assert s.count_outbound_since(since_ts=0) == 4
+
+
+def test_outbound_log_does_not_have_secret_columns(tmp_path: Path) -> None:
+    """Pin contract: outbound_log stores body verbatim but no
+    api_key / totp_secret / smtp_password columns. The body itself
+    cannot contain secrets unless an upstream caller put them
+    there - which would be the actual bug."""
+    s = make_state(tmp_path)
+    s.record_outbound(
+        channel="notify_principal", to_addr="x@y", subject="s",
+        body="body content", smtp_message_id=None,
+        related_message_id=None, ok=True, ts=1_000,
+    )
+    row = s.list_recent_outbound()[0]
+    forbidden = {"api_key", "totp_secret", "smtp_password", "password"}
+    assert not (set(row.keys()) & forbidden)
+
+
+def test_outbound_log_preserves_related_message_id(tmp_path: Path) -> None:
+    """The link from outbound to the inbound mail that triggered it
+    must round-trip so the audit trail can be joined."""
+    s = make_state(tmp_path)
+    s.record_outbound(
+        channel="send_to_contact", to_addr="x@y", subject="s",
+        body="b", smtp_message_id="<a@b>",
+        related_message_id="<inbound-msgid@x>",
+        ok=True, ts=1_000,
+    )
+    row = s.list_recent_outbound()[0]
+    assert row["related_message_id"] == "<inbound-msgid@x>"
+
+
+def test_outbound_log_body_is_searchable(tmp_path: Path) -> None:
+    """Sanity: the body is stored verbatim and fully retrievable.
+    This is the contract: the outbound register is the truth, not
+    an LLM summary, not a redacted version."""
+    s = make_state(tmp_path)
+    full_body = "Hi composer,\n\nThanks for sending the file.\n\n--Footer goes here--\n"
+    s.record_outbound(
+        channel="send_to_contact", to_addr="x@y", subject="Re: file",
+        body=full_body, smtp_message_id="<a@b>",
+        related_message_id=None, ok=True, ts=1_000,
+    )
+    row = s.list_recent_outbound()[0]
+    assert row["body"] == full_body

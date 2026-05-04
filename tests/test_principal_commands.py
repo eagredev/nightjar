@@ -279,6 +279,7 @@ def make_config(tmp_path: Path) -> Config:
         imap_user="bot@example.com",
         imap_password="secret",
         allowed_contacts=("principal", "composer"),
+        trusted_authserv="mx.google.com",
     )
     security = SecurityConfig(
         totp_secret="JBSWY3DPEHPK3PXP",
