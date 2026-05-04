@@ -22,15 +22,24 @@ import contextlib
 import email
 import email.utils
 import random
+import secrets
 import time
 from email.header import decode_header, make_header
 
 from aioimaplib import aioimaplib
 
-from . import auth, notifier, principal_commands, principal_handlers
+from . import auth, executor, notifier, principal_commands, principal_handlers
 from .config import InboxConfig, Config
 from .log import JSONLLogger
 from .state import State
+
+
+# Token format for approval pings. Hex, 8 chars, generated from
+# secrets.token_hex(4). Long enough that two simultaneous pings can't
+# collide; short enough that a phone screen can show it without
+# wrapping. The parser accepts 6+ chars so we can grow this later
+# without breaking existing pending tokens.
+_APPROVAL_TOKEN_BYTES = 4
 
 
 # Gmail's documented IDLE timeout is 29 minutes. We re-IDLE at 27 to be
@@ -457,18 +466,26 @@ class InboxWatcher:
     ) -> None:
         """Parse and handle one authenticated principal email.
 
-        Tier 1: dispatch the handler synchronously, send the reply via
-        notify_principal, transition state to RESPONDED.
+        Five branches:
 
-        Approval token (e.g. 'Re: [Nightjar #abc123] ...'): currently
-        no queue exists, so we just log and transition to
-        APPROVAL_REPLY_NOTED. Step 4b will look up and resolve.
+        1. Approval-token reply: look up the pending approval, validate
+           the verdict (tier-2 needs APPROVE, tier-4 needs IRREVERSIBLE),
+           on approve dispatch the executor, send confirmation. State
+           transitions to APPROVED, DENIED, or APPROVAL_UNCLEAR.
 
-        Free-form: send a deterministic 'interpret with LLM?' prompt
-        (no Claude call yet) and transition to INTERPRET_OFFERED.
+        2. Interpret-choice reply: 'yes interpret' transitions to
+           INTERPRETING and sends the LLM-stubbed reply (Step 5 wires
+           the actual call). 'no' transitions to INTERPRET_DECLINED.
 
-        Tier 2+: recognised but not yet implemented; transition to
-        TIER_2_QUEUED and ping. Real execution lands in Step 4b.
+        3. Tier-1 verb: dispatch the handler, send the reply, transition
+           to RESPONDED.
+
+        4. Tier-2+ verb: queue an approval row with a fresh token, ping
+           the principal with [Nightjar #token] subject describing the
+           proposed action, transition to AWAITING_APPROVAL.
+
+        5. Free-form: send the 'interpret with LLM?' prompt, transition
+           to INTERPRET_OFFERED.
 
         SMTP failures here are non-fatal: the inbound message stays
         recorded; the operator just doesn't get a reply. That's a
@@ -477,18 +494,14 @@ class InboxWatcher:
         cmd = principal_commands.parse_principal_command(subject)
 
         if cmd.approval_token is not None:
-            self.logger.event(
-                "principal_approval_reply",
-                inbox=self.inbox.name,
-                message_id=message_id,
-                token=cmd.approval_token,
-                note="approval queue not implemented yet (Step 4b)",
+            self._resolve_approval_reply(
+                message_id=message_id, command=cmd, from_addr=from_addr
             )
-            self.state.transition(
-                message_id=message_id,
-                from_state="RECEIVED",
-                to_state="APPROVAL_REPLY_NOTED",
-                detail=f"token={cmd.approval_token}",
+            return
+
+        if cmd.interpret_choice is not None:
+            self._resolve_interpret_reply(
+                message_id=message_id, command=cmd, from_addr=from_addr
             )
             return
 
@@ -499,18 +512,8 @@ class InboxWatcher:
             return
 
         if cmd.tier is not None and cmd.tier >= 2:
-            # Step 4b will queue and execute. For now, surface and stop.
-            self._send_deterministic_reply(
-                message_id=message_id,
-                from_addr=from_addr,
-                subject="Nightjar: tier-2+ verb queued",
-                body=(
-                    f"Recognised '{cmd.verb}' (tier {cmd.tier}). Queue + execute\n"
-                    "lands in Step 4b. Acknowledged but not run.\n"
-                ),
-                next_state="TIER_2_QUEUED",
-                event_name="principal_tier2_queued",
-                detail=f"verb={cmd.verb}",
+            self._queue_tier2_plus(
+                message_id=message_id, command=cmd, from_addr=from_addr
             )
             return
 
@@ -526,11 +529,12 @@ class InboxWatcher:
                 "Your request:\n"
                 f"> {cmd.payload or '(empty)'}\n"
                 "\n"
-                "I can either:\n"
-                "  - Reply 'yes interpret' to spend tokens on parsing this\n"
-                "    into a structured plan (Step 4b feature; not active yet).\n"
-                "  - Reply with a recognised verb instead.\n"
-                "  - Reply 'no' to drop the request.\n"
+                "Reply with one of:\n"
+                "  - '[<code>] yes interpret' to spend tokens on parsing this\n"
+                "    into a structured plan (LLM call lands in Step 5;\n"
+                "    will currently stub a no-op response).\n"
+                "  - '[<code>] no' to drop the request.\n"
+                "  - '[<code>] <recognised verb>' to issue a fresh command.\n"
                 "\n"
                 "Recognised verbs:\n"
                 f"{grammar}\n"
@@ -565,6 +569,300 @@ class InboxWatcher:
             next_state="RESPONDED",
             event_name="principal_tier1_dispatched",
             detail=f"verb={command.verb}",
+        )
+
+    def _queue_tier2_plus(
+        self, *, message_id: str, command, from_addr: str
+    ) -> None:
+        """Queue a tier-2+ verb and ping the principal for approval.
+
+        The token is the public handle that comes back in the
+        principal's reply subject. We generate it here (so the executor
+        layer doesn't need to know about token uniqueness) and check
+        for collisions defensively, even though 4 random bytes makes
+        collision implausible.
+        """
+        token = self._generate_approval_token()
+        self.state.queue_approval(
+            token=token,
+            message_id=message_id,
+            verb=command.verb,
+            args=dict(command.args),
+            tier=command.tier,
+        )
+        confirm_phrase = (
+            "YES IRREVERSIBLE" if command.tier >= 4 else "yes"
+        )
+        tier_note = (
+            "This is a tier-4 verb (irreversible local writes). The reply\n"
+            "must be the literal phrase YES IRREVERSIBLE in uppercase.\n"
+            if command.tier >= 4
+            else "This is a tier-2 verb (reversible local writes). A plain\n"
+                 "'yes' (or 'approve' / 'go') is enough.\n"
+        )
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject=f"[Nightjar #{token}] approval needed: {command.verb}",
+            body=(
+                f"Verb:   {command.verb}\n"
+                f"Args:   {dict(command.args)}\n"
+                f"Tier:   {command.tier}\n"
+                "\n"
+                f"{tier_note}"
+                "\n"
+                "To approve, reply with:\n"
+                f"  Subject: [<code>] [Nightjar #{token}] {confirm_phrase}\n"
+                "\n"
+                "To deny, reply with:\n"
+                f"  Subject: [<code>] [Nightjar #{token}] no\n"
+                "\n"
+                "Approval expires in 7 days; offline time is not deducted\n"
+                "automatically (see DESIGN.md).\n"
+            ),
+            next_state="AWAITING_APPROVAL",
+            event_name="principal_approval_queued",
+            detail=f"verb={command.verb} tier={command.tier} token={token}",
+        )
+
+    def _generate_approval_token(self) -> str:
+        """Hex token for the [Nightjar #...] tag.
+
+        Re-rolls if the freshly-generated token already exists in the
+        approvals table (PRIMARY KEY collision). At 4 bytes the
+        collision space is 1/4B per active token, so this is mostly
+        belt-and-braces; expired-but-still-resident rows are still
+        in the keyspace.
+        """
+        for _ in range(8):
+            token = secrets.token_hex(_APPROVAL_TOKEN_BYTES)
+            if self.state.get_approval(token) is None:
+                return token
+        # Improbable. If we hit it the daemon is in a bad state anyway.
+        raise RuntimeError("could not generate a non-colliding approval token")
+
+    def _resolve_approval_reply(
+        self, *, message_id: str, command, from_addr: str
+    ) -> None:
+        """Look up an approval by token and act on the principal's verdict.
+
+        Cases handled:
+
+          - Unknown token: log + reply 'no such pending approval'.
+          - Already-resolved or expired: log + reply 'already
+            resolved' / 'expired'.
+          - Tier-2 + APPROVE: dispatch executor, transition APPROVED,
+            send result.
+          - Tier-2 + DENY: transition DENIED, send acknowledgement.
+          - Tier-4 + IRREVERSIBLE: dispatch executor, transition
+            APPROVED, send result.
+          - Tier-4 + APPROVE (i.e. plain 'yes'): reject as insufficient,
+            keep approval PENDING, reply with the friction note.
+          - Any tier + DENY: transition DENIED.
+          - UNCLEAR: reply with the verdict-format hint, keep approval
+            PENDING so the principal can retry.
+
+        On approve, executor errors are caught (executor.execute does
+        its own try/except) and surfaced in the reply.
+        """
+        token = command.approval_token
+        verdict = command.approval_verdict
+        approval = self.state.get_approval(token)
+
+        if approval is None:
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] unknown approval token",
+                body=(
+                    f"No pending approval matches token #{token}.\n"
+                    "It may have already been resolved, expired, or be a\n"
+                    "typo. Use 'list pending' to see active approvals.\n"
+                ),
+                next_state="APPROVAL_REPLY_NOTED",
+                event_name="principal_approval_unknown_token",
+                detail=f"token={token}",
+            )
+            return
+
+        # Catch already-resolved / expired before checking verdict.
+        if approval["state"] != "PENDING":
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] approval already resolved",
+                body=(
+                    f"The approval for '{approval['verb']}' is already\n"
+                    f"in state {approval['state']}. No action taken.\n"
+                ),
+                next_state="APPROVAL_REPLY_NOTED",
+                event_name="principal_approval_stale",
+                detail=f"token={token} state={approval['state']}",
+            )
+            return
+
+        # Lazy expiry check: if expires_at has passed but the row is
+        # still PENDING, flip it now so a too-late reply is treated
+        # consistently.
+        now = int(time.time())
+        if approval["expires_at"] <= now:
+            self.state.resolve_approval(
+                token=token, outcome="EXPIRED", detail="reply arrived after window", at=now
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] approval expired",
+                body=(
+                    f"The approval for '{approval['verb']}' expired at\n"
+                    f"{approval['expires_at']} (epoch). Resubmit the verb\n"
+                    "to start a fresh approval.\n"
+                ),
+                next_state="APPROVAL_REPLY_NOTED",
+                event_name="principal_approval_expired",
+                detail=f"token={token}",
+            )
+            return
+
+        tier = approval["tier"]
+        verb = approval["verb"]
+        args = approval["args"]
+
+        if verdict == "DENY":
+            self.state.resolve_approval(token=token, outcome="DENIED", detail="principal said no")
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] denied: {verb}",
+                body=(
+                    f"Approval for '{verb}' denied. No action taken.\n"
+                ),
+                next_state="DENIED",
+                event_name="principal_approval_denied",
+                detail=f"token={token} verb={verb}",
+            )
+            return
+
+        # Approve / IRREVERSIBLE branches.
+        if tier >= 4 and verdict != "IRREVERSIBLE":
+            # Tier-4 with plain 'yes' is rejected; approval stays PENDING.
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] tier-4 needs YES IRREVERSIBLE",
+                body=(
+                    f"'{verb}' is a tier-4 verb. A plain 'yes' is not enough.\n"
+                    "Reply with the literal phrase:\n"
+                    "\n"
+                    f"  Subject: [<code>] [Nightjar #{token}] YES IRREVERSIBLE\n"
+                    "\n"
+                    "in uppercase, as the entire post-token text. The\n"
+                    "approval is still pending until you do.\n"
+                ),
+                next_state="APPROVAL_REPLY_NOTED",
+                event_name="principal_approval_insufficient",
+                detail=f"token={token} verb={verb} verdict={verdict}",
+            )
+            return
+
+        if tier < 4 and verdict == "IRREVERSIBLE":
+            # Tier-2 verb with the tier-4 phrase: still approve, but log
+            # the surplus. Conservative: treat as APPROVE.
+            verdict = "APPROVE"
+
+        if verdict not in ("APPROVE", "IRREVERSIBLE"):
+            # UNCLEAR or unexpected. Approval stays PENDING; principal
+            # gets a hint.
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"[Nightjar #{token}] verdict unclear",
+                body=(
+                    "I couldn't parse your reply as a verdict. Reply with:\n"
+                    f"  Subject: [<code>] [Nightjar #{token}] yes\n"
+                    "       or: [<code>] [Nightjar #{token}] no\n"
+                    + (
+                        f"\n  Tier-4 verbs ({verb} is tier 4) require\n"
+                        f"  [<code>] [Nightjar #{token}] YES IRREVERSIBLE\n"
+                        if tier >= 4 else ""
+                    )
+                ),
+                next_state="APPROVAL_REPLY_NOTED",
+                event_name="principal_approval_unclear",
+                detail=f"token={token} verb={verb} verdict={verdict}",
+            )
+            return
+
+        # Approved. Mark APPROVED, run executor, send result.
+        self.state.resolve_approval(
+            token=token, outcome="APPROVED",
+            detail=f"verdict={verdict}", at=now,
+        )
+        result = executor.execute(
+            verb=verb, args=args, config=self.config, state=self.state, now=now,
+        )
+        self.logger.event(
+            "principal_approval_executed",
+            inbox=self.inbox.name,
+            level=("info" if result.ok else "error"),
+            message_id=message_id,
+            token=token,
+            verb=verb,
+            ok=result.ok,
+            summary=result.summary,
+        )
+        outcome_word = "executed" if result.ok else "failed"
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject=f"[Nightjar #{token}] {verb} {outcome_word}: {result.summary}",
+            body=result.body,
+            next_state=("EXECUTED" if result.ok else "EXECUTION_FAILED"),
+            event_name="principal_approval_resolved",
+            detail=f"token={token} verb={verb} ok={result.ok}",
+        )
+
+    def _resolve_interpret_reply(
+        self, *, message_id: str, command, from_addr: str
+    ) -> None:
+        """Handle 'yes interpret' / 'no' replies to a free-form prompt.
+
+        The LLM call is stubbed (Step 5 wires claude-agent-sdk). For
+        now, 'yes interpret' produces a polite 'not yet wired' reply
+        and transitions to INTERPRETING (which then settles to
+        EXECUTION_FAILED via a follow-up in this same call). 'no'
+        transitions to INTERPRET_DECLINED, terminal.
+        """
+        if command.interpret_choice == "NO_INTERPRET":
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret declined",
+                body=(
+                    "Got it; the free-form request was dropped without\n"
+                    "interpretation. No action taken.\n"
+                ),
+                next_state="INTERPRET_DECLINED",
+                event_name="principal_interpret_declined",
+            )
+            return
+
+        # INTERPRET. Step 5 will replace this stub with a real Claude call.
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject="Nightjar: LLM interpret not yet wired",
+            body=(
+                "You replied 'yes interpret', but the Claude call hasn't\n"
+                "landed yet (Step 5). The state machine recorded the\n"
+                "request but no plan was produced and no action will run.\n"
+                "\n"
+                "When Step 5 ships, this same reply will trigger the\n"
+                "interpretation pass and produce a structured plan for\n"
+                "your approval.\n"
+            ),
+            next_state="INTERPRET_STUBBED",
+            event_name="principal_interpret_stubbed",
         )
 
     def _send_deterministic_reply(

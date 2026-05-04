@@ -326,6 +326,24 @@ def test_list_pending_counts_messages_in_pending_states(tmp_path: Path) -> None:
     assert "AWAITING_APPROVAL:   1" in body
 
 
+def test_list_pending_includes_approval_queue_rows(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="abc12345",
+        message_id="<m1>",
+        verb="block",
+        args={"contact": "composer"},
+        tier=2,
+    )
+    cmd = parse_principal_command("list pending")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "#abc12345" in body
+    assert "block" in body
+    assert "composer" in body
+    assert "tier 2" in body
+
+
 def test_tail_log_returns_message_when_no_log(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
