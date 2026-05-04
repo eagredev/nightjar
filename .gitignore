@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Logs (kept local, never committed)
+logs/
+*.log
+*.jsonl
+
+# Local state lives in ~/.local/share/nightjar/, not in the repo,
+# but if anyone ever drops a state.db here by accident, ignore it
+*.db
+*.db-journal
+
+# Editor crud
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets, config lives in ~/.config/nightjar/, but defensive
+*.conf
+!example.conf
