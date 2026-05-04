@@ -22,17 +22,15 @@ from daemon.state import State
 
 
 @pytest.mark.parametrize("subject,verb,expected_args", [
-    ("Nightjar, status", "status", {}),
-    ("nightjar, status", "status", {}),
-    ("Nightjar: status", "status", {}),
     ("status", "status", {}),
-    ("[123456] Nightjar, status", "status", {}),  # leftover code prefix tolerated
-    ("Nightjar, list pending", "list pending", {}),
-    ("Nightjar, tail log", "tail log", {}),
-    ("Nightjar, tail log 2026-05-04", "tail log", {"date": "2026-05-04"}),
-    ("Nightjar, show contact alice", "show contact", {"contact": "alice"}),
-    ("Nightjar, show notes", "show notes", {}),
-    ("Nightjar, show notes alice", "show notes", {"contact": "alice"}),
+    ("STATUS", "status", {}),
+    ("[123456] status", "status", {}),  # leftover code prefix tolerated
+    ("list pending", "list pending", {}),
+    ("tail log", "tail log", {}),
+    ("tail log 2026-05-04", "tail log", {"date": "2026-05-04"}),
+    ("show contact alice", "show contact", {"contact": "alice"}),
+    ("show notes", "show notes", {}),
+    ("show notes alice", "show notes", {"contact": "alice"}),
 ])
 def test_parse_recognises_tier1_verbs(subject: str, verb: str, expected_args: dict) -> None:
     cmd = parse_principal_command(subject)
@@ -41,6 +39,20 @@ def test_parse_recognises_tier1_verbs(subject: str, verb: str, expected_args: di
     assert cmd.args == expected_args
     assert cmd.is_free_form is False
     assert cmd.approval_token is None
+
+
+@pytest.mark.parametrize("subject", [
+    "Nightjar, status",
+    "nightjar: status",
+    "Nightjar status",
+])
+def test_parse_rejects_decorative_lead_in(subject: str) -> None:
+    """Strict matching: 'Nightjar,' prefix is not accepted. Falls through
+    to free-form so the operator gets the 'interpret?' prompt rather than
+    a silent verb match. See module docstring for rationale."""
+    cmd = parse_principal_command(subject)
+    assert cmd.is_free_form is True
+    assert cmd.verb is None
 
 
 def test_parse_approval_token_in_reply_subject() -> None:
@@ -70,15 +82,15 @@ def test_parse_empty_subject_is_free_form() -> None:
     assert cmd2.is_free_form is True
 
 
-def test_parse_strips_leading_code_and_lead_in() -> None:
-    cmd = parse_principal_command("[123456] Nightjar, tail log 2026-05-04")
+def test_parse_strips_leading_code() -> None:
+    cmd = parse_principal_command("[123456] tail log 2026-05-04")
     assert cmd.verb == "tail log"
     assert cmd.args == {"date": "2026-05-04"}
 
 
 def test_parse_show_contact_requires_arg() -> None:
     """Naked 'show contact' shouldn't match (we want the arg form)."""
-    cmd = parse_principal_command("Nightjar, show contact")
+    cmd = parse_principal_command("show contact")
     assert cmd.verb != "show contact"
 
 
@@ -153,7 +165,7 @@ def make_state(tmp_path: Path) -> State:
 def test_status_handler_runs_against_empty_state(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, status")
+    cmd = parse_principal_command("status")
     subject, body = dispatch(command=cmd, config=cfg, state=s)
     assert subject.startswith("Nightjar:")
     assert "status" in subject
@@ -166,7 +178,7 @@ def test_status_handler_reports_panic_when_tripped(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
     s.trip_panic(reason="3 invalid attempts", at=1_700_000_000)
-    cmd = parse_principal_command("Nightjar, status")
+    cmd = parse_principal_command("status")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "panic state:      TRIPPED" in body
     assert "3 invalid attempts" in body
@@ -175,7 +187,7 @@ def test_status_handler_reports_panic_when_tripped(tmp_path: Path) -> None:
 def test_list_pending_reports_empty_when_nothing_queued(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, list pending")
+    cmd = parse_principal_command("list pending")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "Nothing pending." in body
 
@@ -191,7 +203,7 @@ def test_list_pending_counts_messages_in_pending_states(tmp_path: Path) -> None:
         contact_id=None,
         state="AWAITING_APPROVAL",
     )
-    cmd = parse_principal_command("Nightjar, list pending")
+    cmd = parse_principal_command("list pending")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "AWAITING_APPROVAL:   1" in body
 
@@ -199,7 +211,7 @@ def test_list_pending_counts_messages_in_pending_states(tmp_path: Path) -> None:
 def test_tail_log_returns_message_when_no_log(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, tail log 2099-01-01")
+    cmd = parse_principal_command("tail log 2099-01-01")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "No log file for 2099-01-01" in body
 
@@ -213,7 +225,7 @@ def test_tail_log_decodes_jsonl_lines(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, tail log 2026-05-04")
+    cmd = parse_principal_command("tail log 2026-05-04")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "daemon_start" in body
     assert "idle_connect" in body
@@ -223,7 +235,7 @@ def test_tail_log_decodes_jsonl_lines(tmp_path: Path) -> None:
 def test_show_contact_returns_known_contact(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, show contact composer")
+    cmd = parse_principal_command("show contact composer")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "Contact: composer" in body
     assert "composer@example.com" in body
@@ -236,7 +248,7 @@ def test_show_contact_does_not_leak_passwords_or_secrets(tmp_path: Path) -> None
     secret from the surrounding config."""
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, show contact composer")
+    cmd = parse_principal_command("show contact composer")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "smtp-secret" not in body
     assert "JBSWY3DPEHPK3PXP" not in body
@@ -246,7 +258,7 @@ def test_show_contact_does_not_leak_passwords_or_secrets(tmp_path: Path) -> None
 def test_show_contact_rejects_unknown_contact(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, show contact ghost")
+    cmd = parse_principal_command("show contact ghost")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "No contact 'ghost'" in body
 
@@ -254,7 +266,7 @@ def test_show_contact_rejects_unknown_contact(tmp_path: Path) -> None:
 def test_show_notes_placeholder_reports_step_7(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
-    cmd = parse_principal_command("Nightjar, show notes composer")
+    cmd = parse_principal_command("show notes composer")
     _, body = dispatch(command=cmd, config=cfg, state=s)
     assert "Step 7" in body or "rapport notes" in body.lower()
 
