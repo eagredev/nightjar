@@ -18,6 +18,7 @@ not an error.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import email
 import email.utils
@@ -1210,7 +1211,7 @@ class InboxWatcher:
                        "It may be HTML-only or use an unrecognised encoding.\n",
             )
             return
-        body_text, body_truncated = body_result
+        body_text, body_truncated, structure, raw_rfc822 = body_result
 
         # 4. The triage call itself.
         contact = self.config.contacts[contact_id]
@@ -1219,6 +1220,7 @@ class InboxWatcher:
             sender=from_addr,
             subject=subject or "",
             body=body_text,
+            structure=structure,
             config=claude_cfg,
             client=self._claude_client,
             prompts_dir=PROMPTS_DIR,
@@ -1292,10 +1294,9 @@ class InboxWatcher:
             detail=f"verb={plan.verb}",
         )
 
-        # noop / forward / flag don't queue an executor verb. They still
-        # need a human-visible ping so the principal sees the triage
-        # output.
-        if plan.verb in ("noop", "forward_to_principal", "flag_for_review"):
+        # noop / flag don't queue an executor verb. They still need a
+        # human-visible ping so the principal sees the triage output.
+        if plan.verb in ("noop", "flag_for_review"):
             self._send_triage_summary_to_principal(
                 message_id=message_id, contact_id=contact_id,
                 from_addr=from_addr, from_header=from_header,
@@ -1322,6 +1323,34 @@ class InboxWatcher:
                 from_addr=from_addr, from_header=from_header,
                 subject=subject, date_header=date_header,
                 plan=plan, verb="reply",
+                args=args, body_text=body_text,
+                body_truncated=body_truncated,
+            )
+            return
+
+        # `forward_to_principal` queues a tier-3 approval. The args
+        # carry the raw RFC822 bytes (base64-encoded for JSON safety)
+        # so the executor can attach the original message verbatim
+        # without a second IMAP round-trip at execute time. Storing
+        # the bytes in state.db trades a little disk for executor
+        # simplicity (sync path, no IMAP at execute time).
+        if plan.verb == "forward_to_principal":
+            forward_subject = self._build_forward_subject(subject)
+            args = {
+                "contact_id": contact_id,
+                "subject": forward_subject,
+                "raw_rfc822_b64": base64.b64encode(raw_rfc822).decode("ascii"),
+                "summary": plan.summary,
+                "reasoning": plan.reasoning,
+                "risk_flags": list(plan.risk_flags),
+                "notes": plan.notes,
+                "in_reply_to": message_id,
+            }
+            self._queue_triage_approval(
+                message_id=message_id, contact_id=contact_id,
+                from_addr=from_addr, from_header=from_header,
+                subject=subject, date_header=date_header,
+                plan=plan, verb="forward_to_principal",
                 args=args, body_text=body_text,
                 body_truncated=body_truncated,
             )
@@ -1428,6 +1457,35 @@ class InboxWatcher:
         )
         notes_line = f"\nNotes from triage:\n  {plan.notes}\n" if plan.notes else ""
         confirm_phrase = "yes"  # triage caps at tier 3, single-confirm.
+
+        # Per-verb section that explains what `yes` will actually do.
+        if verb == "reply":
+            action_block = (
+                "Drafted reply (will be sent if approved):\n"
+                "---\n"
+                f"{args.get('body', '')}\n"
+                "---\n"
+            )
+        elif verb == "forward_to_principal":
+            attachment_size = len(args.get("raw_rfc822_b64", "")) * 3 // 4
+            action_block = (
+                "On approval Nightjar will forward the original email to\n"
+                f"{self._principal_addr()} as a message/rfc822 attachment\n"
+                f"({attachment_size} bytes). The wrapper body of that\n"
+                "forward will repeat the triage summary above. The\n"
+                "attached .eml will preserve the message exactly as it\n"
+                "arrived: full headers, HTML alternative if present,\n"
+                "attachments, inline images.\n"
+            )
+        else:
+            # Defensive: any future tier-3 verb wired into triage
+            # should declare its own action block. Falling back to a
+            # generic statement so the approval ping is still useful.
+            action_block = (
+                f"On approval Nightjar will run verb '{verb}' with the\n"
+                "args attached to this approval row.\n"
+            )
+
         approval_body = (
             f"Triage of inbound mail from {contact_id} ({from_addr}).\n"
             f"\n"
@@ -1438,10 +1496,7 @@ class InboxWatcher:
             f"{notes_line}"
             f"{flags_line}"
             f"\n"
-            f"Drafted reply (will be sent if approved):\n"
-            f"---\n"
-            f"{args.get('body', '')}\n"
-            f"---\n"
+            f"{action_block}"
             f"\n"
             f"To approve, reply with:\n"
             f"  Subject: [<code>] [Nightjar #{token}] {confirm_phrase}\n"
@@ -1649,18 +1704,39 @@ class InboxWatcher:
             return s
         return f"Re: {s}"
 
+    @staticmethod
+    def _build_forward_subject(inbound_subject: str | None) -> str:
+        """Build a Fwd:-prefixed subject for the forward-to-principal
+        wrapper. Existing Fwd:/Fw: prefixes are not duplicated; an
+        existing Re: is kept and Fwd: stacked in front of it."""
+        s = (inbound_subject or "").strip()
+        if not s:
+            return "Fwd: (no subject)"
+        lower = s.lower()
+        if lower.startswith("fwd:") or lower.startswith("fw:"):
+            return s
+        return f"Fwd: {s}"
+
     async def _fetch_body_text(
         self, client: aioimaplib.IMAP4_SSL, uid: str
-    ) -> tuple[str, bool] | None:
-        """Fetch the full message for `uid` and return its plaintext body.
+    ) -> tuple[str, bool, "MessageStructure", bytes] | None:
+        """Fetch the full message for `uid` and return body + structure
+        + raw RFC822 bytes.
 
-        Returns `(body_text, was_truncated)` on success, or None if no
-        usable body could be extracted (multipart with no text part,
-        decode failure, IMAP error). Body is capped at MAX_TRIAGE_BODY_BYTES
-        and `was_truncated` reflects whether the cap fired.
+        Returns `(body_text, was_truncated, structure, raw_bytes)` on
+        success, or None if no usable body could be extracted (multipart
+        with no text part, decode failure, IMAP error). Body is capped
+        at MAX_TRIAGE_BODY_BYTES; `was_truncated` reflects the cap.
 
-        Body fetch is a SECOND round-trip (after the headers fetch) and
-        is gated on the message being triage-eligible. Strangers,
+        The raw bytes are kept on the caller's side so the
+        `forward_to_principal` executor can attach the original message
+        verbatim later, without a second IMAP round-trip at execute time.
+        Storing the bytes inline in the approval row trades a little
+        state.db size for executor simplicity (sync path, no IMAP
+        connection needed at execute time).
+
+        Body fetch is the SECOND round-trip (after the headers fetch)
+        and is gated on the message being triage-eligible. Strangers,
         blocked contacts, and principal mail never trigger a body fetch
         because they don't need triage.
         """
@@ -1681,6 +1757,9 @@ class InboxWatcher:
         try:
             msg = email.message_from_bytes(blob)
             text, truncated = self._extract_plain_text(msg)
+            structure = self._extract_message_structure(
+                msg, raw_size=len(blob), body_truncated=truncated,
+            )
         except Exception as e:
             self.logger.event(
                 "body_decode_failed",
@@ -1689,7 +1768,76 @@ class InboxWatcher:
             return None
         if text is None:
             return None
-        return text, truncated
+        return text, truncated, structure, blob
+
+    @staticmethod
+    def _extract_message_structure(
+        msg: email.message.Message, *, raw_size: int, body_truncated: bool
+    ) -> "MessageStructure":
+        """Walk a parsed email and produce a structural fingerprint.
+
+        Counts what the LLM cannot see (HTML alternative parts,
+        attachments, inline images) and the size of the raw message.
+        Used as input to triage.build_user_message so the LLM can
+        ground hidden-content suspicion in facts.
+
+        Classification rules:
+          - HTML alternative: any `text/html` part exists, regardless
+            of whether it is the chosen body part. (We pick text/plain
+            for triage; the HTML alternative is what the LLM will not
+            see and what the principal might.)
+          - Attachment: any non-multipart part with
+            Content-Disposition: attachment, OR with a filename that
+            has a non-image content-type. Inline images are tracked
+            separately.
+          - Inline image: any image/* part with
+            Content-Disposition: inline (or no disposition AND inside
+            a multipart/related, which is the typical inline-image
+            shape). For simplicity we count all image/* parts that
+            are not explicitly attachments.
+        """
+        from .triage import MessageStructure
+
+        has_html_alternative = False
+        attachment_count = 0
+        attachment_names: list[str] = []
+        inline_image_count = 0
+
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            ctype = part.get_content_type()
+            disposition = (part.get("Content-Disposition") or "").lower()
+            filename = part.get_filename() or ""
+
+            is_attachment = (
+                "attachment" in disposition
+                or (filename and not ctype.startswith("text/"))
+            )
+            is_inline_image = (
+                ctype.startswith("image/")
+                and "attachment" not in disposition
+            )
+
+            if ctype == "text/html":
+                has_html_alternative = True
+            elif is_attachment:
+                attachment_count += 1
+                if filename:
+                    attachment_names.append(filename)
+                else:
+                    attachment_names.append(f"(unnamed {ctype})")
+            elif is_inline_image:
+                inline_image_count += 1
+
+        return MessageStructure(
+            has_html_alternative=has_html_alternative,
+            attachment_count=attachment_count,
+            attachment_names=tuple(attachment_names),
+            inline_image_count=inline_image_count,
+            total_size_bytes=raw_size,
+            body_truncated_in_prompt=body_truncated,
+        )
 
     @staticmethod
     def _extract_plain_text(msg: email.message.Message) -> tuple[str | None, bool]:

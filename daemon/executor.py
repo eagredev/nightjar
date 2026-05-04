@@ -511,6 +511,141 @@ def _exec_reply(*, args: dict, config: Config, state: State, now: int, config_pa
     )
 
 
+def _exec_forward(*, args: dict, config: Config, state: State, now: int, config_path: Path, jlogger: JSONLLogger | None = None) -> ExecutionResult:
+    """Forward a triage-flagged email to the principal as an attachment.
+
+    This executor is the post-approval terminus of the forward-to-principal
+    path. The watcher queued a tier-3 approval with these args:
+      - contact_id: str. The contact whose email we're forwarding.
+        Looked up here for the wrapper body framing only; we never send
+        anything to the contact.
+      - subject: str. The Fwd:-prefixed wrapper subject.
+      - raw_rfc822_b64: str. base64-encoded raw RFC822 bytes of the
+        original message. Decoded here and attached verbatim.
+      - summary, reasoning, risk_flags, notes: from the triage plan.
+        Rendered into the wrapper body so the principal sees the LLM's
+        reading at the top of the forward email.
+      - in_reply_to: str | None. Original Message-ID for thread linkage.
+
+    The raw bytes are stored in the approval row at queue time, so this
+    executor needs no IMAP connection. After delivery the bytes remain
+    in state.db until the approval row is deleted; that's acceptable
+    because the approval window is bounded and the message would be
+    stored in IMAP anyway.
+
+    Failure semantics: a primary-send failure reports EXECUTION_FAILED.
+    There is no audit copy: the principal IS the recipient.
+    """
+    import base64
+
+    contact_id = args.get("contact_id")
+    subject = args.get("subject", "")
+    raw_b64 = args.get("raw_rfc822_b64")
+    summary = args.get("summary", "")
+    reasoning = args.get("reasoning", "")
+    risk_flags = args.get("risk_flags") or []
+    notes = args.get("notes", "")
+    in_reply_to = args.get("in_reply_to")
+
+    if not contact_id:
+        return ExecutionResult(
+            ok=False,
+            summary="forward: missing 'contact_id' arg",
+            body="Internal error: 'forward_to_principal' invoked without a contact_id.\n",
+        )
+    if not raw_b64 or not isinstance(raw_b64, str):
+        return ExecutionResult(
+            ok=False,
+            summary="forward: missing raw message",
+            body="Internal error: 'forward_to_principal' invoked without "
+                 "raw_rfc822_b64. The raw bytes should have been stored at "
+                 "queue time.\n",
+        )
+    try:
+        raw_rfc822 = base64.b64decode(raw_b64.encode("ascii"))
+    except Exception as e:
+        return ExecutionResult(
+            ok=False,
+            summary="forward: corrupt raw message",
+            body=f"Internal error: raw_rfc822_b64 failed to decode: {e}\n",
+        )
+    if not raw_rfc822:
+        return ExecutionResult(
+            ok=False,
+            summary="forward: empty raw message",
+            body="Internal error: raw_rfc822 decoded to zero bytes.\n",
+        )
+
+    # The contact may have been removed between queue and approval.
+    # Forwarding still makes sense (the bytes are in the args), so we
+    # do not refuse, but we do degrade the wrapper body to flag it.
+    contact = config.contacts.get(contact_id)
+    contact_label = (
+        f"{contact.display_name} <{contact.addresses[0]}>"
+        if contact and contact.addresses
+        else f"{contact_id} (no longer configured)"
+    )
+
+    principal = next(
+        (c for c in config.contacts.values() if c.is_principal), None
+    )
+    if principal is None or not principal.addresses:
+        return ExecutionResult(
+            ok=False,
+            summary="forward: no principal configured",
+            body="Internal error: cannot forward because no principal is\n"
+                 "configured to receive the forwarded mail.\n",
+        )
+
+    flags_line = (
+        ", ".join(risk_flags) if risk_flags else "(none)"
+    )
+    notes_block = f"\nNotes from triage:\n  {notes}\n" if notes else ""
+    wrapper_body = (
+        f"Forwarded from {contact_label} on the principal's behalf.\n"
+        f"\n"
+        f"Triage summary:\n  {summary}\n"
+        f"\n"
+        f"Reasoning:\n  {reasoning}\n"
+        f"{notes_block}"
+        f"Risk flags: {flags_line}\n"
+        f"\n"
+        f"The original message is attached as an .eml file. Open it in\n"
+        f"your mail client to see the message exactly as it arrived,\n"
+        f"including any HTML formatting, attachments, and inline images\n"
+        f"the plain-text view used for triage could not show.\n"
+    )
+
+    result = notifier.forward_to_principal(
+        smtp=config.smtp,
+        state=state,
+        principal_addr=principal.addresses[0],
+        subject=subject or f"Fwd: from {contact_id}",
+        wrapper_body=wrapper_body,
+        raw_rfc822=raw_rfc822,
+        jlogger=jlogger,
+        related_message_id=in_reply_to,
+    )
+
+    if not result.primary_sent:
+        return ExecutionResult(
+            ok=False,
+            summary=f"forward: send failed",
+            body=(
+                f"Failed to forward {contact_id}'s email to the principal.\n"
+                f"Reason: {result.error}\n"
+            ),
+        )
+    return ExecutionResult(
+        ok=True,
+        summary=f"forwarded '{contact_id}' to principal",
+        body=(
+            f"Forwarded {contact_id}'s email to {principal.addresses[0]}\n"
+            f"({len(raw_rfc822)} bytes attached as .eml).\n"
+        ),
+    )
+
+
 _DISPATCH: dict[str, Callable] = {
     "block": _exec_block,
     "unblock": _exec_unblock,
@@ -518,4 +653,5 @@ _DISPATCH: dict[str, Callable] = {
     "add": _exec_add,
     "remove": _exec_remove,
     "reply": _exec_reply,
+    "forward_to_principal": _exec_forward,
 }
