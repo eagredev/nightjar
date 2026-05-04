@@ -159,6 +159,84 @@ def current_code(secret: str, now: float | None = None) -> str:
     return _hotp(secret_bytes, int(t // TOTP_PERIOD_SECONDS))
 
 
+# ---- HOTP (RFC 4226) -------------------------------------------------------
+
+# How many counters past `last_counter` we'll search for a match. RFC 4226
+# §7.4 calls this the "look-ahead synchronization window". 20 is the spec's
+# recommended default and tolerates the operator skipping a handful of
+# codes by accident on the authenticator app.
+HOTP_LOOKAHEAD = 20
+
+
+def hotp_at(secret: str, counter: int) -> str:
+    """Return the HOTP code for a specific counter value.
+
+    Used by tests and by the setup command to display the first code
+    (counter=1) so the operator can verify their authenticator is in sync.
+    """
+    return _hotp(_decode_secret(secret), counter)
+
+
+def verify_hotp(
+    *,
+    secret: str,
+    code: str,
+    last_counter: int,
+    lookahead: int = HOTP_LOOKAHEAD,
+) -> int | None:
+    """Verify an HOTP code against `last_counter+1 .. last_counter+lookahead`.
+
+    Returns the matched counter (a strictly-greater integer than
+    `last_counter`) on success, or None on any failure: malformed input,
+    bad secret, no match within the lookahead window.
+
+    The caller is responsible for advancing the persisted counter to the
+    returned value. Codes at or below `last_counter` are never accepted,
+    which gives replay protection for free: each counter is single-use
+    because the counter only ever moves forward.
+
+    Constant-time per-candidate comparison via `hmac.compare_digest`. The
+    loop is not constant-time across candidates, but the timing only
+    leaks how many counters ahead the matching one was — negligible
+    given the attacker has no oracle for which counter the operator is on.
+    """
+    if not isinstance(code, str) or len(code) != TOTP_DIGITS or not code.isdigit():
+        return None
+    if lookahead <= 0:
+        return None
+    try:
+        secret_bytes = _decode_secret(secret)
+    except Exception:
+        return None
+    for delta in range(1, lookahead + 1):
+        candidate_counter = last_counter + delta
+        candidate_code = _hotp(secret_bytes, candidate_counter)
+        if hmac.compare_digest(candidate_code, code):
+            return candidate_counter
+    return None
+
+
+def hotp_provisioning_uri(
+    *, secret: str, account: str, issuer: str = "Nightjar", counter: int = 0
+) -> str:
+    """Build an otpauth://hotp/ URI for QR-code provisioning.
+
+    HOTP URIs include an explicit counter (typically 0 at first
+    provisioning) so the authenticator app starts in sync with the
+    daemon. Most apps display "code N" alongside each generated code,
+    making counter sync visible to the operator.
+    """
+    label = quote(f"{issuer}:{account}", safe="")
+    params = urlencode({
+        "secret": secret,
+        "issuer": issuer,
+        "algorithm": "SHA1",
+        "digits": str(TOTP_DIGITS),
+        "counter": str(counter),
+    })
+    return f"otpauth://hotp/{label}?{params}"
+
+
 def extract_code_from_subject(subject: str | None) -> str | None:
     """Pull a 6-digit `[123456]` prefix out of a Subject header.
 

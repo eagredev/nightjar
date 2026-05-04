@@ -143,3 +143,23 @@ def test_recent_auth_failures_orders_newest_first(tmp_path: Path) -> None:
     s.record_auth_failure(from_addr="p@example.com", reason="r3", at=3_000)
     rows = s.recent_auth_failures(limit=2)
     assert [r["reason"] for r in rows] == ["r3", "r2"]
+
+
+def test_hotp_counter_starts_at_zero(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.get_hotp_counter() == 0
+
+
+def test_hotp_counter_round_trips(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.set_hotp_counter(42)
+    assert s.get_hotp_counter() == 42
+    s.set_hotp_counter(0)
+    assert s.get_hotp_counter() == 0
+
+
+def test_hotp_counter_rejects_negative(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    import pytest
+    with pytest.raises(ValueError):
+        s.set_hotp_counter(-1)

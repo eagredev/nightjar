@@ -211,3 +211,75 @@ def test_no_inboxes_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="no enabled"):
         load_config(path)
+
+
+# A real-ish base32 secret to exercise the [security] parser.
+_SAMPLE_SECRET = "JBSWY3DPEHPK3PXP"  # "Hello!\xde\xad\xbe\xef"
+
+
+def _conf_with_security(tmp_path: Path, *, security_block: str) -> Path:
+    return write_conf(
+        tmp_path,
+        f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [contact:a]
+        addresses = a@example.com
+        is_principal = true
+        daily_limit = unlimited
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        allowed_contacts = a
+
+        {security_block}
+        """,
+    )
+
+
+def test_security_defaults_to_hotp(tmp_path: Path) -> None:
+    path = _conf_with_security(
+        tmp_path,
+        security_block=f"[security]\n        totp_secret = {_SAMPLE_SECRET}",
+    )
+    cfg = load_config(path)
+    assert cfg.security is not None
+    assert cfg.security.auth_mode == "hotp"
+
+
+def test_security_accepts_explicit_totp(tmp_path: Path) -> None:
+    path = _conf_with_security(
+        tmp_path,
+        security_block=(
+            f"[security]\n        totp_secret = {_SAMPLE_SECRET}"
+            f"\n        auth_mode = totp"
+        ),
+    )
+    cfg = load_config(path)
+    assert cfg.security is not None
+    assert cfg.security.auth_mode == "totp"
+
+
+def test_security_rejects_bad_auth_mode(tmp_path: Path) -> None:
+    path = _conf_with_security(
+        tmp_path,
+        security_block=(
+            f"[security]\n        totp_secret = {_SAMPLE_SECRET}"
+            f"\n        auth_mode = magic"
+        ),
+    )
+    with pytest.raises(ConfigError, match="auth_mode must be one of"):
+        load_config(path)
+
+
+def test_security_rejects_invalid_secret(tmp_path: Path) -> None:
+    path = _conf_with_security(
+        tmp_path,
+        security_block="[security]\n        totp_secret = not-base32!",
+    )
+    with pytest.raises(ConfigError, match="not a valid base32"):
+        load_config(path)

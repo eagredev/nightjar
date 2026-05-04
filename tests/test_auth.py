@@ -98,3 +98,73 @@ def test_provisioning_uri_round_trips_secret() -> None:
     assert "issuer=Nightjar" in uri
     assert "digits=6" in uri
     assert "period=30" in uri
+
+
+# ---- HOTP -----------------------------------------------------------------
+
+
+def test_verify_hotp_matches_next_counter() -> None:
+    secret = auth.generate_secret()
+    code = auth.hotp_at(secret, 1)
+    matched = auth.verify_hotp(secret=secret, code=code, last_counter=0)
+    assert matched == 1
+
+
+def test_verify_hotp_lookahead_finds_skipped_counter() -> None:
+    """Operator tapped 'next' a few times; the daemon should resync."""
+    secret = auth.generate_secret()
+    # Daemon last accepted counter 3; phone is now showing counter 8.
+    code = auth.hotp_at(secret, 8)
+    matched = auth.verify_hotp(secret=secret, code=code, last_counter=3)
+    assert matched == 8
+
+
+def test_verify_hotp_rejects_past_counter() -> None:
+    """A code at or below last_counter is a replay and must fail."""
+    secret = auth.generate_secret()
+    code = auth.hotp_at(secret, 5)
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=5) is None
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=10) is None
+
+
+def test_verify_hotp_rejects_outside_lookahead_window() -> None:
+    secret = auth.generate_secret()
+    # Default lookahead is 20; counter 25 is out of range from last_counter=0.
+    code = auth.hotp_at(secret, 25)
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=0) is None
+
+
+def test_verify_hotp_respects_custom_lookahead() -> None:
+    secret = auth.generate_secret()
+    code = auth.hotp_at(secret, 50)
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=0, lookahead=100) == 50
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=0, lookahead=10) is None
+
+
+def test_verify_hotp_rejects_malformed_codes() -> None:
+    secret = auth.generate_secret()
+    assert auth.verify_hotp(secret=secret, code="12345", last_counter=0) is None
+    assert auth.verify_hotp(secret=secret, code="abcdef", last_counter=0) is None
+    assert auth.verify_hotp(secret=secret, code="", last_counter=0) is None
+
+
+def test_verify_hotp_rejects_bad_secret() -> None:
+    assert auth.verify_hotp(secret="not base32", code="123456", last_counter=0) is None
+
+
+def test_verify_hotp_replay_via_advancing_counter() -> None:
+    """After accepting counter 5, the same code at counter 5 must fail."""
+    secret = auth.generate_secret()
+    code = auth.hotp_at(secret, 5)
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=4) == 5
+    # After persisting matched=5, the same code is now in the past.
+    assert auth.verify_hotp(secret=secret, code=code, last_counter=5) is None
+
+
+def test_hotp_provisioning_uri_includes_counter_zero() -> None:
+    secret = auth.generate_secret()
+    uri = auth.hotp_provisioning_uri(secret=secret, account="x@example.com")
+    assert uri.startswith("otpauth://hotp/Nightjar%3Ax%40example.com?")
+    assert f"secret={secret}" in uri
+    assert "counter=0" in uri
+    assert "digits=6" in uri

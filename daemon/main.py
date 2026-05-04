@@ -9,7 +9,7 @@ Build Step 1 + 2 scope:
     - Heartbeat to SQLite every minute (used later by cold-start logic)
     - On switch trip during runtime: write PANIC.txt, halt the loop
     - Handle SIGTERM / SIGINT cleanly
-    - Subcommands: --revive, --setup-totp
+    - Subcommands: --revive, --setup-auth
 """
 from __future__ import annotations
 
@@ -176,35 +176,35 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--revive",
         action="store_true",
-        help="clear the dead-man's-switch (requires physical TTY + valid TOTP)",
+        help="clear the dead-man's-switch (requires physical TTY + valid auth code)",
     )
     mode.add_argument(
-        "--setup-totp",
+        "--setup-auth",
         action="store_true",
-        help="generate a TOTP secret and print the provisioning URI",
+        help="generate an auth secret and print the provisioning URI",
     )
-    mode.add_argument(
+    parser.add_argument(
         "--force",
         action="store_true",
-        help="with --setup-totp: overwrite an existing secret",
+        help="with --setup-auth: overwrite an existing secret",
     )
     args = parser.parse_args(argv)
 
     try:
         config = load_config(args.config) if args.config else load_config()
     except ConfigError as e:
-        # --setup-totp is the only command that can run without [security].
-        if not args.setup_totp:
+        # --setup-auth is the only command that can run without [security].
+        if not args.setup_auth:
             print(f"nightjar: config error: {e}", file=sys.stderr)
             return 2
-        config = None  # setup_totp handles a missing/incomplete config itself
+        config = None  # setup_auth handles a missing/incomplete config itself
     except FileNotFoundError as e:
         print(f"nightjar: {e}", file=sys.stderr)
         return 2
 
-    if args.setup_totp:
-        from . import setup_totp
-        return setup_totp.run(args.config, force=args.force)
+    if args.setup_auth:
+        from . import setup_auth
+        return setup_auth.run(args.config, force=args.force)
 
     if args.revive:
         from . import revive
