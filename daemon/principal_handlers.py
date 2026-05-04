@@ -85,27 +85,49 @@ def handle_status(*, config: Config, state: State, args: dict[str, str]) -> tupl
 
 
 def handle_list_pending(*, config: Config, state: State, args: dict[str, str]) -> tuple[str, str]:
-    """Pending approvals queue. Step 4b will populate this once
-    contact triage produces tokens; for now we report an honest empty
-    state so the surface exists end-to-end."""
+    """Pending approvals queue.
+
+    Reports two things:
+      1. Per-message pending state counts (AWAITING_APPROVAL etc.):
+         how many inbound messages are mid-flow.
+      2. Approval-queue rows: the actual queued tier-2+ verbs with
+         their tokens, verbs, args, and time-to-expiry.
+
+    Both views are useful: (1) is a quick sanity check the daemon is
+    busy, (2) is the actionable list the principal can reply to.
+    """
     counts = state.count_by_state()
     awaiting = counts.get("AWAITING_APPROVAL", 0)
-    queued = counts.get("TIER_2_QUEUED", 0)
     interpret = counts.get("INTERPRET_OFFERED", 0)
+    pending_approvals = state.list_pending_approvals()
 
     lines = [
         f"Pending items @ {_now_iso()}",
         "",
-        f"  AWAITING_APPROVAL:   {awaiting}",
-        f"  TIER_2_QUEUED:       {queued}",
-        f"  INTERPRET_OFFERED:   {interpret}",
+        f"  message rows AWAITING_APPROVAL:   {awaiting}",
+        f"  message rows INTERPRET_OFFERED:   {interpret}",
+        f"  approval-queue rows:              {len(pending_approvals)}",
         "",
     ]
-    if awaiting + queued + interpret == 0:
+    if pending_approvals:
+        lines.append("Pending approvals:")
+        now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        for row in pending_approvals:
+            ttl_seconds = max(0, row["expires_at"] - now_ts)
+            ttl_days = ttl_seconds / 86400
+            lines.append(
+                f"  #{row['token']}  tier {row['tier']}  {row['verb']}  "
+                f"{row['args']}  expires_in {ttl_days:.1f}d"
+            )
+        lines.append("")
+        lines.append(
+            "Reply with subject:  [<code>] [Nightjar #<token>] yes"
+        )
+        lines.append(
+            "  (tier-4 needs YES IRREVERSIBLE instead of yes)"
+        )
+    elif awaiting == 0 and interpret == 0:
         lines.append("Nothing pending.")
-    else:
-        lines.append("Run 'tail log' to see specifics. Detailed listing")
-        lines.append("ships with Step 4b.")
     return _subject("list pending"), "\n".join(lines) + "\n"
 
 
