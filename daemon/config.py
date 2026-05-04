@@ -1,17 +1,17 @@
 """Config loader for Nightjar.
 
 Reads ~/.config/nightjar/nightjar.conf (INI format) and produces typed
-dataclasses describing the daemon, its contacts, and its inboxes.
-Build Step 2 adds [security] (TOTP secret + dead-man's-switch knobs).
-Later build steps will add [smtp], [caps], etc.
+dataclasses describing the daemon, its contacts, its inboxes, its
+security knobs, and its outbound SMTP credentials. Later build steps
+will add [caps], prompt configuration, etc.
 
 The contact directory is the single mechanism that handles allowlisting
 and rate-limiting. Anyone not in [contact:*] is treated as
 daily_limit=0 by callers.
 
-The TOTP secret loaded here lives only on this dataclass and on
-`daemon/auth.py`. It is never logged, never put into a prompt, never
-returned in a tool result.
+Sensitive fields (TOTP secret, SMTP password) live only on the
+dataclasses and the modules that need them. They are never logged,
+never put into a prompt, never returned in a tool result.
 """
 from __future__ import annotations
 
@@ -57,6 +57,23 @@ class InboxConfig:
     allowed_contacts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SmtpConfig:
+    """Outbound SMTP credentials for daemon/notifier.py.
+
+    The password is sensitive: same handling rules as TOTP secrets —
+    never logged, never put into a prompt, never returned in a tool
+    result. STARTTLS is implicit at port 587; we don't expose a knob
+    for it (Gmail and most providers require it).
+    """
+    host: str
+    port: int
+    user: str
+    password: str
+    from_name: str
+    from_addr: str
+
+
 AUTH_MODES = ("hotp", "totp")
 DEFAULT_AUTH_MODE = "hotp"
 
@@ -87,6 +104,7 @@ class Config:
     contacts: dict[str, Contact]
     inboxes: dict[str, InboxConfig]
     security: SecurityConfig | None = None
+    smtp: SmtpConfig | None = None
     address_index: dict[str, str] = field(default_factory=dict)
     """Maps lowercased email address to contact_id. Built at load time."""
 
@@ -255,10 +273,40 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             auth_mode=auth_mode,
         )
 
+    smtp: SmtpConfig | None = None
+    if "smtp" in parser:
+        smtp_section = parser["smtp"]
+        try:
+            smtp_port = int(smtp_section.get("port", "587"))
+        except ValueError as e:
+            raise ConfigError(f"[smtp].port must be int: {e}") from e
+        host = smtp_section.get("host", "").strip()
+        user = smtp_section.get("user", "").strip()
+        password = smtp_section.get("password", "")
+        from_addr = smtp_section.get("from_addr", user).strip()
+        from_name = smtp_section.get("from_name", "Nightjar").strip()
+        if not host:
+            raise ConfigError("[smtp].host is required")
+        if not user:
+            raise ConfigError("[smtp].user is required")
+        if not password:
+            raise ConfigError("[smtp].password is required")
+        if "@" not in from_addr:
+            raise ConfigError(f"[smtp].from_addr does not look like an email: {from_addr!r}")
+        smtp = SmtpConfig(
+            host=host,
+            port=smtp_port,
+            user=user,
+            password=password,
+            from_name=from_name,
+            from_addr=from_addr,
+        )
+
     return Config(
         daemon=daemon,
         contacts=contacts,
         inboxes=inboxes,
         security=security,
+        smtp=smtp,
         address_index=address_index,
     )
