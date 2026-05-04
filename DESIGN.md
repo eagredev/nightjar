@@ -657,20 +657,25 @@ request. No unauthenticated email gets to the parser.
 ### Subject-line conventions
 
 ```
-[123456] Nightjar, status                        ← tier 1
-[123456] Nightjar, draft email to composer       ← tier 2 (free-form)
+[123456] status                                  ← tier 1
+[123456] draft email to composer                 ← tier 2 (free-form)
 [123456] re: [Nightjar #a4f2c1] approval needed  ← reply to approval ping
-[123456] Nightjar, run the build                 ← tier 2 (recognised verb)
-[123456] Nightjar, push the working branch       ← tier 4 (recognised verb,
+[123456] run the build                           ← tier 2 (recognised verb)
+[123456] push the working branch                 ← tier 4 (recognised verb,
                                                     triggers double-confirm)
 ```
 
-The TOTP prefix is mandatory; the rest is parsed by the daemon.
+The TOTP prefix is mandatory; the rest is parsed by the daemon. Strict
+form: the verb (and any args) is the entire subject after the code,
+with no decorative lead-in. A subject like `[123456] Nightjar, status`
+is treated as free-form, not as the `status` verb, because the parser
+matches the verb pattern against the full post-code subject.
 
 ### Deterministic commands (free, no LLM)
 
-Recognised verbs are matched by `daemon/approval.py` against a fixed
-vocabulary. Tier 1 verbs auto-execute; tier 2+ verbs queue and ping.
+Recognised verbs are matched by `daemon/principal_commands.py` against
+a fixed vocabulary. Tier 1 verbs auto-execute via
+`daemon/principal_handlers.py`; tier 2+ verbs queue and ping.
 
 | Verb | Tier | Behaviour |
 |------|------|-----------|

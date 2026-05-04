@@ -5,19 +5,23 @@ returns a structured ParsedCommand. No LLM involvement, no I/O. The
 watcher calls this *after* TOTP auth succeeds; everything here treats
 the inputs as already-trusted-as-from-the-principal.
 
-The grammar (per DESIGN.md "Subject-line conventions"):
+The grammar (post-Step-4a tweak):
 
-    [123456] Nightjar, status              -> tier-1 verb 'status'
-    [123456] Nightjar, list pending        -> tier-1 verb 'list pending'
-    [123456] Nightjar, tail log 2026-05-04 -> tier-1 verb with arg
-    [123456] Nightjar, show contact alice  -> tier-1 verb with arg
-    [123456] Nightjar, run the build       -> tier-2+ (recognised, queued)
+    [123456] status                        -> tier-1 verb 'status'
+    [123456] list pending                  -> tier-1 verb 'list pending'
+    [123456] tail log 2026-05-04           -> tier-1 verb with arg
+    [123456] show contact alice            -> tier-1 verb with arg
+    [123456] run the build                 -> tier-2+ (recognised, queued)
     [123456] re: [Nightjar #a4f2c1] ...    -> approval-token reply
 
 The TOTP/HOTP prefix is stripped by the auth layer before this parser
 runs; we accept either the full subject (and re-strip defensively) or
-the post-auth subject. The "Nightjar," prefix is optional but
-recognised; some clients lowercase it.
+the post-auth subject. The subject after the prefix must be exactly
+the verb (with any registered args); decorative lead-ins like
+"Nightjar," are NOT accepted, because they create ambiguity with
+casual subjects that happen to mention the daemon's name. Strict
+matching keeps the grammar unambiguous: a subject is a command, not
+a sentence.
 
 Anything that doesn't match a recognised verb OR an approval token is
 classified as `free_form`. The watcher will then send the operator a
@@ -104,10 +108,6 @@ _APPROVAL_TOKEN_RE = re.compile(
 # parser tolerates a leftover [123456] in case the caller forgets.
 _LEADING_CODE_RE = re.compile(r"^\s*\[\d{6}\]\s*")
 
-# "Nightjar, " or "nightjar:" lead-in is optional, allowed in any case,
-# with optional trailing comma/colon.
-_LEAD_IN_RE = re.compile(r"^\s*nightjar\s*[,:]\s*", re.IGNORECASE)
-
 # Common reply prefixes. Stripped before approval-token detection.
 _REPLY_PREFIX_RE = re.compile(r"^(?:re|fwd|fw)\s*:\s*", re.IGNORECASE)
 
@@ -168,8 +168,6 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
     # Strip the leading [123456] code if the auth layer left it on. (It
     # normally doesn't, but defensive against future refactors.)
     stripped = _LEADING_CODE_RE.sub("", raw)
-    # Strip the optional "Nightjar," lead-in.
-    stripped = _LEAD_IN_RE.sub("", stripped)
     payload = stripped.strip()
 
     if not payload:
@@ -198,13 +196,16 @@ def describe_grammar() -> str:
     Lists the recognised verbs by tier. Stable enough to inline in
     notifier replies; if we add a verb, this updates automatically
     because it reads the registry.
+
+    The subject format is `[123456] <verb>`: code prefix, then the
+    verb as the entire rest of the subject, no decorative lead-in.
     """
     by_tier: dict[int, list[VerbSpec]] = {}
     for spec in VERB_REGISTRY:
         by_tier.setdefault(spec.tier, []).append(spec)
-    lines = []
+    lines = ["Subject format: [code] <verb>", ""]
     for tier in sorted(by_tier):
         lines.append(f"Tier {tier} (auto-execute):" if tier == 1 else f"Tier {tier}:")
         for spec in by_tier[tier]:
-            lines.append(f"  - Nightjar, {spec.name}")
+            lines.append(f"  - {spec.name}")
     return "\n".join(lines)
