@@ -921,6 +921,7 @@ class InboxWatcher:
         )
         result = executor.execute(
             verb=verb, args=args, config=self.config, state=self.state, now=now,
+            jlogger=self.logger,
         )
         self.logger.event(
             "principal_approval_executed",
