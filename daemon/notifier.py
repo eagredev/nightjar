@@ -436,6 +436,118 @@ def send_to_contact(
     )
 
 
+def forward_to_principal(
+    *,
+    smtp: SmtpConfig | None,
+    state: State,
+    principal_addr: str,
+    subject: str,
+    wrapper_body: str,
+    raw_rfc822: bytes,
+    attachment_filename: str = "original_message.eml",
+    jlogger: JSONLLogger | None = None,
+    related_message_id: str | None = None,
+) -> SendResult:
+    """Forward an inbound email to the principal as a message/rfc822
+    attachment, with `wrapper_body` as the cover-note body.
+
+    This is structurally a notify_principal call (one SMTP transaction,
+    no audit copy: the recipient IS the principal) plus an attached
+    copy of the original message. The principal's mail client renders
+    the wrapper body inline and shows the attached email as an .eml
+    they can open. Modern clients render the attachment in-thread; the
+    fallback is a click-to-open .eml file.
+
+    The raw bytes are attached verbatim. We do NOT re-parse, modify
+    headers, or strip anything. The whole point of forward-as-attachment
+    is preserving fidelity, including any HTML alternative, attachments,
+    and inline images that the daemon's plain-text view of triage could
+    not see.
+
+    Failure semantics mirror notify_principal: a single SMTP transaction;
+    on failure the caller (the executor) reports EXECUTION_FAILED.
+    """
+    if smtp is None:
+        raise SmtpNotConfiguredError(
+            "[smtp] is required to send mail; add it to nightjar.conf"
+        )
+
+    msg = _build_message(
+        smtp=smtp,
+        to_addr=principal_addr,
+        subject=subject,
+        body=wrapper_body,
+    )
+    primary_id = msg["Message-ID"]
+
+    # message/rfc822 attachment with the original bytes verbatim.
+    # EmailMessage handles the multipart/mixed wrapping automatically
+    # once an attachment is added.
+    msg.add_attachment(
+        raw_rfc822,
+        maintype="message",
+        subtype="rfc822",
+        filename=attachment_filename,
+    )
+
+    try:
+        _smtp_send(smtp, msg)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        if jlogger is not None:
+            jlogger.event(
+                "forward_to_principal_failed",
+                level="error",
+                to_addr=principal_addr,
+                subject=subject,
+                error=type(e).__name__,
+                message=str(e),
+            )
+        state.record_outbound(
+            channel="forward_to_principal",
+            to_addr=principal_addr,
+            subject=subject,
+            body=wrapper_body,
+            smtp_message_id=primary_id,
+            related_message_id=related_message_id,
+            ok=False,
+            error=err,
+        )
+        return SendResult(
+            primary_message_id=primary_id,
+            primary_sent=False,
+            audit_sent=False,
+            audit_queued=False,
+            audit_id=None,
+            error=err,
+        )
+
+    if jlogger is not None:
+        jlogger.event(
+            "forward_to_principal_sent",
+            to_addr=principal_addr,
+            subject=subject,
+            message_id=primary_id,
+            attachment_size_bytes=len(raw_rfc822),
+        )
+    state.record_outbound(
+        channel="forward_to_principal",
+        to_addr=principal_addr,
+        subject=subject,
+        body=wrapper_body,
+        smtp_message_id=primary_id,
+        related_message_id=related_message_id,
+        ok=True,
+    )
+    return SendResult(
+        primary_message_id=primary_id,
+        primary_sent=True,
+        audit_sent=False,
+        audit_queued=False,
+        audit_id=None,
+    )
+
+
 def send_audit_retry(
     *,
     smtp: SmtpConfig,

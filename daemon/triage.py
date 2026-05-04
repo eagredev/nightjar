@@ -53,7 +53,7 @@ TRIAGE_MAX_TIER = 3
 TRIAGE_VERBS: dict[str, dict[str, Any]] = {
     "reply": {"tier": 3, "required_args": ("body",)},
     "noop": {"tier": 1, "required_args": ()},
-    "forward_to_principal": {"tier": 1, "required_args": ()},
+    "forward_to_principal": {"tier": 3, "required_args": ()},
     "flag_for_review": {"tier": 1, "required_args": ()},
 }
 
@@ -67,7 +67,41 @@ KNOWN_RISK_FLAGS = frozenset({
     "off_topic",
     "sensitive_topic",
     "low_information",
+    "hidden_content_suspected",
 })
+
+
+# ---- Message structure -----------------------------------------------------
+
+# The `<body>` block the LLM sees is the plain-text view of the email. It
+# does not show HTML alternatives, attachments, inline images, or remote
+# resources. A `<message_structure>` block alongside it gives the LLM
+# the structural facts it would otherwise have to guess about. The LLM
+# is prompted to flag `hidden_content_suspected` when this block reports
+# parts the plain-text view cannot represent.
+
+# Cap on the rendered attachment-names list. Filenames can be long and
+# numerous; this stops a pathological multipart from blowing past the
+# token budget. Names beyond the cap are summarised as "(+N more)".
+_MAX_ATTACHMENT_NAMES_RENDERED = 10
+_MAX_ATTACHMENT_NAME_LEN = 80
+
+
+@dataclass(frozen=True)
+class MessageStructure:
+    """Structural fingerprint of an inbound MIME message.
+
+    All fields describe the message as the daemon parsed it, NOT as the
+    LLM sees it. The LLM sees only the plain-text body; this dataclass
+    is what it would learn if it could read the headers and walk the
+    parts. Used to ground hidden-content detection.
+    """
+    has_html_alternative: bool
+    attachment_count: int
+    attachment_names: tuple[str, ...]
+    inline_image_count: int
+    total_size_bytes: int
+    body_truncated_in_prompt: bool
 
 
 # ---- Result types ----------------------------------------------------------
@@ -256,9 +290,37 @@ def _strip_block_delimiters(text: str) -> str:
     LLM sees that something was tampered with rather than getting a
     partial body. The marker chars are themselves safe.
     """
-    for tag in ("</contact_metadata>", "</sender>", "</subject>", "</body>"):
+    for tag in (
+        "</contact_metadata>",
+        "</sender>",
+        "</subject>",
+        "</message_structure>",
+        "</body>",
+    ):
         text = text.replace(tag, "[stripped: closing-tag]")
     return text
+
+
+def _render_attachment_names(names: tuple[str, ...]) -> str:
+    """Compress a list of attachment filenames for the structure block.
+
+    Each name is truncated to _MAX_ATTACHMENT_NAME_LEN; the list as a
+    whole is truncated to _MAX_ATTACHMENT_NAMES_RENDERED entries with
+    a "(+N more)" suffix. The strip-block-delimiters pass also applies
+    so filenames cannot escape the structure block.
+    """
+    if not names:
+        return "(none)"
+    rendered: list[str] = []
+    for name in names[:_MAX_ATTACHMENT_NAMES_RENDERED]:
+        clean = _strip_block_delimiters(name)
+        if len(clean) > _MAX_ATTACHMENT_NAME_LEN:
+            clean = clean[:_MAX_ATTACHMENT_NAME_LEN] + "..."
+        rendered.append(clean)
+    suffix = ""
+    if len(names) > _MAX_ATTACHMENT_NAMES_RENDERED:
+        suffix = f" (+{len(names) - _MAX_ATTACHMENT_NAMES_RENDERED} more)"
+    return ", ".join(rendered) + suffix
 
 
 def build_user_message(
@@ -267,12 +329,16 @@ def build_user_message(
     sender: str,
     subject: str,
     body: str,
+    structure: MessageStructure,
 ) -> str:
-    """Format the four-block delimited input the prompt expects.
+    """Format the five-block delimited input the prompt expects.
 
     Untrusted fields (sender, subject, body) get a strip pass so an
     attacker cannot inject a fake `</body>` to escape the block.
     contact_metadata is trusted (config-sourced) and not stripped.
+    The `<message_structure>` block is daemon-derived facts about the
+    raw MIME structure. Filenames inside it are also stripped because
+    a contact controls what they're called.
     """
     safe_sender = _strip_block_delimiters(sender)
     safe_subject = _strip_block_delimiters(subject)
@@ -293,6 +359,15 @@ def build_user_message(
         "<subject>\n"
         f"{safe_subject}\n"
         "</subject>\n"
+        "\n"
+        "<message_structure>\n"
+        f"has_html_alternative: {str(structure.has_html_alternative).lower()}\n"
+        f"attachment_count: {structure.attachment_count}\n"
+        f"attachment_names: {_render_attachment_names(structure.attachment_names)}\n"
+        f"inline_image_count: {structure.inline_image_count}\n"
+        f"total_size_bytes: {structure.total_size_bytes}\n"
+        f"body_truncated_in_prompt: {str(structure.body_truncated_in_prompt).lower()}\n"
+        "</message_structure>\n"
         "\n"
         "<body>\n"
         f"{safe_body}\n"
@@ -418,6 +493,7 @@ async def triage_contact_mail(
     sender: str,
     subject: str,
     body: str,
+    structure: MessageStructure,
     config: ClaudeConfig,
     client: ClaudeClient,
     prompts_dir: Path,
@@ -427,10 +503,18 @@ async def triage_contact_mail(
     This function does no network I/O of its own: all SDK interaction
     goes through the injected `client`. Tests pass a FakeClaudeClient;
     production passes an AnthropicClient.
+
+    `structure` is a daemon-derived fingerprint of the raw MIME message:
+    presence of HTML alternative, attachment count, inline images, and
+    so on. It feeds the `<message_structure>` block in the user message
+    so the LLM can ground hidden-content suspicion in facts rather than
+    speculation. Caller is responsible for building it from the fetched
+    bytes; see InboxWatcher._extract_message_structure.
     """
     system = build_system_prompt(prompts_dir)
     user = build_user_message(
-        contact=contact, sender=sender, subject=subject, body=body
+        contact=contact, sender=sender, subject=subject, body=body,
+        structure=structure,
     )
 
     try:
