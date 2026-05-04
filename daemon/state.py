@@ -11,6 +11,7 @@ cold_start_backlog. The full schema lives in DESIGN.md.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -109,6 +110,35 @@ CREATE INDEX IF NOT EXISTS idx_pending_audits_attempts ON pending_audits(attempt
 # in the diagnostic surface and decide whether to resend manually.
 MAX_AUDIT_ATTEMPTS = 3
 
+# V5 adds approvals, the queue of tier-2+ verbs awaiting principal
+# confirmation. Each row pins one inbound principal-command message to an
+# action that's been parsed but not executed. The token is the public
+# handle that appears in [Nightjar #abc123] and lets the principal's
+# reply route back to the right pending action without us needing
+# threading. State lifecycle: PENDING -> APPROVED | DENIED | EXPIRED.
+SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS approvals (
+    token            TEXT PRIMARY KEY,
+    message_id       TEXT NOT NULL,
+    verb             TEXT NOT NULL,
+    args_json        TEXT NOT NULL,
+    tier             INTEGER NOT NULL,
+    state            TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    expires_at       INTEGER NOT NULL,
+    resolved_at      INTEGER,
+    resolved_detail  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_state ON approvals(state);
+CREATE INDEX IF NOT EXISTS idx_approvals_expires ON approvals(expires_at);
+"""
+
+# How long an approval ping is honoured before expiring. Matches the
+# default mentioned in DESIGN.md ("approval_window_days = 7"). Counted
+# in seconds so the call site does not have to convert; a future config
+# read can override per principal.
+DEFAULT_APPROVAL_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -136,12 +166,14 @@ class State:
             # V4: pending_audits table. CREATE IF NOT EXISTS makes this
             # idempotent without a separate column-presence check.
             conn.executescript(SCHEMA_V4)
+            # V5: approvals table. Same pattern as V4.
+            conn.executescript(SCHEMA_V5)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (4)")
-            elif row["version"] < 4:
-                conn.execute("UPDATE schema_version SET version = 4")
+                conn.execute("INSERT INTO schema_version (version) VALUES (5)")
+            elif row["version"] < 5:
+                conn.execute("UPDATE schema_version SET version = 5")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -414,3 +446,127 @@ class State:
                 "SELECT COUNT(*) AS n FROM pending_audits"
             ).fetchone()
             return int(row["n"]) if row else 0
+
+    # --- Approvals (Build Step 4b) -----------------------------------------
+
+    def queue_approval(
+        self,
+        *,
+        token: str,
+        message_id: str,
+        verb: str,
+        args: dict,
+        tier: int,
+        at: int | None = None,
+        window_seconds: int = DEFAULT_APPROVAL_WINDOW_SECONDS,
+    ) -> None:
+        """Insert a PENDING approval row tied to a parsed verb.
+
+        The token is the public handle the principal will see in the
+        ping subject; we generate it at the call site so the call site
+        also owns its uniqueness check.
+        """
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO approvals (
+                    token, message_id, verb, args_json, tier,
+                    state, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                """,
+                (
+                    token, message_id, verb, json.dumps(args, sort_keys=True),
+                    tier, at, at + window_seconds,
+                ),
+            )
+
+    def get_approval(self, token: str) -> dict | None:
+        """Fetch a single approval by token. Returns None if absent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT token, message_id, verb, args_json, tier, state, "
+                "       created_at, expires_at, resolved_at, resolved_detail "
+                "FROM approvals WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["args"] = json.loads(d["args_json"])
+            return d
+
+    def resolve_approval(
+        self,
+        *,
+        token: str,
+        outcome: str,
+        detail: str | None = None,
+        at: int | None = None,
+    ) -> bool:
+        """Move a PENDING approval to APPROVED, DENIED, or EXPIRED.
+
+        Returns True if a PENDING row was resolved, False otherwise (no
+        such token, or already resolved). The conditional UPDATE makes
+        this safe against double-resolution from a duplicated reply.
+        """
+        if outcome not in ("APPROVED", "DENIED", "EXPIRED"):
+            raise ValueError(f"invalid outcome: {outcome!r}")
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE approvals SET state = ?, resolved_at = ?, resolved_detail = ? "
+                "WHERE token = ? AND state = 'PENDING'",
+                (outcome, at, detail, token),
+            )
+            return cur.rowcount > 0
+
+    def list_pending_approvals(self, *, now: int | None = None) -> list[dict]:
+        """Return PENDING, non-expired approvals oldest-first.
+
+        Rows whose expires_at has passed are excluded; expire_approvals
+        is the helper that flips them to EXPIRED. We exclude here too so
+        readers aren't forced to call expire first.
+        """
+        now = now if now is not None else int(time.time())
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT token, message_id, verb, args_json, tier, state, "
+                "       created_at, expires_at, resolved_at, resolved_detail "
+                "FROM approvals "
+                "WHERE state = 'PENDING' AND expires_at > ? "
+                "ORDER BY created_at ASC",
+                (now,),
+            ).fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                d["args"] = json.loads(d["args_json"])
+                out.append(d)
+            return out
+
+    def count_pending_approvals(self, *, now: int | None = None) -> int:
+        """Active pending count (excludes expired-but-unflipped rows)."""
+        now = now if now is not None else int(time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM approvals "
+                "WHERE state = 'PENDING' AND expires_at > ?",
+                (now,),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
+    def expire_approvals(self, *, now: int | None = None) -> int:
+        """Flip PENDING approvals past their expires_at to EXPIRED.
+
+        Returns the count of rows flipped. Called by the watcher's
+        periodic housekeeping pass; safe to call any time.
+        """
+        now = now if now is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE approvals SET state = 'EXPIRED', resolved_at = ? "
+                "WHERE state = 'PENDING' AND expires_at <= ?",
+                (now, now),
+            )
+            return cur.rowcount
