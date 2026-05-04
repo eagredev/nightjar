@@ -100,6 +100,124 @@ def test_describe_grammar_lists_known_verbs() -> None:
         assert spec.name in text
 
 
+# ---- Tier 2/4 verb parsing (Build Step 4b) --------------------------------
+
+
+@pytest.mark.parametrize("subject,verb,expected_args", [
+    ("block composer", "block", {"contact": "composer"}),
+    ("unblock composer", "unblock", {"contact": "composer"}),
+    ("forget composer", "forget", {"contact": "composer"}),
+])
+def test_parse_recognises_tier2_verbs(subject: str, verb: str, expected_args: dict) -> None:
+    cmd = parse_principal_command(subject)
+    assert cmd.verb == verb
+    assert cmd.tier == 2
+    assert cmd.args == expected_args
+    assert cmd.is_free_form is False
+
+
+@pytest.mark.parametrize("subject,verb,expected_args", [
+    ("add new@example.com", "add", {"email": "new@example.com"}),
+    ("remove composer", "remove", {"contact": "composer"}),
+])
+def test_parse_recognises_tier4_verbs(subject: str, verb: str, expected_args: dict) -> None:
+    cmd = parse_principal_command(subject)
+    assert cmd.verb == verb
+    assert cmd.tier == 4
+    assert cmd.args == expected_args
+
+
+def test_parse_block_requires_contact_arg() -> None:
+    """Naked 'block' is free-form, not the verb."""
+    cmd = parse_principal_command("block")
+    assert cmd.verb is None
+    assert cmd.is_free_form is True
+
+
+def test_parse_add_rejects_non_email_arg() -> None:
+    """'add foobar' looks like a verb but the email pattern doesn't match,
+    so it falls through to free-form."""
+    cmd = parse_principal_command("add foobar")
+    assert cmd.verb is None
+    assert cmd.is_free_form is True
+
+
+# ---- Approval verdict extraction (Build Step 4b) --------------------------
+
+
+@pytest.mark.parametrize("subject,expected_verdict", [
+    ("Re: [Nightjar #abc123] yes", "APPROVE"),
+    ("Re: [Nightjar #abc123] approve", "APPROVE"),
+    ("Re: [Nightjar #abc123] go", "APPROVE"),
+    ("Re: [Nightjar #abc123] YES", "APPROVE"),  # case-insensitive
+    ("Re: [Nightjar #abc123] no", "DENY"),
+    ("Re: [Nightjar #abc123] deny", "DENY"),
+    ("Re: [Nightjar #abc123] stop", "DENY"),
+    ("Re: [Nightjar #abc123] YES IRREVERSIBLE", "IRREVERSIBLE"),
+])
+def test_parse_approval_verdict(subject: str, expected_verdict: str) -> None:
+    cmd = parse_principal_command(subject)
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == expected_verdict
+
+
+def test_parse_approval_verdict_unclear_when_extra_words() -> None:
+    """Strict match: extra words make the verdict UNCLEAR rather than
+    accidentally approving."""
+    cmd = parse_principal_command("Re: [Nightjar #abc123] yes please")
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+def test_parse_tier4_confirm_must_be_uppercase() -> None:
+    """Lowercase 'yes irreversible' is NOT a valid tier-4 confirm. The
+    UPPERCASE EXACT requirement is the friction that makes tier-4
+    deliberate."""
+    cmd = parse_principal_command("Re: [Nightjar #abc123] yes irreversible")
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+def test_parse_approval_verdict_with_leading_code() -> None:
+    """The verdict reply still has a [123456] auth code prefix; we
+    strip it before classifying."""
+    cmd = parse_principal_command("Re: [Nightjar #abc123] [654321] yes")
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == "APPROVE"
+
+
+# ---- Interpret-choice replies (Build Step 4b) -----------------------------
+
+
+def test_parse_yes_interpret() -> None:
+    cmd = parse_principal_command("yes interpret")
+    assert cmd.interpret_choice == "INTERPRET"
+    assert cmd.verb is None
+    assert cmd.is_free_form is False
+
+
+def test_parse_no_interprets_as_no_interpret() -> None:
+    """A bare 'no' is the principal declining the interpret offer.
+    Without context it's ambiguous, but the watcher only routes
+    interpret-choice when the message is a reply to an INTERPRET_OFFERED
+    parent. The parser surfaces the choice; the watcher decides whether
+    to act on it."""
+    cmd = parse_principal_command("no")
+    assert cmd.interpret_choice == "NO_INTERPRET"
+
+
+def test_parse_interpret_with_leading_code() -> None:
+    cmd = parse_principal_command("[123456] yes interpret")
+    assert cmd.interpret_choice == "INTERPRET"
+
+
+def test_parse_interpret_strict_no_extra_words() -> None:
+    """Trailing words disqualify, same strictness as verbs."""
+    cmd = parse_principal_command("yes interpret please")
+    assert cmd.interpret_choice is None
+    assert cmd.is_free_form is True
+
+
 # ---- Handlers -------------------------------------------------------------
 
 
