@@ -27,7 +27,7 @@ from email.header import decode_header, make_header
 
 from aioimaplib import aioimaplib
 
-from . import auth
+from . import auth, notifier, principal_commands, principal_handlers
 from .config import InboxConfig, Config
 from .log import JSONLLogger
 from .state import State
@@ -314,6 +314,19 @@ class InboxWatcher:
                 subject_preview=(subject or "")[:80],
             )
 
+        # Step 4a: post-auth dispatch for authenticated principal mail.
+        # We only run dispatch when auth succeeded (state == RECEIVED on
+        # a principal contact); other states already terminated the flow.
+        if (
+            inserted
+            and state == "RECEIVED"
+            and contact_id is not None
+            and self.config.contacts[contact_id].is_principal
+        ):
+            self._dispatch_principal_command(
+                message_id=message_id, subject=subject, from_addr=from_addr
+            )
+
         if panic_trip_reason is not None:
             self._trip_dead_mans_switch(panic_trip_reason)
 
@@ -438,6 +451,195 @@ class InboxWatcher:
             self._on_panic(reason)
         # Set our own stop event so this watcher exits its loop promptly.
         self._stop_event.set()
+
+    def _dispatch_principal_command(
+        self, *, message_id: str, subject: str | None, from_addr: str
+    ) -> None:
+        """Parse and handle one authenticated principal email.
+
+        Tier 1: dispatch the handler synchronously, send the reply via
+        notify_principal, transition state to RESPONDED.
+
+        Approval token (e.g. 'Re: [Nightjar #abc123] ...'): currently
+        no queue exists, so we just log and transition to
+        APPROVAL_REPLY_NOTED. Step 4b will look up and resolve.
+
+        Free-form: send a deterministic 'interpret with LLM?' prompt
+        (no Claude call yet) and transition to INTERPRET_OFFERED.
+
+        Tier 2+: recognised but not yet implemented; transition to
+        TIER_2_QUEUED and ping. Real execution lands in Step 4b.
+
+        SMTP failures here are non-fatal: the inbound message stays
+        recorded; the operator just doesn't get a reply. That's a
+        better failure mode than crashing the watcher.
+        """
+        cmd = principal_commands.parse_principal_command(subject)
+
+        if cmd.approval_token is not None:
+            self.logger.event(
+                "principal_approval_reply",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                token=cmd.approval_token,
+                note="approval queue not implemented yet (Step 4b)",
+            )
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="APPROVAL_REPLY_NOTED",
+                detail=f"token={cmd.approval_token}",
+            )
+            return
+
+        if cmd.tier == 1:
+            self._send_tier1_reply(
+                message_id=message_id, command=cmd, from_addr=from_addr
+            )
+            return
+
+        if cmd.tier is not None and cmd.tier >= 2:
+            # Step 4b will queue and execute. For now, surface and stop.
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: tier-2+ verb queued",
+                body=(
+                    f"Recognised '{cmd.verb}' (tier {cmd.tier}). Queue + execute\n"
+                    "lands in Step 4b. Acknowledged but not run.\n"
+                ),
+                next_state="TIER_2_QUEUED",
+                event_name="principal_tier2_queued",
+                detail=f"verb={cmd.verb}",
+            )
+            return
+
+        # Free-form fallback.
+        grammar = principal_commands.describe_grammar()
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject="Nightjar: free-form request, interpret with LLM?",
+            body=(
+                "I didn't recognise this as a deterministic command.\n"
+                "\n"
+                "Your request:\n"
+                f"> {cmd.payload or '(empty)'}\n"
+                "\n"
+                "I can either:\n"
+                "  - Reply 'yes interpret' to spend tokens on parsing this\n"
+                "    into a structured plan (Step 4b feature; not active yet).\n"
+                "  - Reply with a recognised verb instead.\n"
+                "  - Reply 'no' to drop the request.\n"
+                "\n"
+                "Recognised verbs:\n"
+                f"{grammar}\n"
+            ),
+            next_state="INTERPRET_OFFERED",
+            event_name="principal_free_form",
+            detail=cmd.payload[:80] if cmd.payload else "",
+        )
+
+    def _send_tier1_reply(
+        self, *, message_id: str, command, from_addr: str
+    ) -> None:
+        """Run a tier-1 handler and email the reply to the principal."""
+        result = principal_handlers.dispatch(
+            command=command, config=self.config, state=self.state
+        )
+        if result is None:
+            self.logger.event(
+                "principal_handler_missing",
+                inbox=self.inbox.name,
+                level="warn",
+                message_id=message_id,
+                verb=command.verb,
+            )
+            return
+        reply_subject, reply_body = result
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject=reply_subject,
+            body=reply_body,
+            next_state="RESPONDED",
+            event_name="principal_tier1_dispatched",
+            detail=f"verb={command.verb}",
+        )
+
+    def _send_deterministic_reply(
+        self,
+        *,
+        message_id: str,
+        from_addr: str,
+        subject: str,
+        body: str,
+        next_state: str,
+        event_name: str,
+        detail: str = "",
+    ) -> None:
+        """Common path: notify_principal + state transition + log event.
+
+        Robust to SMTP failures: logs + transitions to RESPONDED_FAILED
+        if the send didn't go out. The inbound message stays recorded
+        regardless.
+        """
+        if self.config.smtp is None:
+            self.logger.event(
+                "principal_reply_skipped",
+                level="warn",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                reason="no_smtp_config",
+            )
+            return
+        try:
+            send = notifier.notify_principal(
+                smtp=self.config.smtp,
+                principal_addr=from_addr,
+                subject=subject,
+                body=body,
+                jlogger=self.logger,
+                in_reply_to=message_id,
+            )
+        except Exception as e:
+            self.logger.event(
+                "principal_reply_error",
+                level="error",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                error=type(e).__name__,
+                message=str(e),
+            )
+            return
+        if send.primary_sent:
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state=next_state,
+                detail=detail,
+            )
+            self.logger.event(
+                event_name,
+                inbox=self.inbox.name,
+                message_id=message_id,
+                detail=detail,
+                reply_message_id=send.primary_message_id,
+            )
+        else:
+            self.state.transition(
+                message_id=message_id,
+                from_state="RECEIVED",
+                to_state="RESPONDED_FAILED",
+                detail=f"send error: {send.error}",
+            )
+            self.logger.event(
+                "principal_reply_failed",
+                level="error",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                error=send.error,
+            )
 
     @staticmethod
     def _extract_literal(data: list) -> bytes | None:
