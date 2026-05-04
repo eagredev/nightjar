@@ -1,14 +1,17 @@
 """Config loader for Nightjar.
 
 Reads ~/.config/nightjar/nightjar.conf (INI format) and produces typed
-dataclasses describing the daemon, its contacts, and its inboxes. The
-v0.1 (watcher-only) shape is intentionally narrow: only the fields the
-watcher needs are loaded. Later build steps will add [security], [smtp],
-[caps], etc.
+dataclasses describing the daemon, its contacts, and its inboxes.
+Build Step 2 adds [security] (TOTP secret + dead-man's-switch knobs).
+Later build steps will add [smtp], [caps], etc.
 
 The contact directory is the single mechanism that handles allowlisting
 and rate-limiting. Anyone not in [contact:*] is treated as
 daily_limit=0 by callers.
+
+The TOTP secret loaded here lives only on this dataclass and on
+`daemon/auth.py`. It is never logged, never put into a prompt, never
+returned in a tool result.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ import configparser
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import auth
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/nightjar/nightjar.conf").expanduser()
@@ -53,10 +58,24 @@ class InboxConfig:
 
 
 @dataclass(frozen=True)
+class SecurityConfig:
+    """TOTP and dead-man's-switch tuning.
+
+    `totp_secret` is sensitive: it never leaves this dataclass except
+    into `daemon/auth.py`. Don't log it, don't include it in any tool
+    result, don't pass it to any LLM call.
+    """
+    totp_secret: str
+    dead_mans_switch_window_minutes: int
+    dead_mans_switch_threshold: int
+
+
+@dataclass(frozen=True)
 class Config:
     daemon: DaemonConfig
     contacts: dict[str, Contact]
     inboxes: dict[str, InboxConfig]
+    security: SecurityConfig | None = None
     address_index: dict[str, str] = field(default_factory=dict)
     """Maps lowercased email address to contact_id. Built at load time."""
 
@@ -193,9 +212,36 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     if not inboxes:
         raise ConfigError("no enabled [inbox:*] sections found")
 
+    security: SecurityConfig | None = None
+    if "security" in parser:
+        sec_section = parser["security"]
+        totp_secret = sec_section.get("totp_secret", "").strip()
+        if not totp_secret:
+            raise ConfigError("[security].totp_secret is required if [security] is present")
+        if not auth.is_valid_secret(totp_secret):
+            raise ConfigError(
+                "[security].totp_secret is not a valid base32 secret "
+                "(use `nightjar --setup-totp` to generate one)"
+            )
+        try:
+            window_minutes = int(sec_section.get("dead_mans_switch_window_minutes", "60"))
+            threshold = int(sec_section.get("dead_mans_switch_threshold", "3"))
+        except ValueError as e:
+            raise ConfigError(f"[security] integer field must be int: {e}") from e
+        if window_minutes <= 0:
+            raise ConfigError("[security].dead_mans_switch_window_minutes must be > 0")
+        if threshold <= 0:
+            raise ConfigError("[security].dead_mans_switch_threshold must be > 0")
+        security = SecurityConfig(
+            totp_secret=totp_secret,
+            dead_mans_switch_window_minutes=window_minutes,
+            dead_mans_switch_threshold=threshold,
+        )
+
     return Config(
         daemon=daemon,
         contacts=contacts,
         inboxes=inboxes,
+        security=security,
         address_index=address_index,
     )

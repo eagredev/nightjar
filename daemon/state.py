@@ -1,15 +1,13 @@
 """SQLite state layer for Nightjar.
 
-For Build Step 1 (watcher only), this initialises only the schema needed
-to record observed messages: the messages table itself, the
-daemon_heartbeat for cold-start detection, and a transitions audit log.
+Build Step 1 set up: messages, transitions, daemon_heartbeat.
+Build Step 2 adds: daemon_state (panic flag), used_totp_codes (replay
+protection), auth_failures (sliding-window counter for the
+dead-man's-switch).
 
 Future build steps add: principal_commands, principal_sessions,
-used_totp_codes, auth_failures, daemon_state, rate_buckets,
-contact_state, credit_ledger, pending_audits, cold_start_backlog.
-
-The full schema lives in DESIGN.md "State persistence" and will be
-introduced incrementally.
+rate_buckets, contact_state, credit_ledger, pending_audits,
+cold_start_backlog. The full schema lives in DESIGN.md.
 """
 from __future__ import annotations
 
@@ -56,6 +54,35 @@ CREATE TABLE IF NOT EXISTS daemon_heartbeat (
 );
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS daemon_state (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    panic_until_revived   INTEGER NOT NULL DEFAULT 0,
+    panic_reason          TEXT,
+    panic_at              INTEGER
+);
+INSERT OR IGNORE INTO daemon_state (id, panic_until_revived) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS used_totp_codes (
+    code     TEXT PRIMARY KEY,
+    used_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_used_totp_codes_used_at ON used_totp_codes(used_at);
+
+CREATE TABLE IF NOT EXISTS auth_failures (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    from_addr  TEXT NOT NULL,
+    reason     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_failures_ts ON auth_failures(ts);
+"""
+
+# How long a used TOTP code is remembered. Codes outside the verification
+# window (±30s) cannot succeed anyway, so 90s of replay-protection memory
+# is plenty.
+TOTP_REPLAY_RETENTION_SECONDS = 90
+
 
 class State:
     """Thin wrapper around sqlite3 with the connection lifecycle managed.
@@ -69,10 +96,13 @@ class State:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA_V1)
+            conn.executescript(SCHEMA_V2)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            elif row["version"] < 2:
+                conn.execute("UPDATE schema_version SET version = 2")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -166,3 +196,87 @@ class State:
                 "SELECT state, COUNT(*) AS n FROM messages GROUP BY state"
             ).fetchall()
             return {row["state"]: row["n"] for row in rows}
+
+    # --- Auth state (Build Step 2) -----------------------------------------
+
+    def is_panicked(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT panic_until_revived FROM daemon_state WHERE id = 1"
+            ).fetchone()
+            return bool(row and row["panic_until_revived"])
+
+    def panic_info(self) -> dict | None:
+        """Return panic_reason and panic_at if panicked, else None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT panic_until_revived, panic_reason, panic_at "
+                "FROM daemon_state WHERE id = 1"
+            ).fetchone()
+            if not row or not row["panic_until_revived"]:
+                return None
+            return {"reason": row["panic_reason"], "at": row["panic_at"]}
+
+    def trip_panic(self, *, reason: str, at: int | None = None) -> None:
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_state SET panic_until_revived = 1, "
+                "panic_reason = ?, panic_at = ? WHERE id = 1",
+                (reason, at),
+            )
+
+    def clear_panic(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_state SET panic_until_revived = 0, "
+                "panic_reason = NULL, panic_at = NULL WHERE id = 1"
+            )
+
+    def totp_code_was_used(self, code: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM used_totp_codes WHERE code = ?", (code,)
+            ).fetchone()
+            return row is not None
+
+    def mark_totp_code_used(self, code: str, at: int | None = None) -> bool:
+        """Insert the code as used. Returns True if new, False if replay."""
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO used_totp_codes (code, used_at) VALUES (?, ?)",
+                (code, at),
+            )
+            return cur.rowcount > 0
+
+    def prune_used_totp_codes(self, *, before: int | None = None) -> int:
+        """Drop codes older than `before` (default: now - retention). Returns rows deleted."""
+        cutoff = before if before is not None else int(time.time()) - TOTP_REPLAY_RETENTION_SECONDS
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM used_totp_codes WHERE used_at < ?", (cutoff,))
+            return cur.rowcount
+
+    def record_auth_failure(self, *, from_addr: str, reason: str, at: int | None = None) -> None:
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO auth_failures (ts, from_addr, reason) VALUES (?, ?, ?)",
+                (at, from_addr, reason),
+            )
+
+    def count_auth_failures_since(self, since: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM auth_failures WHERE ts >= ?", (since,)
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
+    def recent_auth_failures(self, *, limit: int = 10) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts, from_addr, reason FROM auth_failures "
+                "ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]

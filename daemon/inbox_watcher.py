@@ -22,10 +22,12 @@ import contextlib
 import email
 import email.utils
 import random
+import time
 from email.header import decode_header, make_header
 
 from aioimaplib import aioimaplib
 
+from . import auth
 from .config import InboxConfig, Config
 from .log import JSONLLogger
 from .state import State
@@ -46,6 +48,7 @@ class InboxWatcher:
         config: Config,
         state: State,
         logger: JSONLLogger,
+        on_panic: "callable | None" = None,
     ) -> None:
         self.inbox = inbox
         self.config = config
@@ -53,6 +56,9 @@ class InboxWatcher:
         self.logger = logger
         self._stop_event = asyncio.Event()
         self._backoff = INITIAL_BACKOFF_SECONDS
+        # Called with (reason: str) when the dead-man's-switch trips.
+        # main.py uses this to trigger a clean daemon shutdown.
+        self._on_panic = on_panic
 
     async def run(self) -> None:
         """Run forever (until stop() is called or asyncio cancels us)."""
@@ -262,6 +268,8 @@ class InboxWatcher:
 
         contact_id = self.config.address_index.get(from_addr)
 
+        panic_trip_reason: str | None = None
+
         if contact_id is None:
             state = "DROPPED"
             detail = "stranger"
@@ -273,9 +281,16 @@ class InboxWatcher:
             elif contact.daily_limit == 0:
                 state = "DROPPED"
                 detail = "blocked"
+            elif contact.is_principal:
+                # Principal mail must carry a valid TOTP code in the
+                # subject prefix. No code or a bad code is a switch
+                # counter increment; threshold trips the dead-man's-switch.
+                state, detail, panic_trip_reason = self._authenticate_principal(
+                    subject=subject, from_addr=from_addr
+                )
             else:
-                # Build Step 1 doesn't yet implement triage. We mark the
-                # message RECEIVED and stop; later steps will pick it up.
+                # Allowlisted, in-quota contact mail. Build Step 2 still
+                # doesn't implement triage; later steps will pick this up.
                 state = "RECEIVED"
                 detail = "ok"
 
@@ -298,6 +313,105 @@ class InboxWatcher:
                 disposition=detail,
                 subject_preview=(subject or "")[:80],
             )
+
+        if panic_trip_reason is not None:
+            self._trip_dead_mans_switch(panic_trip_reason)
+
+    def _authenticate_principal(
+        self, *, subject: str | None, from_addr: str
+    ) -> tuple[str, str, str | None]:
+        """Verify the TOTP code on a principal-claimed email.
+
+        Returns (state, disposition, panic_reason). `panic_reason` is
+        non-None iff this failure tripped the switch. The caller writes
+        the message row, then trips the switch (so the failure that
+        tripped it is durably recorded before shutdown).
+        """
+        security = self.config.security
+        if security is None:
+            # No [security] block: refuse to auth principal mail at all.
+            # Treat as a misconfiguration, not a switch trip.
+            self.logger.event(
+                "principal_auth_misconfigured",
+                inbox=self.inbox.name,
+                level="warn",
+                from_addr=from_addr,
+            )
+            return "DROPPED", "no_security_config", None
+
+        code = auth.extract_code_from_subject(subject)
+
+        if code is None:
+            return self._handle_auth_failure(
+                from_addr=from_addr, reason="no_totp_code", security=security
+            )
+
+        if not auth.verify_totp(secret=security.totp_secret, code=code):
+            return self._handle_auth_failure(
+                from_addr=from_addr, reason="bad_totp_code", security=security
+            )
+
+        # Replay protection: if this exact code already consumed within
+        # the retention window, reject. mark_totp_code_used returns
+        # False on duplicate.
+        if not self.state.mark_totp_code_used(code):
+            return self._handle_auth_failure(
+                from_addr=from_addr, reason="totp_replay", security=security
+            )
+
+        # Opportunistic prune of stale codes (cheap, keeps the table small).
+        self.state.prune_used_totp_codes()
+
+        self.logger.event(
+            "principal_auth_ok",
+            inbox=self.inbox.name,
+            from_addr=from_addr,
+        )
+        return "RECEIVED", "ok", None
+
+    def _handle_auth_failure(
+        self,
+        *,
+        from_addr: str,
+        reason: str,
+        security,
+    ) -> tuple[str, str, str | None]:
+        """Record an auth failure, return classification + panic_reason if tripped."""
+        self.state.record_auth_failure(from_addr=from_addr, reason=reason)
+        window_seconds = security.dead_mans_switch_window_minutes * 60
+        since = int(time.time()) - window_seconds
+        recent_failures = self.state.count_auth_failures_since(since)
+        self.logger.event(
+            "principal_auth_failed",
+            inbox=self.inbox.name,
+            level="warn",
+            from_addr=from_addr,
+            reason=reason,
+            recent_failures=recent_failures,
+            threshold=security.dead_mans_switch_threshold,
+        )
+        if recent_failures >= security.dead_mans_switch_threshold:
+            panic_reason = (
+                f"{recent_failures} invalid TOTP attempts within "
+                f"{security.dead_mans_switch_window_minutes} minutes "
+                f"from {from_addr}"
+            )
+            return "DROPPED", reason, panic_reason
+        return "DROPPED", reason, None
+
+    def _trip_dead_mans_switch(self, reason: str) -> None:
+        """Persist panic state and signal the daemon to halt."""
+        self.state.trip_panic(reason=reason)
+        self.logger.event(
+            "panic_tripped",
+            inbox=self.inbox.name,
+            level="error",
+            reason=reason,
+        )
+        if self._on_panic is not None:
+            self._on_panic(reason)
+        # Set our own stop event so this watcher exits its loop promptly.
+        self._stop_event.set()
 
     @staticmethod
     def _extract_literal(data: list) -> bytes | None:

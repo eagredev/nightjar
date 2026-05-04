@@ -23,3 +23,7 @@ logs/
 # Secrets, config lives in ~/.config/nightjar/, but defensive
 *.conf
 !example.conf
+
+# Operator incident reports (panic state, auth failures, etc.) are
+# private to the running instance and should never be committed.
+incidents/
