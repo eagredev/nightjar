@@ -56,6 +56,13 @@ class InboxConfig:
     imap_user: str
     imap_password: str
     allowed_contacts: tuple[str, ...]
+    # `trusted_authserv` is the authserv-id stamped by the inbox's MTA
+    # in its Authentication-Results header. Gmail uses "mx.google.com".
+    # The watcher gates inbound mail on this header's dmarc verdict;
+    # without a known trusted authserv, the daemon cannot tell real
+    # Gmail-stamped headers from attacker-injected ones, so this is
+    # required for any inbox that processes contact mail.
+    trusted_authserv: str = ""
 
 
 @dataclass(frozen=True)
@@ -267,6 +274,16 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
                 raise ConfigError(
                     f"{section_name}.allowed_contacts references unknown contact: {ref!r}"
                 )
+        trusted_authserv = section.get("trusted_authserv", "").strip()
+        if not trusted_authserv:
+            raise ConfigError(
+                f"{section_name}.trusted_authserv is required. Set it to the "
+                "authserv-id your provider stamps in Authentication-Results: "
+                "headers (Gmail: 'mx.google.com'). The daemon refuses to "
+                "process contact mail without a known authserv because it "
+                "cannot otherwise tell real DMARC verdicts from attacker-"
+                "injected ones."
+            )
         inbox = InboxConfig(
             name=inbox_name,
             enabled=enabled,
@@ -275,6 +292,7 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             imap_user=section["imap_user"].strip(),
             imap_password=section["imap_password"],
             allowed_contacts=allowed,
+            trusted_authserv=trusted_authserv,
         )
         inboxes[inbox_name] = inbox
 

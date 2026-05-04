@@ -41,6 +41,7 @@ def test_minimal_config_loads(tmp_path: Path) -> None:
         imap_port = 993
         imap_user = nightjar@example.com
         imap_password = secret
+        trusted_authserv = mx.google.com
         allowed_contacts = principal, friend
         """,
     )
@@ -74,6 +75,7 @@ def test_address_index_is_lowercased(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = principal
         """,
     )
@@ -104,6 +106,7 @@ def test_two_principals_rejected(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a, b
         """,
     )
@@ -132,6 +135,7 @@ def test_duplicate_address_rejected(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a, b
         """,
     )
@@ -156,6 +160,7 @@ def test_unknown_contact_in_allowlist_rejected(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a, ghost
         """,
     )
@@ -181,12 +186,14 @@ def test_disabled_inbox_skipped(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a
 
         [inbox:active]
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a
         """,
     )
@@ -234,6 +241,7 @@ def _conf_with_security(tmp_path: Path, *, security_block: str) -> Path:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a
 
         {security_block}
@@ -310,6 +318,7 @@ def _conf_with_claude(tmp_path: Path, *, claude_block: str) -> Path:
         imap_host = imap.example.com
         imap_user = me@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = a
 
         {claude_block}

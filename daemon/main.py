@@ -82,7 +82,19 @@ async def _main_async(config: Config) -> int:
         "daemon_start",
         inboxes=list(config.inboxes.keys()),
         contacts=len(config.contacts),
+        claude_configured=config.claude is not None,
     )
+
+    # Construct the Claude client once, share across watchers. None when
+    # [claude] is missing from config; in that case the contact-mail
+    # branch falls through to RECEIVED with disposition "no_claude_config"
+    # and no triage runs. The daemon does NOT refuse to start without a
+    # [claude] section: the principal command path (Steps 1-4) still
+    # works and is independently useful.
+    claude_client = None
+    if config.claude is not None:
+        from .triage import AnthropicClient
+        claude_client = AnthropicClient(api_key=config.claude.api_key)
 
     stop = asyncio.Event()
     panic_reason: dict[str, str] = {}  # mutable holder for the on_panic callback
@@ -102,7 +114,8 @@ async def _main_async(config: Config) -> int:
 
     watchers = [
         InboxWatcher(
-            inbox=ic, config=config, state=state, logger=logger, on_panic=_on_panic,
+            inbox=ic, config=config, state=state, logger=logger,
+            on_panic=_on_panic, claude_client=claude_client,
         )
         for ic in config.inboxes.values()
     ]

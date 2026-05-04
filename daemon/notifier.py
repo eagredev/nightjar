@@ -186,12 +186,19 @@ def notify_principal(
     body: str,
     jlogger: JSONLLogger | None = None,
     in_reply_to: str | None = None,
+    state: State | None = None,
+    related_message_id: str | None = None,
 ) -> SendResult:
     """Send to the principal. No footer, no audit copy.
 
     Used for: panic notifications, daily digests, replies to principal
     commands, audit-failure pings. The recipient is the principal so
     sending an audit copy would just be a duplicate.
+
+    `state`, when provided, gets one row per call appended to
+    outbound_log (the unified audit register). `related_message_id`
+    pins the row to the inbound mail that triggered this send when
+    applicable.
     """
     if smtp is None:
         raise SmtpNotConfiguredError(
@@ -208,6 +215,7 @@ def notify_principal(
     try:
         _smtp_send(smtp, msg)
     except Exception as e:
+        err = f"{type(e).__name__}: {e}"
         if jlogger is not None:
             jlogger.event(
                 "notify_principal_failed",
@@ -217,13 +225,24 @@ def notify_principal(
                 error=type(e).__name__,
                 message=str(e),
             )
+        if state is not None:
+            state.record_outbound(
+                channel="notify_principal",
+                to_addr=principal_addr,
+                subject=subject,
+                body=body,
+                smtp_message_id=primary_id,
+                related_message_id=related_message_id,
+                ok=False,
+                error=err,
+            )
         return SendResult(
             primary_message_id=primary_id,
             primary_sent=False,
             audit_sent=False,
             audit_queued=False,
             audit_id=None,
-            error=f"{type(e).__name__}: {e}",
+            error=err,
         )
     if jlogger is not None:
         jlogger.event(
@@ -231,6 +250,16 @@ def notify_principal(
             to_addr=principal_addr,
             subject=subject,
             message_id=primary_id,
+        )
+    if state is not None:
+        state.record_outbound(
+            channel="notify_principal",
+            to_addr=principal_addr,
+            subject=subject,
+            body=body,
+            smtp_message_id=primary_id,
+            related_message_id=related_message_id,
+            ok=True,
         )
     return SendResult(
         primary_message_id=primary_id,
@@ -253,6 +282,7 @@ def send_to_contact(
     in_reply_to: str | None = None,
     references: Iterable[str] | None = None,
     approval_token: str | None = None,
+    related_message_id: str | None = None,
 ) -> SendResult:
     """Send to a third-party contact with mandatory footer + audit copy.
 
@@ -370,6 +400,31 @@ def send_to_contact(
             audit_sent=audit_sent,
             audit_queued=audit_queued,
         )
+
+    # Two outbound_log rows per call: one for the contact send, one for
+    # the audit-to-principal. The contact body is stored with footer
+    # included (that's what the contact actually saw); the audit body
+    # is stored with the (SEND FAILED) banner if applicable.
+    state.record_outbound(
+        channel="send_to_contact",
+        to_addr=contact_addr,
+        subject=subject,
+        body=body_with_footer,
+        smtp_message_id=primary_id,
+        related_message_id=related_message_id,
+        ok=primary_sent,
+        error=primary_error,
+    )
+    state.record_outbound(
+        channel="audit_copy",
+        to_addr=principal_addr,
+        subject=audit_subject,
+        body=audit_body,
+        smtp_message_id=audit_msg["Message-ID"],
+        related_message_id=related_message_id,
+        ok=audit_sent,
+        error=audit_error,
+    )
 
     return SendResult(
         primary_message_id=primary_id,

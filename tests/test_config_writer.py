@@ -43,6 +43,7 @@ def baseline_conf(tmp_path: Path) -> Path:
         imap_port = 993
         imap_user = nightjar@example.com
         imap_password = secret
+        trusted_authserv = mx.google.com
         allowed_contacts = principal, friend
         """,
     )
@@ -260,12 +261,14 @@ def test_remove_contact_strips_from_multiple_inboxes(tmp_path: Path) -> None:
         imap_host = imap.example.com
         imap_user = one@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = principal, friend
 
         [inbox:two]
         imap_host = imap.example.com
         imap_user = two@example.com
         imap_password = x
+        trusted_authserv = mx.google.com
         allowed_contacts = principal, friend
         """,
     )
