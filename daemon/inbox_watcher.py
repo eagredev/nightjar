@@ -209,15 +209,15 @@ class InboxWatcher:
             )
             return
 
-        # aioimaplib returns a list with mixed bytes / strings. The header
-        # block is the bytes element that contains MIME headers.
-        header_blob = b""
-        for chunk in data:
-            if isinstance(chunk, bytes) and b"\r\n" in chunk:
-                header_blob = chunk
-                break
-        if not header_blob:
-            self.logger.event("fetch_no_headers", inbox=self.inbox.name, uid=uid, level="warn")
+        header_blob = self._extract_literal(data)
+        if header_blob is None:
+            self.logger.event(
+                "fetch_no_headers",
+                inbox=self.inbox.name,
+                uid=uid,
+                level="warn",
+                response_shape=[type(c).__name__ for c in data],
+            )
             return
 
         msg = email.message_from_bytes(header_blob)
@@ -275,6 +275,49 @@ class InboxWatcher:
                 disposition=detail,
                 subject_preview=(subject or "")[:80],
             )
+
+    @staticmethod
+    def _extract_literal(data: list) -> bytes | None:
+        """Pull the literal payload out of an aioimaplib fetch response.
+
+        A typical single-UID fetch response is structured as:
+            [0] bytes      "1 FETCH (UID 1 BODY[HEADER] {N}"
+            [1] bytearray  <N bytes of payload>
+            [2] bytes      ")"
+            [3] bytes      "Success"  (or similar trailing token)
+
+        The robust extraction is: find the literal-size descriptor `{N}`
+        in any element, then look for a subsequent element of length N.
+        Falls back to the largest bytearray/bytes blob if the descriptor
+        is malformed.
+        """
+        import re
+
+        expected_size: int | None = None
+        for chunk in data:
+            if isinstance(chunk, (bytes, bytearray)):
+                m = re.search(rb"\{(\d+)\}", bytes(chunk))
+                if m:
+                    expected_size = int(m.group(1))
+                    break
+
+        if expected_size is not None:
+            for chunk in data:
+                if isinstance(chunk, (bytes, bytearray)) and len(chunk) == expected_size:
+                    return bytes(chunk)
+
+        # Fallback: pick the largest bytes/bytearray that looks like
+        # a real header block (contains "From:" or "Date:").
+        candidate: bytes | None = None
+        for chunk in data:
+            if not isinstance(chunk, (bytes, bytearray)):
+                continue
+            blob = bytes(chunk)
+            if (b"From:" in blob or b"Date:" in blob) and (
+                candidate is None or len(blob) > len(candidate)
+            ):
+                candidate = blob
+        return candidate
 
     @staticmethod
     def _decode_header(value: str | None) -> str | None:
