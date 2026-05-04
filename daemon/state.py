@@ -84,6 +84,31 @@ SCHEMA_V3_ALTER_HOTP_COUNTER = (
     "ALTER TABLE daemon_state ADD COLUMN hotp_counter INTEGER NOT NULL DEFAULT 0"
 )
 
+# V4 adds pending_audits, the queue of audit copies that need a retry. The
+# daemon writes to this table when an audit-copy SMTP send fails after the
+# primary already succeeded; a separate retry loop drains it. Fields are
+# enough to reconstruct the audit copy in full so the retry doesn't depend
+# on any other row staying around.
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS pending_audits (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    primary_message_id TEXT,
+    to_addr           TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at   INTEGER,
+    last_error        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_audits_attempts ON pending_audits(attempts);
+"""
+
+# Audit retry policy. The daemon retries up to MAX_AUDIT_ATTEMPTS times
+# before giving up; the row is left in place so the principal can see it
+# in the diagnostic surface and decide whether to resend manually.
+MAX_AUDIT_ATTEMPTS = 3
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -108,12 +133,15 @@ class State:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_state)")}
             if "hotp_counter" not in cols:
                 conn.execute(SCHEMA_V3_ALTER_HOTP_COUNTER)
+            # V4: pending_audits table. CREATE IF NOT EXISTS makes this
+            # idempotent without a separate column-presence check.
+            conn.executescript(SCHEMA_V4)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (3)")
-            elif row["version"] < 3:
-                conn.execute("UPDATE schema_version SET version = 3")
+                conn.execute("INSERT INTO schema_version (version) VALUES (4)")
+            elif row["version"] < 4:
+                conn.execute("UPDATE schema_version SET version = 4")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -309,3 +337,80 @@ class State:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # --- Pending audits (Build Step 3) -------------------------------------
+
+    def queue_audit(
+        self,
+        *,
+        primary_message_id: str | None,
+        to_addr: str,
+        subject: str,
+        body: str,
+        first_error: str | None = None,
+        at: int | None = None,
+    ) -> int:
+        """Insert a row representing a failed audit copy that needs retry.
+
+        `attempts` starts at 1 because we count the original failed
+        attempt. Returns the new row id.
+        """
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pending_audits (
+                    primary_message_id, to_addr, subject, body,
+                    created_at, attempts, last_attempt_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (primary_message_id, to_addr, subject, body, at, at, first_error),
+            )
+            return int(cur.lastrowid)
+
+    def list_pending_audits(self, *, max_attempts: int = MAX_AUDIT_ATTEMPTS) -> list[dict]:
+        """Return audits still under the retry budget, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, primary_message_id, to_addr, subject, body, "
+                "       created_at, attempts, last_attempt_at, last_error "
+                "FROM pending_audits "
+                "WHERE attempts < ? "
+                "ORDER BY created_at ASC",
+                (max_attempts,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_audit_attempt(
+        self,
+        *,
+        audit_id: int,
+        success: bool,
+        error: str | None = None,
+        at: int | None = None,
+    ) -> None:
+        """Record a retry outcome.
+
+        On success the row is deleted (audit is delivered, no further
+        action). On failure attempts is incremented and the error is
+        stored; the row stays for the next retry pass or for principal
+        diagnostic review if the attempt budget is exhausted.
+        """
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            if success:
+                conn.execute("DELETE FROM pending_audits WHERE id = ?", (audit_id,))
+            else:
+                conn.execute(
+                    "UPDATE pending_audits "
+                    "SET attempts = attempts + 1, last_attempt_at = ?, last_error = ? "
+                    "WHERE id = ?",
+                    (at, error, audit_id),
+                )
+
+    def count_pending_audits(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM pending_audits"
+            ).fetchone()
+            return int(row["n"]) if row else 0
