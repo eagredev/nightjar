@@ -230,3 +230,123 @@ def test_list_pending_audits_filters_exhausted(tmp_path: Path) -> None:
     s.mark_audit_attempt(audit_id=audit_id, success=False, error="e2")
     assert s.list_pending_audits() == []  # exhausted; not in retry queue
     assert s.count_pending_audits() == 1  # but the row stays for diagnostics
+
+
+# --- Approvals (Build Step 4b) ---------------------------------------------
+
+
+def test_approvals_starts_empty(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.list_pending_approvals() == []
+    assert s.count_pending_approvals() == 0
+    assert s.get_approval("nonexistent") is None
+
+
+def test_queue_approval_persists_args_and_tier(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="abc123",
+        message_id="<m1@example.com>",
+        verb="block",
+        args={"contact": "composer"},
+        tier=2,
+        at=1_700_000_000,
+    )
+    row = s.get_approval("abc123")
+    assert row is not None
+    assert row["verb"] == "block"
+    assert row["args"] == {"contact": "composer"}
+    assert row["tier"] == 2
+    assert row["state"] == "PENDING"
+    assert row["created_at"] == 1_700_000_000
+    # Default 7-day window
+    assert row["expires_at"] == 1_700_000_000 + 7 * 24 * 60 * 60
+
+
+def test_resolve_approval_marks_approved(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="t1", message_id="<m@x>", verb="block",
+        args={"contact": "c"}, tier=2,
+    )
+    assert s.resolve_approval(token="t1", outcome="APPROVED", detail="yes") is True
+    row = s.get_approval("t1")
+    assert row["state"] == "APPROVED"
+    assert row["resolved_detail"] == "yes"
+    # Already resolved: second resolve is a no-op.
+    assert s.resolve_approval(token="t1", outcome="DENIED") is False
+
+
+def test_resolve_approval_rejects_invalid_outcome(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="t1", message_id="<m@x>", verb="block",
+        args={}, tier=2,
+    )
+    import pytest
+    with pytest.raises(ValueError):
+        s.resolve_approval(token="t1", outcome="MAYBE")
+
+
+def test_resolve_approval_unknown_token_returns_false(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.resolve_approval(token="ghost", outcome="APPROVED") is False
+
+
+def test_list_pending_approvals_orders_oldest_first(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="a", message_id="<1@x>", verb="block",
+        args={}, tier=2, at=1_000,
+    )
+    s.queue_approval(
+        token="b", message_id="<2@x>", verb="forget",
+        args={}, tier=2, at=2_000,
+    )
+    rows = s.list_pending_approvals(now=2_500)
+    assert [r["token"] for r in rows] == ["a", "b"]
+
+
+def test_pending_approvals_excludes_resolved(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="a", message_id="<1@x>", verb="block",
+        args={}, tier=2,
+    )
+    s.queue_approval(
+        token="b", message_id="<2@x>", verb="forget",
+        args={}, tier=2,
+    )
+    s.resolve_approval(token="a", outcome="APPROVED")
+    rows = s.list_pending_approvals()
+    assert [r["token"] for r in rows] == ["b"]
+    assert s.count_pending_approvals() == 1
+
+
+def test_expire_approvals_flips_past_expiry(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="old", message_id="<1@x>", verb="block",
+        args={}, tier=2, at=1_000, window_seconds=10,
+    )
+    s.queue_approval(
+        token="new", message_id="<2@x>", verb="block",
+        args={}, tier=2, at=10_000, window_seconds=10,
+    )
+    flipped = s.expire_approvals(now=1_500)
+    assert flipped == 1
+    assert s.get_approval("old")["state"] == "EXPIRED"
+    assert s.get_approval("new")["state"] == "PENDING"
+
+
+def test_pending_approvals_excludes_expired_pre_flip(tmp_path: Path) -> None:
+    """list_pending_approvals filters by expires_at without needing
+    expire_approvals to have run yet — so it's safe to read at any time."""
+    s = make_state(tmp_path)
+    s.queue_approval(
+        token="old", message_id="<1@x>", verb="block",
+        args={}, tier=2, at=1_000, window_seconds=10,
+    )
+    rows = s.list_pending_approvals(now=2_000)
+    assert rows == []
+    assert s.count_pending_approvals(now=2_000) == 0
