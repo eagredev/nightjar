@@ -90,6 +90,28 @@ def test_extract_code_only_matches_at_start() -> None:
     assert auth.extract_code_from_subject("hello [123456] world") is None
 
 
+def test_extract_code_accepts_bare_form() -> None:
+    """Bare 123456 (no brackets) is also accepted as the prefix."""
+    assert auth.extract_code_from_subject("123456 do the thing") == "123456"
+    assert auth.extract_code_from_subject("  654321  hi") == "654321"
+    assert auth.extract_code_from_subject("123456") == "123456"
+
+
+def test_extract_code_bare_form_handles_reply_prefix() -> None:
+    assert auth.extract_code_from_subject("Re: 123456 existing thread") == "123456"
+    assert auth.extract_code_from_subject("Fwd: 654321 forwarded") == "654321"
+
+
+def test_extract_code_bare_form_requires_whitespace_boundary() -> None:
+    """`123456foo` must NOT match — would be ambiguous with a future
+    digit-prefixed verb."""
+    assert auth.extract_code_from_subject("123456foo") is None
+    assert auth.extract_code_from_subject("123456abc") is None
+    # Wrong-length bare digits also rejected.
+    assert auth.extract_code_from_subject("12345 short") is None
+    assert auth.extract_code_from_subject("1234567 long") is None
+
+
 def test_provisioning_uri_round_trips_secret() -> None:
     secret = auth.generate_secret()
     uri = auth.provisioning_uri(secret=secret, account="test@example.com")

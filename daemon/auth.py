@@ -38,9 +38,12 @@ TOTP_PERIOD_SECONDS = 30
 # ±1 window of clock skew tolerance, per RFC 6238 §6 implementation note.
 TOTP_GRACE_WINDOWS = 1
 
-# Subject-line code format: leading [123456], optionally followed by
-# whitespace and the rest of the subject. Anchored to the start.
-_SUBJECT_CODE_RE = re.compile(r"^\s*\[(\d{6})\]")
+# Subject-line code format: leading 6-digit code, optionally bracketed.
+# Either `[123456] verb...` or `123456 verb...` is accepted; the bare
+# form must be followed by whitespace (or end-of-string) so that
+# `123456foo` does not match. The bracketed form is unambiguous on
+# its own. Anchored to the start of the subject.
+_SUBJECT_CODE_RE = re.compile(r"^\s*(?:\[(\d{6})\]|(\d{6})(?=\s|$))")
 
 # Base32 alphabet for secret validation.
 _BASE32_RE = re.compile(r"^[A-Z2-7]+=*$")
@@ -238,10 +241,13 @@ def hotp_provisioning_uri(
 
 
 def extract_code_from_subject(subject: str | None) -> str | None:
-    """Pull a 6-digit `[123456]` prefix out of a Subject header.
+    """Pull a 6-digit auth code prefix out of a Subject header.
 
-    Returns the bare code or None. Tolerates leading whitespace and
-    common Re:/Fwd: prefixes by stripping them once before matching.
+    Accepts either `[123456] verb` or bare `123456 verb`. The bare
+    form must be followed by whitespace so a verb that happens to
+    begin with digits is not misread. Returns the 6-digit code or
+    None. Tolerates leading whitespace and common Re:/Fwd: prefixes
+    by stripping one once before matching.
     """
     if not subject:
         return None
@@ -250,4 +256,6 @@ def extract_code_from_subject(subject: str | None) -> str | None:
     # `Re: [123456] foo` still works for back-and-forth threads.
     s = re.sub(r"^(?:re|fwd|fw)\s*:\s*", "", s, flags=re.IGNORECASE)
     m = _SUBJECT_CODE_RE.match(s)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    return m.group(1) or m.group(2)

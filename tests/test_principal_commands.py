@@ -88,6 +88,34 @@ def test_parse_strips_leading_code() -> None:
     assert cmd.args == {"date": "2026-05-04"}
 
 
+def test_parse_strips_bare_leading_code() -> None:
+    """Bare `123456` (no brackets) is accepted as a prefix the same
+    way as the bracketed form."""
+    cmd = parse_principal_command("123456 tail log 2026-05-04")
+    assert cmd.verb == "tail log"
+    assert cmd.args == {"date": "2026-05-04"}
+
+
+def test_parse_bare_code_with_approval_verdict() -> None:
+    """The realistic verdict subject is `[code] [Nightjar #token]
+    VERDICT` — bare code form should match the bracketed-form path."""
+    cmd = parse_principal_command("123456 [Nightjar #abc1234] YES IRREVERSIBLE")
+    assert cmd.approval_token == "abc1234"
+    assert cmd.approval_verdict == "IRREVERSIBLE"
+
+
+def test_parse_bare_code_with_reply_prefix_first() -> None:
+    """`Re: 123456 [Nightjar #...] verdict` order also works."""
+    cmd = parse_principal_command("Re: 123456 [Nightjar #abc1234] yes")
+    assert cmd.approval_token == "abc1234"
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_bare_code_with_yes_interpret() -> None:
+    cmd = parse_principal_command("123456 yes interpret")
+    assert cmd.interpret_choice == "INTERPRET"
+
+
 def test_parse_show_contact_requires_arg() -> None:
     """Naked 'show contact' shouldn't match (we want the arg form)."""
     cmd = parse_principal_command("show contact")

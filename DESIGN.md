@@ -290,10 +290,11 @@ counter increments.
 - **Seed never enters LLM context.** It's loaded only by
   `daemon/auth.py`. No prompt, no tool result, no log line ever
   contains it.
-- **Code location in email:** Subject-line prefix in square
-  brackets, e.g. `[123456] Nightjar, run the build`. Easy to type
-  on a phone keyboard, easy for the daemon to extract via regex
-  before any LLM is invoked.
+- **Code location in email:** Subject-line prefix, either bracketed
+  or bare, e.g. `[123456] run the build` or `123456 run the build`.
+  Both forms are accepted; the bare form must be followed by
+  whitespace. Easy to type on a phone keyboard, easy for the daemon
+  to extract via regex before any LLM is invoked.
 - **Verification:** Pure Python `hmac.compare_digest()` against the
   current 30-second window plus a one-window grace either side
   (clock skew tolerance). Stdlib only.
@@ -671,11 +672,18 @@ request. No unauthenticated email gets to the parser.
                                                     triggers double-confirm)
 ```
 
-The TOTP prefix is mandatory; the rest is parsed by the daemon. Strict
-form: the verb (and any args) is the entire subject after the code,
-with no decorative lead-in. A subject like `[123456] Nightjar, status`
-is treated as free-form, not as the `status` verb, because the parser
-matches the verb pattern against the full post-code subject.
+The auth-code prefix is mandatory; the rest is parsed by the daemon.
+The brackets are optional: `123456 status` is accepted the same way
+as `[123456] status`. The bare form must be followed by a whitespace
+boundary so that a future verb beginning with digits (none today) is
+not misread as a code. The bracketed form remains the canonical
+example because it is unambiguous on its own.
+
+Strict form: the verb (and any args) is the entire subject after the
+code, with no decorative lead-in. A subject like `[123456] Nightjar,
+status` is treated as free-form, not as the `status` verb, because
+the parser matches the verb pattern against the full post-code
+subject.
 
 ### Deterministic commands (free, no LLM)
 

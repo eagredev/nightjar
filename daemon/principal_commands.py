@@ -157,8 +157,10 @@ _APPROVAL_TOKEN_RE = re.compile(
 )
 
 # The TOTP/HOTP prefix is normally stripped by the auth layer, but the
-# parser tolerates a leftover [123456] in case the caller forgets.
-_LEADING_CODE_RE = re.compile(r"^\s*\[\d{6}\]\s*")
+# parser tolerates a leftover 6-digit code in case the caller forgets.
+# Either `[123456]` or bare `123456` (the bare form requires a trailing
+# whitespace boundary so a future digit-prefixed verb is not misread).
+_LEADING_CODE_RE = re.compile(r"^\s*(?:\[\d{6}\]|\d{6}(?=\s|$))\s*")
 
 # Common reply prefixes. Stripped before approval-token detection.
 _REPLY_PREFIX_RE = re.compile(r"^(?:re|fwd|fw)\s*:\s*", re.IGNORECASE)
