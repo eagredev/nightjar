@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS auth_failures (
 CREATE INDEX IF NOT EXISTS idx_auth_failures_ts ON auth_failures(ts);
 """
 
+# V3 adds the HOTP counter on daemon_state. Existing rows on V2 databases
+# will gain the new column with default 0 via the ALTER below.
+SCHEMA_V3_ALTER_HOTP_COUNTER = (
+    "ALTER TABLE daemon_state ADD COLUMN hotp_counter INTEGER NOT NULL DEFAULT 0"
+)
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -97,12 +103,17 @@ class State:
         with self._connect() as conn:
             conn.executescript(SCHEMA_V1)
             conn.executescript(SCHEMA_V2)
+            # V3: add hotp_counter to daemon_state. Idempotent because we
+            # check the column list before issuing the ALTER.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_state)")}
+            if "hotp_counter" not in cols:
+                conn.execute(SCHEMA_V3_ALTER_HOTP_COUNTER)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (2)")
-            elif row["version"] < 2:
-                conn.execute("UPDATE schema_version SET version = 2")
+                conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+            elif row["version"] < 3:
+                conn.execute("UPDATE schema_version SET version = 3")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -231,6 +242,24 @@ class State:
             conn.execute(
                 "UPDATE daemon_state SET panic_until_revived = 0, "
                 "panic_reason = NULL, panic_at = NULL WHERE id = 1"
+            )
+
+    def get_hotp_counter(self) -> int:
+        """Return the highest HOTP counter consumed so far. 0 means no codes used yet."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT hotp_counter FROM daemon_state WHERE id = 1"
+            ).fetchone()
+            return int(row["hotp_counter"]) if row else 0
+
+    def set_hotp_counter(self, counter: int) -> None:
+        """Set the HOTP counter. Called on (re)provision (resets to 0) and on accepted codes."""
+        if counter < 0:
+            raise ValueError("hotp_counter must be >= 0")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_state SET hotp_counter = ? WHERE id = 1",
+                (counter,),
             )
 
     def totp_code_was_used(self, code: str) -> bool:

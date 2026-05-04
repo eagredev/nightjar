@@ -57,17 +57,28 @@ class InboxConfig:
     allowed_contacts: tuple[str, ...]
 
 
+AUTH_MODES = ("hotp", "totp")
+DEFAULT_AUTH_MODE = "hotp"
+
+
 @dataclass(frozen=True)
 class SecurityConfig:
-    """TOTP and dead-man's-switch tuning.
+    """Authentication and dead-man's-switch tuning.
 
     `totp_secret` is sensitive: it never leaves this dataclass except
     into `daemon/auth.py`. Don't log it, don't include it in any tool
     result, don't pass it to any LLM call.
+
+    `auth_mode` selects between HOTP (counter-based, the default — no
+    time pressure on the operator, well-suited to email's async nature)
+    and TOTP (time-based, useful when you want codes to auto-expire).
+    The shared base32 secret is reused either way; only the verification
+    primitive changes.
     """
     totp_secret: str
     dead_mans_switch_window_minutes: int
     dead_mans_switch_threshold: int
+    auth_mode: str = DEFAULT_AUTH_MODE
 
 
 @dataclass(frozen=True)
@@ -232,10 +243,16 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             raise ConfigError("[security].dead_mans_switch_window_minutes must be > 0")
         if threshold <= 0:
             raise ConfigError("[security].dead_mans_switch_threshold must be > 0")
+        auth_mode = sec_section.get("auth_mode", DEFAULT_AUTH_MODE).strip().lower()
+        if auth_mode not in AUTH_MODES:
+            raise ConfigError(
+                f"[security].auth_mode must be one of {AUTH_MODES}, got: {auth_mode!r}"
+            )
         security = SecurityConfig(
             totp_secret=totp_secret,
             dead_mans_switch_window_minutes=window_minutes,
             dead_mans_switch_threshold=threshold,
+            auth_mode=auth_mode,
         )
 
     return Config(

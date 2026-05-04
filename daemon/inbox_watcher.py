@@ -343,29 +343,55 @@ class InboxWatcher:
 
         if code is None:
             return self._handle_auth_failure(
-                from_addr=from_addr, reason="no_totp_code", security=security
+                from_addr=from_addr, reason="no_auth_code", security=security
             )
 
+        if security.auth_mode == "hotp":
+            return self._authenticate_principal_hotp(
+                code=code, from_addr=from_addr, security=security
+            )
+        return self._authenticate_principal_totp(
+            code=code, from_addr=from_addr, security=security
+        )
+
+    def _authenticate_principal_totp(
+        self, *, code: str, from_addr: str, security
+    ) -> tuple[str, str, str | None]:
         if not auth.verify_totp(secret=security.totp_secret, code=code):
             return self._handle_auth_failure(
                 from_addr=from_addr, reason="bad_totp_code", security=security
             )
-
-        # Replay protection: if this exact code already consumed within
-        # the retention window, reject. mark_totp_code_used returns
-        # False on duplicate.
         if not self.state.mark_totp_code_used(code):
             return self._handle_auth_failure(
                 from_addr=from_addr, reason="totp_replay", security=security
             )
-
-        # Opportunistic prune of stale codes (cheap, keeps the table small).
         self.state.prune_used_totp_codes()
+        self.logger.event("principal_auth_ok", inbox=self.inbox.name, from_addr=from_addr, mode="totp")
+        return "RECEIVED", "ok", None
 
+    def _authenticate_principal_hotp(
+        self, *, code: str, from_addr: str, security
+    ) -> tuple[str, str, str | None]:
+        last = self.state.get_hotp_counter()
+        matched = auth.verify_hotp(
+            secret=security.totp_secret, code=code, last_counter=last
+        )
+        if matched is None:
+            return self._handle_auth_failure(
+                from_addr=from_addr, reason="bad_hotp_code", security=security
+            )
+        # Advance to the matched counter. RFC 4226 lookahead burns the
+        # skipped counters so they can't be replayed if the operator
+        # accidentally tapped past them on the authenticator.
+        skipped = matched - last - 1
+        self.state.set_hotp_counter(matched)
         self.logger.event(
             "principal_auth_ok",
             inbox=self.inbox.name,
             from_addr=from_addr,
+            mode="hotp",
+            counter=matched,
+            skipped=skipped,
         )
         return "RECEIVED", "ok", None
 
