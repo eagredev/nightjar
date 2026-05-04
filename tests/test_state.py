@@ -341,7 +341,7 @@ def test_expire_approvals_flips_past_expiry(tmp_path: Path) -> None:
 
 def test_pending_approvals_excludes_expired_pre_flip(tmp_path: Path) -> None:
     """list_pending_approvals filters by expires_at without needing
-    expire_approvals to have run yet — so it's safe to read at any time."""
+    expire_approvals to have run yet -- so it's safe to read at any time."""
     s = make_state(tmp_path)
     s.queue_approval(
         token="old", message_id="<1@x>", verb="block",
@@ -350,3 +350,39 @@ def test_pending_approvals_excludes_expired_pre_flip(tmp_path: Path) -> None:
     rows = s.list_pending_approvals(now=2_000)
     assert rows == []
     assert s.count_pending_approvals(now=2_000) == 0
+
+
+# --- Contact blocks (Build Step 4b) ----------------------------------------
+
+
+def test_contact_blocks_starts_empty(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.is_contact_blocked("composer") is False
+    assert s.list_blocked_contacts() == []
+
+
+def test_block_contact_is_idempotent(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.block_contact(contact_id="composer", at=1_000) is True
+    assert s.block_contact(contact_id="composer", at=2_000) is False
+    assert s.is_contact_blocked("composer") is True
+
+
+def test_unblock_contact_returns_true_when_was_blocked(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.block_contact(contact_id="composer", at=1_000)
+    assert s.unblock_contact(contact_id="composer") is True
+    assert s.is_contact_blocked("composer") is False
+
+
+def test_unblock_contact_returns_false_when_not_blocked(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.unblock_contact(contact_id="composer") is False
+
+
+def test_list_blocked_contacts_orders_by_blocked_at(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.block_contact(contact_id="b", at=2_000)
+    s.block_contact(contact_id="a", at=1_000)
+    rows = s.list_blocked_contacts()
+    assert [r["contact_id"] for r in rows] == ["a", "b"]

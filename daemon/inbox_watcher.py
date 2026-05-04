@@ -287,6 +287,16 @@ class InboxWatcher:
             if contact_id not in self.inbox.allowed_contacts:
                 state = "DROPPED"
                 detail = "contact_not_allowed_on_inbox"
+            elif self.state.is_contact_blocked(contact_id):
+                # Live block flag set by the `block` tier-2 verb. The
+                # principal can lift it with `unblock`; nightjar.conf is
+                # not touched. We check this BEFORE is_principal so a
+                # block on the principal is honoured (defensive: a
+                # principal who blocks themselves can recover via the
+                # state DB directly, but the daemon will refuse their
+                # mail until then).
+                state = "DROPPED"
+                detail = "contact_blocked"
             elif contact.daily_limit == 0:
                 state = "DROPPED"
                 detail = "blocked"
