@@ -152,6 +152,32 @@ CREATE TABLE IF NOT EXISTS contact_blocks (
 );
 """
 
+# V7 adds claude_invocations, the spend ledger for triage and (later)
+# principal-command interpretation calls. Two functions of the table:
+#   1. Rate limit. count_claude_invocations_since() backs the in-daemon
+#      runaway-loop guard. The first line of cost defence is the
+#      Anthropic console spend cap; this table is the second.
+#   2. Audit trail. Every call logs sender, model, token counts. An
+#      operator inspecting "what did Claude do today" reads here.
+# The api_key is NEVER recorded. Neither is the prompt nor the response.
+# Only metadata: who triggered the call, what model, how many tokens,
+# whether it ended ok or with an error reason.
+SCHEMA_V7 = """
+CREATE TABLE IF NOT EXISTS claude_invocations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    purpose         TEXT NOT NULL,
+    contact_id      TEXT,
+    model           TEXT NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    ok              INTEGER NOT NULL,
+    error_reason    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_claude_invocations_ts ON claude_invocations(ts);
+CREATE INDEX IF NOT EXISTS idx_claude_invocations_contact ON claude_invocations(contact_id);
+"""
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -183,12 +209,14 @@ class State:
             conn.executescript(SCHEMA_V5)
             # V6: contact_blocks table. Same pattern.
             conn.executescript(SCHEMA_V6)
+            # V7: claude_invocations table. Same pattern.
+            conn.executescript(SCHEMA_V7)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (6)")
-            elif row["version"] < 6:
-                conn.execute("UPDATE schema_version SET version = 6")
+                conn.execute("INSERT INTO schema_version (version) VALUES (7)")
+            elif row["version"] < 7:
+                conn.execute("UPDATE schema_version SET version = 7")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -629,5 +657,67 @@ class State:
             rows = conn.execute(
                 "SELECT contact_id, blocked_at, reason "
                 "FROM contact_blocks ORDER BY blocked_at ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ---- Claude invocation ledger (V7) -----------------------------------
+
+    def record_claude_invocation(
+        self,
+        *,
+        purpose: str,
+        contact_id: str | None,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        ok: bool,
+        error_reason: str | None = None,
+        ts: int | None = None,
+    ) -> int:
+        """Append one row to the spend ledger. Returns the new row id.
+
+        `purpose` is a short identifier like "triage" or
+        "principal_interpret" so the ledger can be sliced by use case
+        when reasoning about cost. Never includes prompt content.
+        """
+        ts = ts if ts is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO claude_invocations "
+                "(ts, purpose, contact_id, model, input_tokens, "
+                " output_tokens, ok, error_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ts, purpose, contact_id, model,
+                    int(input_tokens), int(output_tokens),
+                    1 if ok else 0, error_reason,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def count_claude_invocations_since(self, *, since_ts: int) -> int:
+        """How many calls have been recorded since the given timestamp.
+
+        Used by the in-daemon rate limit. The watcher calls this with
+        `since_ts = now - 3600` and refuses a triage call if the count
+        is at or above the per-hour cap from [claude].
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM claude_invocations WHERE ts >= ?",
+                (int(since_ts),),
+            ).fetchone()
+            return int(row["n"]) if row is not None else 0
+
+    def list_recent_claude_invocations(self, *, limit: int = 50) -> list[dict]:
+        """Most recent ledger rows, newest first. For diagnostic surfaces
+        like `[code] tail spend` (lands in a later step)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, purpose, contact_id, model, "
+                "       input_tokens, output_tokens, ok, error_reason "
+                "FROM claude_invocations "
+                "ORDER BY ts DESC, id DESC LIMIT ?",
+                (int(limit),),
             ).fetchall()
             return [dict(row) for row in rows]
