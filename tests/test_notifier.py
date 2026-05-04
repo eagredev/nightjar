@@ -298,3 +298,151 @@ def test_send_audit_retry_failure_increments_attempts(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["attempts"] == 2
     assert "ConnectionResetError" in (rows[0]["last_error"] or "")
+
+
+# --- forward_to_principal --------------------------------------------------
+
+
+_SAMPLE_RFC822 = (
+    b"From: composer@example.com\r\n"
+    b"To: bot@example.com\r\n"
+    b"Subject: original\r\n"
+    b"Message-ID: <orig@example.com>\r\n"
+    b"\r\n"
+    b"Original message body.\r\n"
+)
+
+
+def test_forward_to_principal_raises_without_smtp_config(tmp_path: Path) -> None:
+    state = make_state(tmp_path)
+    with pytest.raises(notifier.SmtpNotConfiguredError):
+        notifier.forward_to_principal(
+            smtp=None,
+            state=state,
+            principal_addr="me@example.com",
+            subject="Fwd: x",
+            wrapper_body="x",
+            raw_rfc822=_SAMPLE_RFC822,
+        )
+
+
+def test_forward_to_principal_sends_message_with_rfc822_attachment(tmp_path: Path) -> None:
+    """The forwarded email is multipart with one message/rfc822 part
+    carrying the original bytes verbatim."""
+    state = make_state(tmp_path)
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        result = notifier.forward_to_principal(
+            smtp=SMTP_CONFIG,
+            state=state,
+            principal_addr="me@example.com",
+            subject="Fwd: original",
+            wrapper_body="Triage: composer sent a track.\n",
+            raw_rfc822=_SAMPLE_RFC822,
+        )
+    assert result.primary_sent is True
+    # Exactly one SMTP transaction (no audit copy).
+    assert len(FakeSMTP.instances) == 1
+    sent = FakeSMTP.instances[0].sent_messages
+    assert len(sent) == 1
+    msg = sent[0]
+    assert msg.is_multipart()
+    # Find the message/rfc822 part.
+    rfc822_parts = [p for p in msg.walk() if p.get_content_type() == "message/rfc822"]
+    assert len(rfc822_parts) == 1
+    # The original headers and body are preserved inside the attachment.
+    # The attachment is emitted as a parsed inner message so the headers
+    # are visible inline (8bit encoding, not base64).
+    rendered = rfc822_parts[0].as_string()
+    assert "Subject: original" in rendered
+    assert "Original message body." in rendered
+    # The wrapper body is the cover note, present in the multipart.
+    plain_part = next(
+        p for p in msg.walk() if p.get_content_type() == "text/plain"
+    )
+    assert "Triage: composer sent a track." in plain_part.get_payload()
+
+
+def test_forward_to_principal_writes_outbound_log_row(tmp_path: Path) -> None:
+    state = make_state(tmp_path)
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.forward_to_principal(
+            smtp=SMTP_CONFIG,
+            state=state,
+            principal_addr="me@example.com",
+            subject="Fwd: x",
+            wrapper_body="body",
+            raw_rfc822=_SAMPLE_RFC822,
+            related_message_id="<orig@example.com>",
+        )
+    rows = state.list_recent_outbound(limit=10)
+    forwarded = [r for r in rows if r["channel"] == "forward_to_principal"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["to_addr"] == "me@example.com"
+    assert forwarded[0]["ok"] == 1
+    assert forwarded[0]["related_message_id"] == "<orig@example.com>"
+
+
+def test_forward_to_principal_returns_error_on_smtp_failure(tmp_path: Path) -> None:
+    state = make_state(tmp_path)
+    fake = FakeSMTP("x", 0)
+    fake.fail_on_send = ConnectionRefusedError("mail server down")
+
+    def factory(*a, **k):
+        return fake
+
+    with patch.object(notifier.smtplib, "SMTP", factory):
+        result = notifier.forward_to_principal(
+            smtp=SMTP_CONFIG,
+            state=state,
+            principal_addr="me@example.com",
+            subject="Fwd: x",
+            wrapper_body="body",
+            raw_rfc822=_SAMPLE_RFC822,
+        )
+    assert result.primary_sent is False
+    assert "ConnectionRefusedError" in (result.error or "")
+    rows = state.list_recent_outbound(limit=10)
+    forwarded = [r for r in rows if r["channel"] == "forward_to_principal"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["ok"] == 0
+
+
+def test_forward_to_principal_does_not_modify_attached_bytes(tmp_path: Path) -> None:
+    """Fidelity guarantee: whatever bytes the watcher captured from
+    BODY.PEEK[] are what the principal opens. Re-encoding for transport
+    is allowed, but the bytes inside the message/rfc822 part must be
+    semantically identical to the input."""
+    state = make_state(tmp_path)
+    custom_payload = (
+        b"From: weird@example.com\r\n"
+        b"To: bot@example.com\r\n"
+        b"Subject: =?utf-8?b?aGVsbG8=?=\r\n"
+        b"Content-Type: multipart/mixed; boundary=BOUNDARY\r\n"
+        b"\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Inline plain.\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b"<b>HTML alternative.</b>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.forward_to_principal(
+            smtp=SMTP_CONFIG,
+            state=state,
+            principal_addr="me@example.com",
+            subject="Fwd: weird",
+            wrapper_body="body",
+            raw_rfc822=custom_payload,
+        )
+    sent = FakeSMTP.instances[0].sent_messages[0]
+    rfc822_part = next(p for p in sent.walk() if p.get_content_type() == "message/rfc822")
+    rendered = rfc822_part.as_string()
+    # Both alternatives are preserved verbatim inside the attachment.
+    assert "HTML alternative." in rendered
+    assert "Inline plain." in rendered
+    # The Subject decoded from utf-8 base64 round-trips through.
+    assert "hello" in rendered.lower() or "=?utf-8?b?aGVsbG8=?=" in rendered

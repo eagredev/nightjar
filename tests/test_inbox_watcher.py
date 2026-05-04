@@ -205,3 +205,159 @@ def test_format_original_email_block_appends_newline_when_body_lacks_one() -> No
         body_truncated=False,
     )
     assert "no trailing newline\n========== END ORIGINAL" in block
+
+
+# ---- Forward subject building (Step 6) ------------------------------------
+
+
+def test_build_forward_subject_adds_fwd_prefix() -> None:
+    assert InboxWatcher._build_forward_subject("track ready") == "Fwd: track ready"
+
+
+def test_build_forward_subject_does_not_double_prefix() -> None:
+    assert InboxWatcher._build_forward_subject("Fwd: x") == "Fwd: x"
+    assert InboxWatcher._build_forward_subject("FW: x") == "FW: x"
+
+
+def test_build_forward_subject_keeps_re_prefix() -> None:
+    """An existing Re: stays in place; Fwd: stacks in front."""
+    assert InboxWatcher._build_forward_subject("Re: track") == "Fwd: Re: track"
+
+
+def test_build_forward_subject_handles_none_or_empty() -> None:
+    assert InboxWatcher._build_forward_subject(None) == "Fwd: (no subject)"
+    assert InboxWatcher._build_forward_subject("") == "Fwd: (no subject)"
+    assert InboxWatcher._build_forward_subject("   ") == "Fwd: (no subject)"
+
+
+# ---- Message structure extraction (Step 6) --------------------------------
+
+
+def test_extract_structure_plain_text_only() -> None:
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: plain\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Just text.\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    assert s.has_html_alternative is False
+    assert s.attachment_count == 0
+    assert s.attachment_names == ()
+    assert s.inline_image_count == 0
+    assert s.total_size_bytes == len(blob)
+    assert s.body_truncated_in_prompt is False
+
+
+def test_extract_structure_detects_html_alternative() -> None:
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: alt\r\n"
+        b"Content-Type: multipart/alternative; boundary=BOUND\r\n"
+        b"\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"plain version\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<b>html version</b>\r\n"
+        b"--BOUND--\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    assert s.has_html_alternative is True
+    assert s.attachment_count == 0
+
+
+def test_extract_structure_counts_attachments() -> None:
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: with attachments\r\n"
+        b"Content-Type: multipart/mixed; boundary=BOUND\r\n"
+        b"\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"see attached\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: application/pdf; name=\"contract.pdf\"\r\n"
+        b"Content-Disposition: attachment; filename=\"contract.pdf\"\r\n\r\n"
+        b"(pdf bytes)\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: image/jpeg; name=\"scan.jpg\"\r\n"
+        b"Content-Disposition: attachment; filename=\"scan.jpg\"\r\n\r\n"
+        b"(jpg bytes)\r\n"
+        b"--BOUND--\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    assert s.attachment_count == 2
+    assert "contract.pdf" in s.attachment_names
+    assert "scan.jpg" in s.attachment_names
+
+
+def test_extract_structure_distinguishes_inline_image_from_attachment() -> None:
+    """An image with disposition=inline (or no disposition inside a
+    related multipart) is an inline image, not an attachment."""
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: inline pic\r\n"
+        b"Content-Type: multipart/related; boundary=BOUND\r\n"
+        b"\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<img src=\"cid:logo\">\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: image/png\r\n"
+        b"Content-Disposition: inline; filename=\"logo.png\"\r\n"
+        b"Content-ID: <logo>\r\n\r\n"
+        b"(png bytes)\r\n"
+        b"--BOUND--\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    assert s.inline_image_count == 1
+    assert s.attachment_count == 0
+
+
+def test_extract_structure_propagates_body_truncation() -> None:
+    blob = b"From: x@example.com\r\nSubject: s\r\n\r\nbody\r\n"
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=True,
+    )
+    assert s.body_truncated_in_prompt is True
+
+
+def test_extract_structure_handles_unnamed_attachment() -> None:
+    """Some senders emit attachments with no filename; we still count
+    them but use a placeholder so the LLM sees the count is non-zero."""
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: nameless\r\n"
+        b"Content-Type: multipart/mixed; boundary=BOUND\r\n"
+        b"\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"hi\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Disposition: attachment\r\n\r\n"
+        b"(bytes)\r\n"
+        b"--BOUND--\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    assert s.attachment_count == 1
+    assert "(unnamed application/octet-stream)" in s.attachment_names
