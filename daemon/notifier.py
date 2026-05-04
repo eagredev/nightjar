@@ -472,6 +472,8 @@ def forward_to_principal(
             "[smtp] is required to send mail; add it to nightjar.conf"
         )
 
+    from email import message_from_bytes
+
     msg = _build_message(
         smtp=smtp,
         to_addr=principal_addr,
@@ -480,15 +482,23 @@ def forward_to_principal(
     )
     primary_id = msg["Message-ID"]
 
-    # message/rfc822 attachment with the original bytes verbatim.
-    # EmailMessage handles the multipart/mixed wrapping automatically
-    # once an attachment is added.
-    msg.add_attachment(
-        raw_rfc822,
-        maintype="message",
-        subtype="rfc822",
-        filename=attachment_filename,
-    )
+    # message/rfc822 attachment. We pass the original as a parsed inner
+    # Message rather than as raw bytes so EmailMessage emits the
+    # RFC-canonical 8bit form rather than base64-wrapping. Mail clients
+    # will then render the attachment in-thread or as a clickable .eml.
+    # If the inner message fails to parse for some reason, we fall back
+    # to the raw-bytes form which is base64-wrapped but still a valid
+    # message/rfc822 attachment.
+    try:
+        inner = message_from_bytes(raw_rfc822)
+        msg.add_attachment(inner, filename=attachment_filename)
+    except Exception:
+        msg.add_attachment(
+            raw_rfc822,
+            maintype="message",
+            subtype="rfc822",
+            filename=attachment_filename,
+        )
 
     try:
         _smtp_send(smtp, msg)

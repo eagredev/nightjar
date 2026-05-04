@@ -1810,25 +1810,31 @@ class InboxWatcher:
             disposition = (part.get("Content-Disposition") or "").lower()
             filename = part.get_filename() or ""
 
+            if ctype == "text/html":
+                has_html_alternative = True
+                continue
+
+            # Inline images first: an image/* part is inline unless
+            # explicitly marked attachment. This catches the common
+            # multipart/related case where the image has a filename and
+            # a Content-ID but is rendered inline rather than offered
+            # as an attachment.
+            if ctype.startswith("image/") and "attachment" not in disposition:
+                inline_image_count += 1
+                continue
+
+            # Anything else with attachment disposition or a filename
+            # and a non-text type is an attachment.
             is_attachment = (
                 "attachment" in disposition
                 or (filename and not ctype.startswith("text/"))
             )
-            is_inline_image = (
-                ctype.startswith("image/")
-                and "attachment" not in disposition
-            )
-
-            if ctype == "text/html":
-                has_html_alternative = True
-            elif is_attachment:
+            if is_attachment:
                 attachment_count += 1
                 if filename:
                     attachment_names.append(filename)
                 else:
                     attachment_names.append(f"(unnamed {ctype})")
-            elif is_inline_image:
-                inline_image_count += 1
 
         return MessageStructure(
             has_html_alternative=has_html_alternative,

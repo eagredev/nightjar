@@ -516,3 +516,170 @@ def test_reply_warns_when_audit_failed_but_primary_sent(tmp_path: Path, monkeypa
     # the body about the audit-copy gap.
     assert result.ok is True
     assert "audit copy did NOT reach" in result.body
+
+
+# ---- forward_to_principal --------------------------------------------------
+
+
+_SAMPLE_RFC822 = (
+    b"From: composer@example.com\r\n"
+    b"To: bot@example.com\r\n"
+    b"Subject: original\r\n"
+    b"Message-ID: <orig@example.com>\r\n"
+    b"\r\n"
+    b"This is the original message body.\r\n"
+)
+
+
+def _b64(raw: bytes) -> str:
+    import base64
+    return base64.b64encode(raw).decode("ascii")
+
+
+def test_forward_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forward verb dispatches to notifier.forward_to_principal with the
+    decoded raw bytes verbatim and reports ok on success."""
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    captured: dict = {}
+
+    def fake_forward(*, smtp, state, principal_addr, subject, wrapper_body,
+                     raw_rfc822, attachment_filename="original_message.eml",
+                     jlogger=None, related_message_id=None):
+        captured.update(dict(
+            principal=principal_addr, subject=subject,
+            wrapper_body=wrapper_body, raw_rfc822=raw_rfc822,
+            related_message_id=related_message_id,
+        ))
+        return _StubSendResult()
+
+    monkeypatch.setattr(executor.notifier, "forward_to_principal", fake_forward)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={
+            "contact_id": "composer",
+            "subject": "Fwd: original",
+            "raw_rfc822_b64": _b64(_SAMPLE_RFC822),
+            "summary": "Composer sent a track for review.",
+            "reasoning": "Original tone matters; forwarding so principal sees the source.",
+            "risk_flags": ["sensitive_topic"],
+            "notes": "",
+            "in_reply_to": "<orig@example.com>",
+        },
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is True
+    assert "forwarded 'composer' to principal" in result.summary
+    assert captured["principal"] == "me@example.com"
+    assert captured["subject"] == "Fwd: original"
+    # Raw bytes attached verbatim, not re-encoded or rewritten.
+    assert captured["raw_rfc822"] == _SAMPLE_RFC822
+    # Wrapper body surfaces the LLM's reading.
+    assert "Composer sent a track for review." in captured["wrapper_body"]
+    assert "Original tone matters" in captured["wrapper_body"]
+    assert "sensitive_topic" in captured["wrapper_body"]
+    assert captured["related_message_id"] == "<orig@example.com>"
+
+
+def test_forward_rejects_missing_contact_id(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={"raw_rfc822_b64": _b64(_SAMPLE_RFC822)},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "missing 'contact_id'" in result.summary
+
+
+def test_forward_rejects_missing_raw_bytes(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={"contact_id": "composer"},
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "missing raw message" in result.summary
+
+
+def test_forward_rejects_corrupt_b64(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={
+            "contact_id": "composer",
+            "raw_rfc822_b64": "!!!not-valid-base64!!!",
+        },
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "corrupt raw message" in result.summary
+
+
+def test_forward_succeeds_when_contact_removed_after_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the contact has been removed between queue time and approval,
+    the forward still goes through (the bytes are in the args), but the
+    wrapper body flags the gap so the principal sees what happened.
+    """
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    captured: dict = {}
+
+    def fake_forward(*, wrapper_body, **kwargs):
+        captured["wrapper_body"] = wrapper_body
+        return _StubSendResult()
+
+    monkeypatch.setattr(executor.notifier, "forward_to_principal", fake_forward)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={
+            "contact_id": "ghost",
+            "subject": "Fwd: ghost",
+            "raw_rfc822_b64": _b64(_SAMPLE_RFC822),
+            "summary": "...",
+            "reasoning": "...",
+            "risk_flags": [],
+            "notes": "",
+            "in_reply_to": None,
+        },
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is True
+    assert "no longer configured" in captured["wrapper_body"]
+
+
+def test_forward_reports_send_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+
+    def fake_forward(**kwargs):
+        return _StubSendResult(
+            primary_sent=False, error="SMTPServerDisconnected: connection lost",
+        )
+
+    monkeypatch.setattr(executor.notifier, "forward_to_principal", fake_forward)
+    result = executor.execute(
+        verb="forward_to_principal",
+        args={
+            "contact_id": "composer",
+            "subject": "Fwd: x",
+            "raw_rfc822_b64": _b64(_SAMPLE_RFC822),
+            "summary": "...",
+            "reasoning": "...",
+            "risk_flags": [],
+            "notes": "",
+            "in_reply_to": None,
+        },
+        config=cfg, state=s, now=1,
+    )
+    assert result.ok is False
+    assert "send failed" in result.summary
+    assert "SMTPServerDisconnected" in result.body
