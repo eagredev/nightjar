@@ -537,13 +537,19 @@ flow). Both feed into the same execution layer once approved.
 |-------|-----------------|-----------------|
 | `AUTH_CHECK` | Principal-claimed email arrived | to `PARSED` or `AUTH_REJECTED` |
 | `AUTH_REJECTED` | TOTP missing/invalid/replay/DMARC fail | terminal; switch counter increments |
-| `PARSED` | TOTP valid; deterministic command parser ran | to `TIER_1_AUTOEXEC`, `TIER_2_QUEUED`, or `INTERPRET_REQUESTED` |
-| `TIER_1_AUTOEXEC` | Tier-1 verb recognised (status, list, query) | to `EXECUTING` directly |
-| `TIER_2_QUEUED` | Tier-2 verb recognised; awaiting confirmation reply | to `APPROVED` or `DENIED` |
-| `INTERPRET_REQUESTED` | Free-form principal request; daemon asked "spend tokens to interpret?" | to `INTERPRETING` (yes), terminal (no), or `TIER_1_AUTOEXEC` (interpret produced a clear tier-1 verb) |
+| `PARSED` | TOTP valid; deterministic command parser ran | to `TIER_1_AUTOEXEC`, `AWAITING_APPROVAL`, or `INTERPRET_OFFERED` |
+| `TIER_1_AUTOEXEC` | Tier-1 verb recognised (status, list, query) | to `RESPONDED` directly |
+| `AWAITING_APPROVAL` | Tier-2+ verb recognised; approval ping sent | to `APPROVED`, `DENIED`, `EXPIRED`, or back to `AWAITING_APPROVAL` if the verdict reply was UNCLEAR or insufficient (tier-4 needs YES IRREVERSIBLE) |
+| `APPROVED` | Verdict reply matched (yes for tier-2; YES IRREVERSIBLE for tier-4) | to `EXECUTED` or `EXECUTION_FAILED` |
+| `DENIED` | Principal replied no/deny/stop | terminal |
+| `EXPIRED` | No verdict reply within window (default 7 days) | terminal |
+| `INTERPRET_OFFERED` | Free-form principal request; daemon asked "spend tokens to interpret?" | to `INTERPRETING` (yes interpret), `INTERPRET_DECLINED` (no), or `INTERPRET_STUBBED` (yes, but LLM not yet wired in current build step) |
 | `INTERPRETING` | LLM call to parse the free-form request into a structured plan | to `AWAITING_APPROVAL` (plan generated) |
-| `EXECUTING` | Tools being invoked | to `REPORTED` or `EXECUTION_FAILED` |
-| `REPORTED` | Completion reply sent to principal | terminal |
+| `EXECUTED` | Approved verb ran successfully; reply sent | terminal |
+| `EXECUTION_FAILED` | Approved verb raised or returned ok=False | terminal (recorded for diagnostic) |
+| `RESPONDED` | Tier-1 reply sent | terminal |
+| `RESPONDED_FAILED` | Reply send failed at SMTP | terminal (recorded for diagnostic) |
+| `APPROVAL_REPLY_NOTED` | Approval reply received but not actionable (unknown token, stale, unclear verdict) | terminal |
 
 There is no `AUTO_REPLIED` state in the contact-mail flow.
 
@@ -687,15 +693,16 @@ a fixed vocabulary. Tier 1 verbs auto-execute via
 | `yes` / `approve` / `go` | varies | Approve a pending action |
 | `no` / `deny` / `stop` | varies | Deny a pending action |
 | `YES IRREVERSIBLE` | varies | Confirm a tier-4 pending action |
-| `add <email>` | 2 | Begin contact onboarding |
 | `forget <contact>` | 2 | Wipe rapport notes |
-| `remove <contact>` | 2 | Full removal incl. config block |
+| `block <contact>` | 2 | Block inbound mail from a contact (state-DB flag, reversible) |
+| `unblock <contact>` | 2 | Lift a contact's block |
 | `revive <message-id>` | 2 | Pull dropped/expired message back |
 | `allow <N> [D]` | 2 | Credit ledger adjustment |
 | `throttle <N> [D]` | 2 | Credit ledger adjustment |
 | `burn` | 2 | Macro: throttle 2 1 |
-| `block` / `unblock <contact>` | 2 | Permanent ledger entries |
 | `resume` / `dismiss` | 2 | Cold-start backlog handling |
+| `add <email>` | 4 | Begin contact onboarding (rewrites nightjar.conf) |
+| `remove <contact>` | 4 | Full removal incl. config block (rewrites nightjar.conf) |
 | `run build [project]` | 4 | Build with side effects |
 | `push [repo]` | 4 | git push |
 | `sync [project]` | 4 | Sync that overwrites files |
@@ -703,6 +710,13 @@ a fixed vocabulary. Tier 1 verbs auto-execute via
 Tier-2 commands queue and email a confirmation ping. Tier-4
 commands queue, email a confirmation ping, and require
 `YES IRREVERSIBLE` in the reply.
+
+`add` and `remove` are deliberately tier-4 even though they read
+as administrative housekeeping, because both rewrite nightjar.conf
+and so change the daemon's authentication surface (which contacts
+exist, which inboxes accept which senders). A bug or a coerced
+approval here has a wider blast radius than a state-DB toggle, so
+the friction of `YES IRREVERSIBLE` is the right gate.
 
 ### Free-form requests (LLM-interpreted)
 
