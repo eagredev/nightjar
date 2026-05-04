@@ -718,6 +718,15 @@ exist, which inboxes accept which senders). A bug or a coerced
 approval here has a wider blast radius than a state-DB toggle, so
 the friction of `YES IRREVERSIBLE` is the right gate.
 
+The config rewrite is atomic. `daemon/config_writer.py` writes the
+new file to a sibling tmp file in the same directory, fsyncs it,
+chmods it 600, re-parses it through `daemon.config.load` to confirm
+the mutation produced a valid file, and only then `os.replace`s it
+into position. If validation fails, the tmp is unlinked and the
+original is untouched. After a successful write the executor
+mutates the in-memory `Config.contacts` and `Config.address_index`
+dicts so the running daemon picks up the change without a restart.
+
 ### Free-form requests (LLM-interpreted)
 
 Anything not matching a deterministic verb is a free-form request.
