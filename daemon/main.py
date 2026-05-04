@@ -183,10 +183,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="generate an auth secret and print the provisioning URI",
     )
+    mode.add_argument(
+        "--test-notify",
+        action="store_true",
+        help="send a test email via the notifier path; pair with --principal or --contact",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
         help="with --setup-auth: overwrite an existing secret",
+    )
+    parser.add_argument(
+        "--principal",
+        action="store_true",
+        help="with --test-notify: target the principal (no audit, no footer)",
+    )
+    parser.add_argument(
+        "--contact",
+        metavar="CONTACT_ID",
+        default=None,
+        help="with --test-notify: target this contact (audit + footer; prompts to confirm)",
     )
     args = parser.parse_args(argv)
 
@@ -209,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.revive:
         from . import revive
         return revive.run(config)
+
+    if args.test_notify:
+        from . import test_notify
+        return test_notify.run(
+            config, principal=args.principal, contact=args.contact
+        )
 
     code = _check_panic_preflight(config)
     if code is not None:
