@@ -338,15 +338,22 @@ principles here are a starting position, not a destination.
 
 ## Status
 
-v0 design complete. Implementation underway in this repository,
-following the build sequence at the bottom of
-[DESIGN.md](./DESIGN.md). Each step in that sequence produces a
-working system; the project becomes more capable in stages rather
-than appearing all at once.
+v0 design complete. Implementation underway, following the build
+sequence at the bottom of [DESIGN.md](./DESIGN.md). Each step
+produces a working system; the project becomes more capable in
+stages rather than appearing all at once.
 
 The first three build steps establish the security perimeter
 (watcher, then authentication and dead-man's-switch, then notifier
 with audit copy and footer) before any LLM is wired in. By design.
+
+**Build Step 1 (watcher only): complete.** The daemon connects
+to IMAP via IDLE, processes incoming mail, looks up senders against
+the contact directory, and persists message metadata to SQLite.
+No LLM, no outbound, no authentication on principal mail yet. 11
+unit tests cover config parsing and state persistence; the IDLE
+loop will be validated against a live Gmail inbox over several days
+of real sleep/wake cycles before Step 2 begins.
 
 This README will be updated as the implementation lands. Where
 the design and the code disagree, the **code is right and the

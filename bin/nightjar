@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launcher for the nightjar daemon. Uses the project venv if present.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    exec "$ROOT/.venv/bin/python" -m daemon.main "$@"
+else
+    exec python3 -m daemon.main "$@"
+fi
