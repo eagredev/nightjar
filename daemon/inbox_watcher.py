@@ -162,23 +162,46 @@ class InboxWatcher:
         """
         idle_task = await client.idle_start(timeout=IDLE_REFRESH_SECONDS + 30)
         try:
+            # Race three conditions: server push (activity), stop_event
+            # (clean shutdown), and the refresh timer. Whichever resolves
+            # first wins; the others are cancelled in the finally block.
+            activity_task = asyncio.create_task(self._wait_for_activity(client))
+            stop_task = asyncio.create_task(self._stop_event.wait())
+            timer_task = asyncio.create_task(asyncio.sleep(IDLE_REFRESH_SECONDS))
             try:
-                # Wait until either we see EXISTS-style activity, or
-                # the refresh timer fires.
-                await asyncio.wait_for(
-                    self._wait_for_activity(client),
-                    timeout=IDLE_REFRESH_SECONDS,
+                done, pending = await asyncio.wait(
+                    {activity_task, stop_task, timer_task},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                self.logger.event("idle_activity", inbox=self.inbox.name)
-                # Don't fetch yet; finalize IDLE first, then search.
-            except asyncio.TimeoutError:
-                self.logger.event("idle_refresh", inbox=self.inbox.name)
+                for t in pending:
+                    t.cancel()
+                # Surface any exception from the winning task.
+                for t in done:
+                    exc = t.exception()
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                        raise exc
+                if stop_task in done:
+                    self.logger.event("idle_stop_requested", inbox=self.inbox.name)
+                elif activity_task in done:
+                    self.logger.event("idle_activity", inbox=self.inbox.name)
+                else:
+                    self.logger.event("idle_refresh", inbox=self.inbox.name)
+            finally:
+                for t in (activity_task, stop_task, timer_task):
+                    if not t.done():
+                        t.cancel()
+                # Drain cancellations.
+                with contextlib.suppress(asyncio.CancelledError, BaseException):
+                    await asyncio.gather(activity_task, stop_task, timer_task, return_exceptions=True)
         finally:
             client.idle_done()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(idle_task, timeout=10)
 
-        # Whether activity or refresh, do an UNSEEN search to be safe.
+        # If we're stopping, don't bother running another catch-up.
+        if self._stop_event.is_set():
+            return
+        # Otherwise, do an UNSEEN search regardless of which path woke us.
         # Catching up twice is cheaper than missing a message once.
         await self._catch_up(client)
 

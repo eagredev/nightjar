@@ -1,0 +1,29 @@
+# Example systemd user service for Nightjar.
+#
+# Place at ~/.config/systemd/user/nightjar.service, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now nightjar.service
+#   loginctl enable-linger $USER    # so the service survives logout/reboot
+#
+# The service uses the project's .venv/bin/python; create that venv with:
+#   cd ~/nightjar && python3 -m venv .venv && .venv/bin/pip install aioimaplib
+
+[Unit]
+Description=Nightjar email assistant daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nightjar
+ExecStart=%h/nightjar/.venv/bin/python -m daemon.main
+Restart=on-failure
+RestartSec=10
+MemoryHigh=200M
+MemoryMax=500M
+TasksMax=50
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target
