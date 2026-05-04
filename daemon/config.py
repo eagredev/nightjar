@@ -78,6 +78,43 @@ class SmtpConfig:
 AUTH_MODES = ("hotp", "totp")
 DEFAULT_AUTH_MODE = "hotp"
 
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
+DEFAULT_PER_HOUR_MAX_INVOCATIONS = 30
+DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS = 8000
+
+
+@dataclass(frozen=True)
+class ClaudeConfig:
+    """Anthropic API credentials and rate-limit knobs for triage.
+
+    `api_key` is sensitive: same handling rules as the TOTP secret and
+    the SMTP password. Never logged, never put into a prompt, never
+    returned in a tool result. Lives only on this dataclass and on the
+    triage module that calls anthropic.AsyncAnthropic.
+
+    `default_model` is the model Nightjar uses for triage and
+    principal-command interpretation. Haiku 4.5 is the floor: the
+    threat model assumes a frontier-tier-or-better LLM, and Haiku is
+    cheap enough that the daemon can stay inside the $20/month console
+    cap with comfortable headroom (~thousands of triage calls).
+
+    `per_hour_max_invocations` is the in-daemon rate limit. The first
+    line of defence is the spend cap on the Anthropic console; this is
+    the second line, so a runaway state inside the daemon (loop, bad
+    state machine transition) cannot burn an entire month's budget in
+    a single hour. 30/hr matches DESIGN.md's cost model worst case of
+    ~$0.60/hr.
+
+    `per_invocation_max_input_tokens` is a defensive cap on prompt
+    size. A pathological email body should not be allowed to spend a
+    whole hour's budget in one call. 8000 is enough for a normal
+    email plus the system prompt and recent thread context.
+    """
+    api_key: str
+    default_model: str = DEFAULT_CLAUDE_MODEL
+    per_hour_max_invocations: int = DEFAULT_PER_HOUR_MAX_INVOCATIONS
+    per_invocation_max_input_tokens: int = DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS
+
 
 @dataclass(frozen=True)
 class SecurityConfig:
@@ -106,6 +143,7 @@ class Config:
     inboxes: dict[str, InboxConfig]
     security: SecurityConfig | None = None
     smtp: SmtpConfig | None = None
+    claude: ClaudeConfig | None = None
     address_index: dict[str, str] = field(default_factory=dict)
     """Maps lowercased email address to contact_id. Built at load time."""
 
@@ -304,11 +342,46 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             from_addr=from_addr,
         )
 
+    claude: ClaudeConfig | None = None
+    if "claude" in parser:
+        claude_section = parser["claude"]
+        api_key = claude_section.get("api_key", "").strip()
+        if not api_key:
+            raise ConfigError("[claude].api_key is required if [claude] is present")
+        if not (api_key.startswith("sk-ant-") and len(api_key) > 50):
+            raise ConfigError(
+                "[claude].api_key does not look like an Anthropic API key "
+                "(expected prefix 'sk-ant-' and length > 50)"
+            )
+        default_model = claude_section.get("default_model", DEFAULT_CLAUDE_MODEL).strip()
+        if not default_model:
+            raise ConfigError("[claude].default_model must not be empty")
+        try:
+            per_hour = int(claude_section.get(
+                "per_hour_max_invocations", str(DEFAULT_PER_HOUR_MAX_INVOCATIONS)
+            ))
+            per_inv_tokens = int(claude_section.get(
+                "per_invocation_max_input_tokens", str(DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS)
+            ))
+        except ValueError as e:
+            raise ConfigError(f"[claude] integer field must be int: {e}") from e
+        if per_hour <= 0:
+            raise ConfigError("[claude].per_hour_max_invocations must be > 0")
+        if per_inv_tokens <= 0:
+            raise ConfigError("[claude].per_invocation_max_input_tokens must be > 0")
+        claude = ClaudeConfig(
+            api_key=api_key,
+            default_model=default_model,
+            per_hour_max_invocations=per_hour,
+            per_invocation_max_input_tokens=per_inv_tokens,
+        )
+
     return Config(
         daemon=daemon,
         contacts=contacts,
         inboxes=inboxes,
         security=security,
         smtp=smtp,
+        claude=claude,
         address_index=address_index,
     )

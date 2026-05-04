@@ -2,7 +2,22 @@
 
 > **Status:** v0 design, not yet implemented.
 > **Date:** 2026-05-04 (revised from earlier triage-only framing)
-> **Substrate:** Claude Agent SDK (Python), Haiku 4.5 default, runs on Steam Deck.
+> **Substrate:** `anthropic` Python SDK (Messages API, AsyncAnthropic),
+> Haiku 4.5 default, runs on Steam Deck.
+>
+> **SDK choice rationale.** An earlier draft of this document named the
+> `claude-agent-sdk` PyPI package. That package is the substrate for the
+> Claude Code CLI: it boots an agent loop with the full Claude Code
+> toolset (Read, Write, Bash, etc.) and is built for autonomous,
+> multi-turn coding work. Nightjar's triage is the opposite shape: a
+> single-shot Messages API call that takes one email, returns one
+> structured `draft_plan` tool-use payload, and exits. Carrying the
+> Claude Code substrate to do that would import an agent runtime, a CLI
+> binary, and a much larger attack surface for no benefit. The plain
+> `anthropic` package is the lower-level Messages API client, supports
+> custom tools, supports async (`AsyncAnthropic`), and matches the
+> threat model in this document: the LLM call is one input/output
+> hop, never a loop.
 
 ## What Nightjar is
 
@@ -461,7 +476,7 @@ principal-driven work.
 ~/nightjar/                          # project root, git
   DESIGN.md                          # this file
   README.md                          # public-facing intro and ethical posture
-  pyproject.toml                     # deps: claude-agent-sdk, aioimaplib
+  pyproject.toml                     # deps: anthropic, aioimaplib
   daemon/
     __init__.py
     main.py                          # entry point, asyncio.run()
@@ -1445,7 +1460,10 @@ or any code values.
 
 ## Dependencies
 
-- `claude-agent-sdk` (PyPI), required.
+- `anthropic` (PyPI), required. Messages API client; we use
+  `AsyncAnthropic` so it cooperates with the asyncio inbox watcher.
+  Not `claude-agent-sdk`. See "SDK choice rationale" at the top of
+  this document for why.
 - `aioimaplib` (PyPI), required for clean IDLE on Python 3.13.
   (Python 3.14 stdlib `imaplib.IMAP4.idle()` would let us drop
   this; revisit when Steam Deck ships 3.14.)
@@ -1465,9 +1483,11 @@ No runtime dependency on any other project on the machine.
   free-form complexity.
 - Hard cap: 30 invocations/hour. Worst case $0.60/hour ceiling.
 - Defensive: $20/month spend cap on the Anthropic console.
-- Open question: whether a Claude Code Max subscription covers
-  Agent SDK token usage, or if SDK calls are metered separately.
-  Assume separately.
+- Open question (resolved 2026-05-04): a Claude Code Max
+  subscription does NOT cover `anthropic` Messages API calls. The
+  two are separately metered against separately purchased credit.
+  Nightjar bills against the Anthropic console (Settings → Billing),
+  guarded by the $20/month spend cap.
 
 ## Open questions and explicit non-goals for v1
 
@@ -1517,9 +1537,9 @@ command surface.
    sends.
 4. **Approval grammar.** Reply parser, deterministic verbs, tier
    classification. No LLM yet; ambiguous replies just ping.
-5. **Triage pass with Claude.** Agent SDK call for contact mail,
-   `triage_default.md` system prompt, `draft_plan` tool. Plan
-   emailed to principal. No actions yet.
+5. **Triage pass with Claude.** `anthropic.AsyncAnthropic.messages.create`
+   call for contact mail, `triage_default.md` system prompt,
+   `draft_plan` tool. Plan emailed to principal. No actions yet.
 6. **First contact-driven action.** Lowest-risk reply, full
    round-trip (triage, approval, execute, report, audit copy).
 7. **Rapport notes.** Three-test rule, safeguarding layers,

@@ -386,3 +386,98 @@ def test_list_blocked_contacts_orders_by_blocked_at(tmp_path: Path) -> None:
     s.block_contact(contact_id="a", at=1_000)
     rows = s.list_blocked_contacts()
     assert [r["contact_id"] for r in rows] == ["a", "b"]
+
+
+# ---- V7: claude_invocations ledger ----------------------------------------
+
+
+def test_claude_ledger_starts_empty(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.count_claude_invocations_since(since_ts=0) == 0
+    assert s.list_recent_claude_invocations() == []
+
+
+def test_record_claude_invocation_returns_row_id(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    rid = s.record_claude_invocation(
+        purpose="triage",
+        contact_id="composer",
+        model="claude-haiku-4-5",
+        input_tokens=2400,
+        output_tokens=180,
+        ok=True,
+        ts=1_000,
+    )
+    assert rid >= 1
+
+
+def test_count_claude_invocations_within_window(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    # Three calls in the last hour, two more from yesterday.
+    for ts in (1_000, 2_000, 3_000):
+        s.record_claude_invocation(
+            purpose="triage", contact_id="x", model="m",
+            input_tokens=100, output_tokens=10, ok=True, ts=ts,
+        )
+    for ts in (10, 20):
+        s.record_claude_invocation(
+            purpose="triage", contact_id="x", model="m",
+            input_tokens=100, output_tokens=10, ok=True, ts=ts,
+        )
+    # Window starts at 500, so only the three recent calls count.
+    assert s.count_claude_invocations_since(since_ts=500) == 3
+
+
+def test_claude_ledger_records_failures_separately(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.record_claude_invocation(
+        purpose="triage", contact_id="x", model="m",
+        input_tokens=100, output_tokens=0, ok=False,
+        error_reason="sdk_error", ts=1_000,
+    )
+    rows = s.list_recent_claude_invocations()
+    assert len(rows) == 1
+    assert rows[0]["ok"] == 0
+    assert rows[0]["error_reason"] == "sdk_error"
+
+
+def test_claude_ledger_orders_newest_first(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.record_claude_invocation(
+        purpose="triage", contact_id="x", model="m",
+        input_tokens=10, output_tokens=1, ok=True, ts=1_000,
+    )
+    s.record_claude_invocation(
+        purpose="triage", contact_id="y", model="m",
+        input_tokens=10, output_tokens=1, ok=True, ts=3_000,
+    )
+    s.record_claude_invocation(
+        purpose="triage", contact_id="z", model="m",
+        input_tokens=10, output_tokens=1, ok=True, ts=2_000,
+    )
+    rows = s.list_recent_claude_invocations()
+    assert [r["contact_id"] for r in rows] == ["y", "z", "x"]
+
+
+def test_claude_ledger_respects_limit(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    for i in range(5):
+        s.record_claude_invocation(
+            purpose="triage", contact_id=f"c{i}", model="m",
+            input_tokens=10, output_tokens=1, ok=True, ts=1_000 + i,
+        )
+    rows = s.list_recent_claude_invocations(limit=2)
+    assert len(rows) == 2
+
+
+def test_claude_ledger_does_not_store_prompt_or_key(tmp_path: Path) -> None:
+    """The schema only has metadata columns. This test pins that
+    contract by inspecting the row keys returned by the lister."""
+    s = make_state(tmp_path)
+    s.record_claude_invocation(
+        purpose="triage", contact_id="x", model="m",
+        input_tokens=10, output_tokens=1, ok=True, ts=1_000,
+    )
+    row = s.list_recent_claude_invocations()[0]
+    forbidden_keys = {"api_key", "prompt", "system", "user", "response", "tool_input"}
+    assert not (set(row.keys()) & forbidden_keys)
