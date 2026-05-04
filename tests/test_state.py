@@ -163,3 +163,70 @@ def test_hotp_counter_rejects_negative(tmp_path: Path) -> None:
     import pytest
     with pytest.raises(ValueError):
         s.set_hotp_counter(-1)
+
+
+# --- Pending audits (Build Step 3) -----------------------------------------
+
+
+def test_pending_audits_starts_empty(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.count_pending_audits() == 0
+    assert s.list_pending_audits() == []
+
+
+def test_queue_audit_inserts_with_attempts_one(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    audit_id = s.queue_audit(
+        primary_message_id="<msg1@nightjar>",
+        to_addr="dylanmoir97@gmail.com",
+        subject="[Nightjar Audit] To composer@example.com, hello",
+        body="(audit body)",
+        first_error="connection refused",
+        at=1_700_000_000,
+    )
+    assert audit_id > 0
+    rows = s.list_pending_audits()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["to_addr"] == "dylanmoir97@gmail.com"
+    assert row["attempts"] == 1
+    assert row["last_error"] == "connection refused"
+
+
+def test_mark_audit_attempt_success_deletes_row(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    audit_id = s.queue_audit(
+        primary_message_id=None,
+        to_addr="x@example.com",
+        subject="x",
+        body="x",
+    )
+    s.mark_audit_attempt(audit_id=audit_id, success=True)
+    assert s.count_pending_audits() == 0
+
+
+def test_mark_audit_attempt_failure_increments_attempts(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    audit_id = s.queue_audit(
+        primary_message_id=None,
+        to_addr="x@example.com",
+        subject="x",
+        body="x",
+    )
+    s.mark_audit_attempt(audit_id=audit_id, success=False, error="timeout")
+    rows = s.list_pending_audits()
+    assert rows[0]["attempts"] == 2
+    assert rows[0]["last_error"] == "timeout"
+
+
+def test_list_pending_audits_filters_exhausted(tmp_path: Path) -> None:
+    """Audits at or above max_attempts are excluded from the retry queue."""
+    s = make_state(tmp_path)
+    audit_id = s.queue_audit(
+        primary_message_id=None, to_addr="x@example.com", subject="x", body="x"
+    )
+    # Fail twice more to land at attempts=3 (the default max).
+    s.mark_audit_attempt(audit_id=audit_id, success=False, error="e1")
+    s.mark_audit_attempt(audit_id=audit_id, success=False, error="e2")
+    assert s.list_pending_audits() == []  # exhausted; not in retry queue
+    assert s.count_pending_audits() == 1  # but the row stays for diagnostics
