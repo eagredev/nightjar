@@ -139,6 +139,19 @@ CREATE INDEX IF NOT EXISTS idx_approvals_expires ON approvals(expires_at);
 # read can override per principal.
 DEFAULT_APPROVAL_WINDOW_SECONDS = 7 * 24 * 60 * 60
 
+# V6 adds contact_blocks: per-contact block flag set by the `block`
+# tier-2 verb and cleared by `unblock`. Holding the flag here (rather
+# than in nightjar.conf) keeps the verb fully reversible without
+# touching the config file. The watcher consults this table on inbound
+# mail and treats a blocked contact as DROPPED.
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS contact_blocks (
+    contact_id  TEXT PRIMARY KEY,
+    blocked_at  INTEGER NOT NULL,
+    reason      TEXT
+);
+"""
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -168,12 +181,14 @@ class State:
             conn.executescript(SCHEMA_V4)
             # V5: approvals table. Same pattern as V4.
             conn.executescript(SCHEMA_V5)
+            # V6: contact_blocks table. Same pattern.
+            conn.executescript(SCHEMA_V6)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (5)")
-            elif row["version"] < 5:
-                conn.execute("UPDATE schema_version SET version = 5")
+                conn.execute("INSERT INTO schema_version (version) VALUES (6)")
+            elif row["version"] < 6:
+                conn.execute("UPDATE schema_version SET version = 6")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -570,3 +585,49 @@ class State:
                 (now, now),
             )
             return cur.rowcount
+
+    # --- Contact blocks (Build Step 4b) -------------------------------------
+
+    def block_contact(
+        self,
+        *,
+        contact_id: str,
+        reason: str | None = None,
+        at: int | None = None,
+    ) -> bool:
+        """Mark a contact as blocked. Returns True if newly blocked,
+        False if already blocked (idempotent)."""
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO contact_blocks (contact_id, blocked_at, reason) "
+                "VALUES (?, ?, ?)",
+                (contact_id, at, reason),
+            )
+            return cur.rowcount > 0
+
+    def unblock_contact(self, *, contact_id: str) -> bool:
+        """Lift a contact's block. Returns True if a row was removed,
+        False if the contact wasn't blocked."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM contact_blocks WHERE contact_id = ?",
+                (contact_id,),
+            )
+            return cur.rowcount > 0
+
+    def is_contact_blocked(self, contact_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM contact_blocks WHERE contact_id = ?",
+                (contact_id,),
+            ).fetchone()
+            return row is not None
+
+    def list_blocked_contacts(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT contact_id, blocked_at, reason "
+                "FROM contact_blocks ORDER BY blocked_at ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]

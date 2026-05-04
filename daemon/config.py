@@ -34,6 +34,7 @@ class ConfigError(Exception):
 class DaemonConfig:
     state_dir: Path
     log_dir: Path
+    notes_dir: Path = field(default_factory=lambda: Path("~/nightjar/contacts").expanduser())
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,7 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     daemon = DaemonConfig(
         state_dir=Path(os.path.expanduser(daemon_section.get("state_dir", "~/.local/share/nightjar"))),
         log_dir=Path(os.path.expanduser(daemon_section.get("log_dir", "~/nightjar/logs"))),
+        notes_dir=Path(os.path.expanduser(daemon_section.get("notes_dir", "~/nightjar/contacts"))),
     )
 
     contacts: dict[str, Contact] = {}
