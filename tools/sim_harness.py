@@ -225,8 +225,21 @@ _SUBAGENT_PROMPT = textwrap.dedent("""\
 
     Write a SINGLE JSON object to {response_file}. The object must be
     the tool input — i.e. what the production SDK would deliver as
-    `block.input` for a single tool_use of the named tool. Do not wrap
-    it in {{"name": ..., "input": ...}}; just write the input object.
+    `block.input` for a single tool_use of the named tool.
+
+    DO NOT WRAP IT. The harness expects the bare input object, not a
+    tool_use envelope. Specifically:
+
+      WRONG (will be recorded as a triage failure):
+        {{"type": "tool_use", "name": "draft_plan", "input": {{...}}}}
+        {{"name": "draft_plan", "input": {{...}}}}
+
+      RIGHT:
+        {{...input fields directly at the top level...}}
+
+    For draft_plan that means the file's top-level keys are summary,
+    verb, args, reasoning, risk_flags, etc. — not name/input.
+    For classify_scope that means the file is just {{"scope": "..."}}.
 
     Do not write any other files. Do not call any other tools. Reply
     OK on stdout when the response file is in place. Then exit.
