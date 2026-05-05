@@ -2184,6 +2184,7 @@ class InboxWatcher:
         # in passing while saying "no reply needed").
         self._handle_note_proposals(
             contact_id=contact_id, plan=plan, now=now,
+            source_message_id=message_id,
         )
 
         # noop / flag don't queue an executor verb. They still need a
@@ -2270,6 +2271,7 @@ class InboxWatcher:
         contact_id: str,
         plan: TriagePlan,
         now: int,
+        source_message_id: str,
     ) -> None:
         """Apply the plan's note_proposals directly to the contact's
         notes file.
@@ -2285,6 +2287,14 @@ class InboxWatcher:
         rationale; this is ring 1 (per-contact memory) under the
         broader content-firewall framing.
 
+        Provenance: each note records the inbound `source_message_id`
+        plus the model's `attribution` classification (observed |
+        asserted | self). Both reach the on-disk bullet via the
+        `[meta: src=...; attr=...]` tag and surface in `show notes`
+        so the principal can spot sender-asserted claims. See the
+        2026-05-05 red-team observations file for the drift-attack
+        rationale.
+
         On write error, log warn but continue. Losing one note is
         recoverable; failing the whole triage path because of a notes
         write isn't. The JSONL log carries full provenance for any
@@ -2295,21 +2305,40 @@ class InboxWatcher:
 
         notes_path = self.config.daemon.notes_dir / f"{contact_id}.md"
         for proposal in plan.note_proposals:
+            # Resolve the on-disk scope tag from the proposal's two
+            # axes (`scope` + `is_universal`):
+            #   - is_universal=True  → write literal '*' tag (always-visible)
+            #   - is_universal=False → write the chosen scope tag
+            #   - Unscoped contact (proposal.scope is None) → no tag
+            # The parser treats untagged content and explicit '*' as
+            # equivalent for visibility, but for scoped contacts we
+            # want the universal case to be EXPLICIT — a future
+            # addition of new sections won't accidentally inherit a
+            # narrower scope.
+            if proposal.is_universal:
+                effective_scope: str | None = "*"
+            else:
+                effective_scope = proposal.scope
+
             try:
                 notes_store.append_note(
                     notes_path,
                     contact_id=contact_id,
                     section_heading=proposal.section_heading,
                     body=proposal.body,
-                    scope=proposal.scope,
+                    scope=effective_scope,
+                    attribution=proposal.attribution,
+                    source_message_id=source_message_id,
                 )
-            except (OSError, notes_store.NotesParseError) as e:
+            except (OSError, notes_store.NotesParseError, ValueError) as e:
                 self.logger.event(
                     "note_write_failed",
                     level="warn",
                     inbox=self.inbox.name,
                     contact_id=contact_id,
                     scope=proposal.scope,
+                    is_universal=proposal.is_universal,
+                    attribution=proposal.attribution,
                     section_heading=proposal.section_heading,
                     error=f"{type(e).__name__}: {e}",
                 )
@@ -2319,6 +2348,9 @@ class InboxWatcher:
                 inbox=self.inbox.name,
                 contact_id=contact_id,
                 scope=proposal.scope,
+                is_universal=proposal.is_universal,
+                attribution=proposal.attribution,
+                source_message_id=source_message_id,
                 section_heading=proposal.section_heading,
                 body_preview=proposal.body[:100],
             )

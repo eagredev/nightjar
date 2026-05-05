@@ -71,12 +71,21 @@ class Bullet:
     """A single bullet under a section.
 
     `text` is the bullet body without the leading `- ` and without any
-    trailing `[scopes: ...]` annotation. `scopes` is the resolved scope
-    tuple (empty tuple = inherit from section). `raw_line` preserves
+    trailing `[scopes: ...]` or `[meta: ...]` annotations. `scopes` is
+    the resolved scope tuple (empty tuple = inherit from section).
+    `attribution` is the provenance classification: 'observed' (the
+    daemon saw this firsthand from the contact's behaviour), 'asserted'
+    (the contact claimed it about a third party — UNVERIFIED), 'self'
+    (the contact claimed it about themselves — UNVERIFIED). Empty
+    string = legacy bullet predating provenance, treated as 'observed'
+    for back-compat. `source_message_id` is the inbound message that
+    produced the note; empty for legacy bullets. `raw_line` preserves
     the exact source line for round-trip serialization."""
     text: str
     scopes: tuple[str, ...]
     raw_line: str
+    attribution: str = ""
+    source_message_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,6 +123,8 @@ class ParsedNotes:
 
 
 _SCOPES_TAG_RE = re.compile(r"\s*\[scopes:\s*([^\]]*)\]\s*$")
+_META_TAG_RE = re.compile(r"\s*\[meta:\s*([^\]]*)\]\s*$")
+_KNOWN_ATTRIBUTIONS = ("observed", "asserted", "self")
 
 
 def _split_scopes_tag(line: str) -> tuple[str, tuple[str, ...]]:
@@ -145,6 +156,55 @@ def _format_scopes_tag(scopes: tuple[str, ...]) -> str:
     if not scopes:
         return ""
     return f" [scopes: {', '.join(scopes)}]"
+
+
+def _split_meta_tag(line: str) -> tuple[str, str, str]:
+    """Strip a trailing `[meta: src=...; attr=...]` tag if present.
+
+    Returns (line_without_tag, attribution, source_message_id). Empty
+    strings when no tag is present (legacy bullet — back-compat).
+
+    The meta tag has fixed key=value pairs separated by `;`. Unknown
+    keys are ignored so future extensions don't break old parsers.
+    Unknown attribution values are silently dropped (the bullet behaves
+    like a legacy unattributed bullet) — fail-soft is the right call
+    because the alternative is refusing to load the whole notes file.
+    """
+    m = _META_TAG_RE.search(line)
+    if not m:
+        return line.rstrip(), "", ""
+    raw = m.group(1).strip()
+    head = line[: m.start()].rstrip()
+    if not raw:
+        return head, "", ""
+    attribution = ""
+    source_message_id = ""
+    for pair in raw.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "attr":
+            if value in _KNOWN_ATTRIBUTIONS:
+                attribution = value
+        elif key == "src":
+            source_message_id = value
+    return head, attribution, source_message_id
+
+
+def _format_meta_tag(attribution: str, source_message_id: str) -> str:
+    """Inverse of _split_meta_tag for serialization. Empty when both
+    fields are empty so legacy bullets serialize unchanged."""
+    if not attribution and not source_message_id:
+        return ""
+    parts: list[str] = []
+    if source_message_id:
+        parts.append(f"src={source_message_id}")
+    if attribution:
+        parts.append(f"attr={attribution}")
+    return f" [meta: {'; '.join(parts)}]"
 
 
 # ---- Parsing --------------------------------------------------------------
@@ -242,15 +302,26 @@ def parse(text: str) -> ParsedNotes:
 def _parse_bullets(lines: list[str]) -> tuple[Bullet, ...]:
     """Extract `- ...` bullet lines from a section body. Non-bullet
     lines are ignored (preserved into the round-trip via raw_text but
-    not surfaced as Bullets)."""
+    not surfaced as Bullets).
+
+    Tag order on disk is `text [meta: ...] [scopes: ...]`. We strip
+    scopes first (it's the trailing tag), then strip meta from the
+    remainder. Either or both may be absent."""
     bullets: list[Bullet] = []
     for line in lines:
         m = _BULLET_RE.match(line)
         if not m:
             continue
         body = m.group(1)
-        text, scopes = _split_scopes_tag(body)
-        bullets.append(Bullet(text=text, scopes=scopes, raw_line=line))
+        without_scopes, scopes = _split_scopes_tag(body)
+        text, attribution, source_message_id = _split_meta_tag(without_scopes)
+        bullets.append(Bullet(
+            text=text,
+            scopes=scopes,
+            raw_line=line,
+            attribution=attribution,
+            source_message_id=source_message_id,
+        ))
     return tuple(bullets)
 
 
@@ -305,6 +376,46 @@ def filtered_text(parsed: ParsedNotes, active_scope: str | None) -> str:
         out.append("")
 
     # Trim trailing blank line.
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+_ATTRIBUTION_BADGE = {
+    "observed": "",  # daemon's own observation, no warning needed
+    "asserted": " ⚠ asserted by sender — unverified",
+    "self": " ⚠ self-asserted by sender — unverified",
+}
+
+
+def audit_text(parsed: ParsedNotes) -> str:
+    """Render `parsed` as a principal-facing audit view.
+
+    Same scope-policy as `filtered_text(None)` (everything visible),
+    but each bullet is annotated with its attribution badge so the
+    principal can immediately spot 'asserted' or 'self' bullets that
+    came from sender claims rather than daemon observation. Source
+    message-id is rendered after the bullet text in parentheses.
+    Frontmatter is omitted (metadata, not user-facing).
+
+    Bullets without attribution metadata (legacy, predating provenance)
+    render unannotated — back-compat. The principal can still re-tag
+    them by editing the file manually.
+    """
+    out: list[str] = []
+    for section in parsed.sections:
+        if not section.bullets:
+            continue
+        out.append(f"## {section.heading}")
+        out.append("")
+        for bullet in section.bullets:
+            badge = _ATTRIBUTION_BADGE.get(bullet.attribution, "")
+            src_suffix = (
+                f"  (src: {bullet.source_message_id})"
+                if bullet.source_message_id else ""
+            )
+            out.append(f"- {bullet.text}{badge}{src_suffix}")
+        out.append("")
     while out and out[-1] == "":
         out.pop()
     return "\n".join(out)
@@ -465,6 +576,8 @@ def append_note(
     section_heading: str,
     body: str,
     scope: str | None,
+    attribution: str = "",
+    source_message_id: str = "",
     now_iso: str | None = None,
 ) -> None:
     """Append a bullet to a section in a contact's notes file.
@@ -477,14 +590,36 @@ def append_note(
     (when not None) or unscoped (visible everywhere) when scope is None.
 
     `body` is the bullet text *without* the leading `- `; this function
-    adds the prefix and the optional `[scopes: ...]` tag.
+    adds the prefix, the optional `[meta: ...]` provenance tag, and the
+    optional `[scopes: ...]` tag. Tag order is `text [meta] [scopes]`.
 
     `scope` is a single scope name or None. Multi-scope bullets aren't
     supported here — callers wanting multi-scope can edit the file
     manually or call this multiple times under different sections.
 
+    `attribution` is the provenance classification:
+      - 'observed' — daemon saw this firsthand from the contact's behaviour
+        or the message structure (writing style, response timing).
+      - 'asserted' — the contact claimed this about a third party
+        (the principal, another collaborator, etc.). UNVERIFIED.
+      - 'self' — the contact claimed this about themselves
+        (preferences, project status). UNVERIFIED.
+      - '' (empty) — legacy bullet predating provenance; treated like
+        'observed' by show-notes for back-compat.
+    `source_message_id` is the inbound RFC822 Message-ID that produced
+    this note; empty when not available (manual edit, fallback path).
+
+    Unknown attribution values are rejected here (callers must pick one
+    of the known set) — but parser failure-mode is fail-soft so a
+    hand-edited file with garbage attr still loads.
+
     Atomic: tmp + fsync + chmod 600 + rename. On crash mid-write, the
     file is unchanged."""
+    if attribution and attribution not in _KNOWN_ATTRIBUTIONS:
+        raise ValueError(
+            f"attribution must be one of {_KNOWN_ATTRIBUTIONS} or empty, "
+            f"got {attribution!r}"
+        )
     now = now_iso if now_iso is not None else _now_iso()
 
     if path.exists():
@@ -509,9 +644,15 @@ def append_note(
 
     bullet_scopes: tuple[str, ...] = (scope,) if scope else ()
     bullet_text = body.strip()
-    bullet_raw = f"- {bullet_text}{_format_scopes_tag(bullet_scopes)}"
+    meta_tag = _format_meta_tag(attribution, source_message_id)
+    scopes_tag = _format_scopes_tag(bullet_scopes)
+    bullet_raw = f"- {bullet_text}{meta_tag}{scopes_tag}"
     new_bullet = Bullet(
-        text=bullet_text, scopes=bullet_scopes, raw_line=bullet_raw,
+        text=bullet_text,
+        scopes=bullet_scopes,
+        raw_line=bullet_raw,
+        attribution=attribution,
+        source_message_id=source_message_id,
     )
 
     new_sections: list[Section] = []

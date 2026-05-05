@@ -468,7 +468,9 @@ def _make_plan(*proposals):
         note_proposals=tuple(
             NoteProposal(scope=p.get("scope"),
                          section_heading=p["section_heading"],
-                         body=p["body"])
+                         body=p["body"],
+                         is_universal=p.get("is_universal", False),
+                         attribution=p.get("attribution", "observed"))
             for p in proposals
         ),
     )
@@ -485,6 +487,7 @@ def test_handle_note_proposals_writes_directly_no_queue(tmp_path):
     )
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     notes_path = watcher.config.daemon.notes_dir / "fraser.md"
     assert notes_path.exists()
@@ -499,6 +502,7 @@ def test_handle_note_proposals_no_proposals_is_noop(tmp_path):
     plan = _make_plan()  # empty proposals
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     # No file created when no proposals.
     notes_path = watcher.config.daemon.notes_dir / "fraser.md"
@@ -518,6 +522,7 @@ def test_handle_note_proposals_appends_to_existing_file(tmp_path):
     )
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     text = notes_path.read_text(encoding="utf-8")
     assert "prior bullet" in text
@@ -533,6 +538,7 @@ def test_handle_note_proposals_writes_multiple_to_same_file(tmp_path):
     )
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     notes_path = watcher.config.daemon.notes_dir / "fraser.md"
     text = notes_path.read_text(encoding="utf-8")
@@ -553,6 +559,7 @@ def test_handle_note_proposals_logs_each_write(tmp_path):
     )
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     log_files = list(watcher.config.daemon.log_dir.iterdir())
     assert log_files, "expected at least one JSONL log file"
@@ -577,8 +584,225 @@ def test_handle_note_proposals_continues_on_partial_failure(tmp_path):
     # Should not raise.
     watcher._handle_note_proposals(
         contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
     )
     # And the JSONL log records the failure.
     log_files = list(watcher.config.daemon.log_dir.iterdir())
     log_text = "\n".join(p.read_text() for p in log_files)
     assert "note_write_failed" in log_text
+
+
+def test_handle_note_proposals_scoped_writes_with_scope_tag(tmp_path):
+    """A scoped proposal (is_universal=False) writes the scope tag to
+    disk, so the parser will scope-filter it correctly later."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": "nightjar-dev", "is_universal": False,
+         "section_heading": "Project timeline",
+         "body": "v1.0 target is September."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "[scopes: nightjar-dev]" in text, (
+        f"expected scope tag in file, got:\n{text}"
+    )
+    assert "v1.0 target is September." in text
+
+
+def test_handle_note_proposals_universal_writes_wildcard_tag(tmp_path):
+    """A universal proposal (is_universal=True) writes a literal '*'
+    tag so the bullet survives the scope filter regardless of which
+    scope the future conversation runs under."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": "nightjar-dev", "is_universal": True,
+         "section_heading": "Communication style",
+         "body": "Prefers terse, direct replies."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "[scopes: *]" in text, (
+        f"expected wildcard scope tag in file, got:\n{text}"
+    )
+    assert "Prefers terse, direct replies." in text
+
+
+def test_handle_note_proposals_unscoped_contact_writes_no_tag(tmp_path):
+    """For unscoped contacts, scope=None still writes with no tag —
+    matching the pre-Step-7 behaviour for contacts whose .toml has no
+    scopes field."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "is_universal": False,
+         "section_heading": "General",
+         "body": "Replies fastest in evenings."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    # No scope tag of any kind on the section heading or bullet.
+    assert "[scopes:" not in text, (
+        f"unscoped contact write should produce no scope tag, got:\n{text}"
+    )
+
+
+def test_handle_note_proposals_scoped_filtered_view_excludes_other_scope(tmp_path):
+    """Belt-and-braces end-to-end: writing a scoped note with the
+    correct on-disk tag means a future scope-filtered read for a
+    DIFFERENT scope will not see it. This is the security invariant
+    the Step 7 wave is supposed to provide; verify it rather than
+    assuming the parser does the right thing."""
+    from daemon import notes_store
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": "nightjar-dev", "is_universal": False,
+         "section_heading": "Project timeline",
+         "body": "v1.0 target is September."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    # Reading under a different scope should yield empty.
+    out = notes_store.read_notes(notes_path, active_scope="personal")
+    assert "v1.0 target" not in out
+    # Reading under the right scope should yield the bullet.
+    out = notes_store.read_notes(notes_path, active_scope="nightjar-dev")
+    assert "v1.0 target is September." in out
+    # Reading the safe-only view (classifier path) should not see it.
+    safe = notes_store.read_safe_notes(notes_path)
+    assert "v1.0 target" not in safe
+
+
+def test_handle_note_proposals_universal_filtered_view_includes_everywhere(tmp_path):
+    """Mirror of the previous test for the is_universal case: a
+    universal note must be visible under EVERY scope (including
+    scopes the contact isn't even opted into) and in the safe-only
+    classifier view."""
+    from daemon import notes_store
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": "nightjar-dev", "is_universal": True,
+         "section_heading": "Communication style",
+         "body": "Prefers terse, direct replies."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    out_dev = notes_store.read_notes(notes_path, active_scope="nightjar-dev")
+    out_personal = notes_store.read_notes(notes_path, active_scope="personal")
+    out_unrelated = notes_store.read_notes(notes_path, active_scope="random-other")
+    safe = notes_store.read_safe_notes(notes_path)
+    for view in (out_dev, out_personal, out_unrelated, safe):
+        assert "Prefers terse, direct replies." in view, (
+            f"universal note missing from a scope view:\n{view}"
+        )
+
+
+def test_handle_note_proposals_logs_is_universal_in_event(tmp_path):
+    """The note_written JSONL event should carry is_universal so an
+    operator grepping the audit log can distinguish scoped writes
+    from cross-cutting writes without reading the .md file."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": "nightjar-dev", "is_universal": True,
+         "section_heading": "Style", "body": "Terse."},
+        {"scope": "nightjar-dev", "is_universal": False,
+         "section_heading": "Project", "body": "v1.0 in September."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<test-msg-id@example>",
+    )
+    log_files = list(watcher.config.daemon.log_dir.iterdir())
+    log_text = "\n".join(p.read_text() for p in log_files)
+    assert '"is_universal": true' in log_text
+    assert '"is_universal": false' in log_text
+
+
+# ---- Provenance: source_message_id + attribution threading ----------------
+
+
+def test_handle_note_proposals_threads_source_message_id_to_disk(tmp_path):
+    """The source_message_id arg lands in the on-disk meta tag so
+    `show notes` can show which inbound mail produced each note."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "G",
+         "body": "An observation.",
+         "attribution": "observed"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<unique-msgid-123@example>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "<unique-msgid-123@example>" in text
+    assert "attr=observed" in text
+
+
+def test_handle_note_proposals_threads_attribution_through(tmp_path):
+    """asserted attribution is preserved end-to-end (from validator
+    output → watcher → on-disk meta tag)."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "Project",
+         "body": "Sender claimed Dylan approved X.",
+         "attribution": "asserted"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<m@x>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "attr=asserted" in text
+
+
+def test_handle_note_proposals_logs_attribution_and_src_in_event(tmp_path):
+    """Operators grepping JSONL must be able to filter by attribution
+    type — e.g. find all 'asserted' note writes for audit."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "X", "body": "Y.",
+         "attribution": "asserted"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<grepme@x>",
+    )
+    log_files = list(watcher.config.daemon.log_dir.iterdir())
+    log_text = "\n".join(p.read_text() for p in log_files)
+    assert '"attribution": "asserted"' in log_text
+    assert '"source_message_id": "<grepme@x>"' in log_text
+
+
+def test_handle_note_proposals_default_observed_attribution(tmp_path):
+    """If a NoteProposal is constructed without attribution (legacy
+    test paths), it defaults to 'observed' and that lands on disk."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "X", "body": "Y."},  # no attribution
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+        source_message_id="<m@x>",
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "attr=observed" in text

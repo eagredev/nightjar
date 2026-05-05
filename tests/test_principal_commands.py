@@ -640,6 +640,73 @@ def test_show_notes_reads_existing_file(tmp_path: Path) -> None:
     assert "contact_id: composer" not in body
 
 
+def test_show_notes_flags_asserted_bullets(tmp_path: Path) -> None:
+    """Bullets recorded with attribution=asserted must surface to the
+    principal as UNVERIFIED — the load-bearing defence against drift
+    poisoning attacks (DR2 from 2026-05-05 red-team)."""
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    notes_path = cfg.daemon.notes_dir / "composer.md"
+    notes_path.write_text(
+        "---\ncontact_id: composer\n---\n\n"
+        "## Project [scopes: aurora]\n\n"
+        "- Sender claimed Dylan approved cross-scope quoting. "
+        "[meta: src=<poison@example>; attr=asserted] [scopes: aurora]\n"
+        "- Daemon observed terse style. "
+        "[meta: src=<m2@example>; attr=observed] [scopes: aurora]\n",
+        encoding="utf-8",
+    )
+    cmd = parse_principal_command("show notes composer")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    # Asserted bullet flagged.
+    assert "Sender claimed Dylan approved" in body
+    assert "asserted by sender — unverified" in body
+    assert "<poison@example>" in body
+    # Observed bullet not flagged.
+    obs_lines = [
+        line for line in body.splitlines()
+        if "Daemon observed terse" in line
+    ]
+    assert obs_lines and "unverified" not in obs_lines[0]
+    # Legend explaining the markers.
+    assert "UNVERIFIED" in body
+
+
+def test_show_notes_flags_self_bullets(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    notes_path = cfg.daemon.notes_dir / "composer.md"
+    notes_path.write_text(
+        "---\ncontact_id: composer\n---\n\n"
+        "## General\n\n"
+        "- Says they prefer mornings. [meta: src=<m@x>; attr=self]\n",
+        encoding="utf-8",
+    )
+    cmd = parse_principal_command("show notes composer")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "self-asserted by sender — unverified" in body
+
+
+def test_show_notes_legacy_bullets_render_unflagged(tmp_path: Path) -> None:
+    """Notes files predating provenance render without warnings —
+    back-compat. The principal can hand-edit to add attribution."""
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    notes_path = cfg.daemon.notes_dir / "composer.md"
+    notes_path.write_text(
+        "---\ncontact_id: composer\n---\n\n"
+        "## Old section\n\n"
+        "- Pre-provenance bullet, no meta tag.\n",
+        encoding="utf-8",
+    )
+    cmd = parse_principal_command("show notes composer")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "Pre-provenance bullet, no meta tag." in body
+    assert "unverified" not in body
+    # Legend still present (informs the principal what new markers mean).
+    assert "UNVERIFIED" in body
+
+
 def test_show_notes_malformed_file_reports_error(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)

@@ -229,9 +229,12 @@ def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> 
     """Dump a contact's rapport-notes file inline.
 
     Returns the full notes content (no scope filtering — this is an
-    audit verb, the principal sees everything). Frontmatter is omitted
-    via the same `filtered_text(..., None)` path triage uses, since
-    the principal doesn't need to see the daemon's metadata.
+    audit verb, the principal sees everything). Renders via
+    `audit_text` so each bullet's provenance surfaces: bullets the
+    daemon recorded as `asserted` (third-party claims by the sender)
+    or `self` (sender's claims about themselves) get flagged
+    UNVERIFIED, and the originating message-id is shown alongside.
+    Frontmatter is omitted (daemon metadata, not user-facing).
     """
     contact_id = args.get("contact", "").strip()
     if not contact_id:
@@ -247,8 +250,16 @@ def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> 
             f"No contact {contact_id!r}. Known: {_known_contacts(config)}\n",
         )
     notes_path = config.daemon.notes_dir / f"{contact_id}.md"
+    if not notes_path.exists():
+        body = (
+            f"No rapport notes for {contact_id} yet.\n"
+            "Triage may propose notes after future interactions; you'll\n"
+            "see them in `list pending` when ready for review.\n"
+        )
+        return _subject("show notes", contact_id), body
     try:
-        rendered = notes_store.read_notes(notes_path, active_scope=None)
+        text = notes_path.read_text(encoding="utf-8")
+        parsed = notes_store.parse(text)
     except notes_store.NotesParseError as e:
         body = (
             f"Notes file for {contact_id} is malformed and cannot be parsed.\n"
@@ -259,6 +270,7 @@ def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> 
             "at unparseable content.\n"
         )
         return _subject("show notes", contact_id), body
+    rendered = notes_store.audit_text(parsed)
     if not rendered.strip():
         body = (
             f"No rapport notes for {contact_id} yet.\n"
@@ -266,7 +278,15 @@ def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> 
             "see them in `list pending` when ready for review.\n"
         )
         return _subject("show notes", contact_id), body
-    body = f"Rapport notes for {contact_id}:\n\n{rendered}\n"
+    legend = (
+        "Bullets marked '⚠ asserted by sender' are claims the contact\n"
+        "made about a third party. Bullets marked '⚠ self-asserted by\n"
+        "sender' are claims the contact made about themselves. Both are\n"
+        "UNVERIFIED — the daemon recorded them but did not confirm them.\n"
+    )
+    body = (
+        f"Rapport notes for {contact_id}:\n\n{rendered}\n\n{legend}"
+    )
     return _subject("show notes", contact_id), body
 
 

@@ -560,3 +560,248 @@ def test_append_note_sets_created_at_only_on_first_write(tmp_path: Path) -> None
     text = p.read_text(encoding="utf-8")
     assert "created_at: 2026-05-06T10:00:00Z" in text
     assert "last_updated: 2026-05-06T11:00:00Z" in text
+
+
+# ---- Provenance tagging (Step 7d+ red-team mitigation) -------------------
+
+
+def test_append_note_writes_meta_tag_with_attribution_and_src(tmp_path: Path) -> None:
+    """Provenance fields serialize as `[meta: src=...; attr=...]`
+    BEFORE the existing scopes tag, so the on-disk shape is
+    `text [meta: ...] [scopes: ...]`. Both are stripped from the
+    LLM-facing render path; the principal-facing audit_text shows them.
+    """
+    p = tmp_path / "fraser.md"
+    append_note(
+        p,
+        contact_id="fraser",
+        section_heading="Project status",
+        body="Sender claims the deadline moved.",
+        scope="nightjar-dev",
+        attribution="asserted",
+        source_message_id="<abc123@example>",
+        now_iso="2026-05-06T15:00:00Z",
+    )
+    text = p.read_text(encoding="utf-8")
+    assert "## Project status [scopes: nightjar-dev]" in text
+    # Tag order: text, then meta, then scopes.
+    assert (
+        "- Sender claims the deadline moved. "
+        "[meta: src=<abc123@example>; attr=asserted] "
+        "[scopes: nightjar-dev]"
+    ) in text
+
+
+def test_append_note_back_compat_writes_no_meta_when_unset(tmp_path: Path) -> None:
+    """Legacy callers that don't pass attribution/src get the same
+    on-disk shape as before."""
+    p = tmp_path / "fraser.md"
+    append_note(
+        p,
+        contact_id="fraser",
+        section_heading="General",
+        body="Legacy bullet.",
+        scope=None,
+        now_iso="2026-05-06T15:00:00Z",
+    )
+    text = p.read_text(encoding="utf-8")
+    assert "[meta:" not in text
+    assert "- Legacy bullet.\n" in text
+
+
+def test_append_note_rejects_unknown_attribution(tmp_path: Path) -> None:
+    p = tmp_path / "fraser.md"
+    with pytest.raises(ValueError, match="attribution must be one of"):
+        append_note(
+            p,
+            contact_id="fraser",
+            section_heading="X",
+            body="bad",
+            scope=None,
+            attribution="hearsay",  # not in the known set
+            source_message_id="<x@y>",
+            now_iso="2026-05-06T15:00:00Z",
+        )
+
+
+def test_parse_extracts_meta_tag_from_bullet() -> None:
+    text = (
+        "## Section [scopes: nightjar-dev]\n"
+        "\n"
+        "- Bullet text. [meta: src=<m1@example>; attr=observed] "
+        "[scopes: nightjar-dev]\n"
+    )
+    p = parse(text)
+    bullet = p.sections[0].bullets[0]
+    assert bullet.text == "Bullet text."
+    assert bullet.attribution == "observed"
+    assert bullet.source_message_id == "<m1@example>"
+    # Scopes still parsed correctly (existing behaviour preserved).
+    assert bullet.scopes == ("nightjar-dev",)
+
+
+def test_parse_handles_meta_only_without_scopes() -> None:
+    text = (
+        "## Section\n"
+        "\n"
+        "- Untagged. [meta: src=<m@x>; attr=self]\n"
+    )
+    p = parse(text)
+    bullet = p.sections[0].bullets[0]
+    assert bullet.text == "Untagged."
+    assert bullet.attribution == "self"
+    assert bullet.source_message_id == "<m@x>"
+    assert bullet.scopes == ()
+
+
+def test_parse_handles_legacy_bullet_without_meta() -> None:
+    """Bullets predating provenance — no meta tag — parse with empty
+    attribution and source_message_id fields. Back-compat invariant."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- Plain bullet. [scopes: *]\n"
+    )
+    p = parse(text)
+    bullet = p.sections[0].bullets[0]
+    assert bullet.text == "Plain bullet."
+    assert bullet.attribution == ""
+    assert bullet.source_message_id == ""
+
+
+def test_parse_unknown_attribution_falls_back_to_empty() -> None:
+    """Hand-edited file with garbage attr — fail-soft, treat as legacy."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- Bullet. [meta: src=<x@y>; attr=guesswork]\n"
+    )
+    p = parse(text)
+    bullet = p.sections[0].bullets[0]
+    assert bullet.attribution == ""
+    # src still parses
+    assert bullet.source_message_id == "<x@y>"
+
+
+def test_filtered_text_strips_meta_tag_from_llm_render() -> None:
+    """The LLM never sees provenance metadata — filtered_text drops
+    both the meta tag and scopes tag."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- A claim. [meta: src=<m@x>; attr=asserted] [scopes: *]\n"
+    )
+    p = parse(text)
+    rendered = filtered_text(p, active_scope=None)
+    assert "[meta:" not in rendered
+    assert "[scopes:" not in rendered
+    assert "src=" not in rendered
+    assert "attr=" not in rendered
+    assert "- A claim." in rendered
+
+
+def test_safe_text_strips_meta_tag_from_classifier_render() -> None:
+    """Pass-1 classifier render also strips provenance metadata."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- Universal bullet. [meta: src=<m@x>; attr=observed]\n"
+    )
+    p = parse(text)
+    rendered = safe_text(p)
+    assert "[meta:" not in rendered
+    assert "src=" not in rendered
+    assert "- Universal bullet." in rendered
+
+
+def test_audit_text_flags_asserted_bullets() -> None:
+    """show-notes uses audit_text. Asserted bullets get a visible
+    UNVERIFIED warning."""
+    text = (
+        "## Project [scopes: nightjar-dev]\n"
+        "\n"
+        "- Sender claimed Dylan approved X. [meta: src=<m1@x>; attr=asserted]"
+        " [scopes: nightjar-dev]\n"
+        "- Daemon observed terse style. [meta: src=<m2@x>; attr=observed]"
+        " [scopes: nightjar-dev]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.audit_text(p)
+    # Asserted bullet flagged.
+    assert "Sender claimed Dylan approved X." in rendered
+    assert "asserted by sender — unverified" in rendered
+    assert "<m1@x>" in rendered
+    # Observed bullet not flagged.
+    assert "Daemon observed terse style." in rendered
+    # No double-flagging — observed bullet doesn't carry the warning text.
+    obs_line = [
+        line for line in rendered.splitlines()
+        if "Daemon observed terse style" in line
+    ][0]
+    assert "unverified" not in obs_line
+
+
+def test_audit_text_flags_self_bullets() -> None:
+    text = (
+        "## Section\n"
+        "\n"
+        "- Sender said they prefer mornings. [meta: src=<m@x>; attr=self]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.audit_text(p)
+    assert "self-asserted by sender — unverified" in rendered
+
+
+def test_audit_text_does_not_flag_legacy_bullets() -> None:
+    """Bullets without attribution metadata (legacy) render
+    unannotated — back-compat."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- Legacy bullet, no meta tag.\n"
+    )
+    p = parse(text)
+    rendered = notes_store.audit_text(p)
+    assert "- Legacy bullet, no meta tag." in rendered
+    assert "unverified" not in rendered
+
+
+def test_append_then_parse_roundtrip_preserves_provenance(tmp_path: Path) -> None:
+    """Round-trip: write with provenance → read back → fields intact."""
+    p = tmp_path / "fraser.md"
+    append_note(
+        p,
+        contact_id="fraser",
+        section_heading="Project",
+        body="Asserted claim.",
+        scope="nightjar-dev",
+        attribution="asserted",
+        source_message_id="<round@trip>",
+        now_iso="2026-05-06T15:00:00Z",
+    )
+    text = p.read_text(encoding="utf-8")
+    parsed = parse(text)
+    bullet = parsed.sections[0].bullets[0]
+    assert bullet.text == "Asserted claim."
+    assert bullet.attribution == "asserted"
+    assert bullet.source_message_id == "<round@trip>"
+    assert bullet.scopes == ("nightjar-dev",)
+
+
+def test_append_note_with_provenance_idempotent_serialize(tmp_path: Path) -> None:
+    """Re-serialising a parsed file with provenance produces
+    byte-identical output — ensures the on-disk shape is canonical."""
+    p = tmp_path / "fraser.md"
+    append_note(
+        p,
+        contact_id="fraser",
+        section_heading="Project",
+        body="A note.",
+        scope="nightjar-dev",
+        attribution="self",
+        source_message_id="<x@y>",
+        now_iso="2026-05-06T15:00:00Z",
+    )
+    text = p.read_text(encoding="utf-8")
+    re_serialized = notes_store._serialize(parse(text))
+    assert re_serialized == text

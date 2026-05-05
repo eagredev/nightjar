@@ -436,7 +436,19 @@ def test_validate_rejects_oversized_reply() -> None:
 
 
 def test_validate_rejects_oversized_notes() -> None:
-    err = validate_plan_payload(_good_payload(notes="x" * 500))
+    err = validate_plan_payload(_good_payload(notes="x" * 900))
+    assert isinstance(err, TriageError)
+    assert err.reason == "notes_too_long"
+
+
+def test_validate_accepts_notes_at_cap() -> None:
+    """800 chars exactly is allowed. 801+ is rejected. The cap was
+    bumped from 400 after a red-team session showed it was too tight
+    when the model legitimately had analysis to share about adversarial
+    content (`risk_flags` non-empty)."""
+    plan = validate_plan_payload(_good_payload(notes="x" * 800))
+    assert isinstance(plan, TriagePlan)
+    err = validate_plan_payload(_good_payload(notes="x" * 801))
     assert isinstance(err, TriageError)
     assert err.reason == "notes_too_long"
 
@@ -644,6 +656,140 @@ def test_validate_drops_proposal_with_non_string_scope() -> None:
     assert plan.note_proposals == ()
 
 
+# ---- is_universal: scoped contacts force a real scope ---------------------
+
+
+def _scoped_contact(*scopes: str) -> Contact:
+    """Return a Contact with given scopes registered."""
+    base = _contact()
+    return Contact(
+        contact_id=base.contact_id, addresses=base.addresses,
+        display_name=base.display_name, relationship=base.relationship,
+        daily_limit=base.daily_limit, is_principal=base.is_principal,
+        inboxes=base.inboxes, scopes=scopes,
+    )
+
+
+def test_validate_drops_null_scope_proposal_when_contact_has_scopes() -> None:
+    """The whole point of the enum schema: scoped contact must not
+    accept a null-scope proposal. The model can't emit one through the
+    tool schema; this test guards the daemon-side belt-and-braces drop
+    in case the model bypasses the schema or future schema relaxations."""
+    contact = _scoped_contact("aurora")
+    plan = validate_plan_payload(
+        _payload_with_proposals(
+            {"scope": None, "section_heading": "X", "body": "Y"},
+        ),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_accepts_is_universal_true_with_scope() -> None:
+    """A scoped contact CAN have universal-tagged proposals as long as
+    they include a real scope name (capturing where the observation
+    came from). is_universal=true flips on-disk visibility, not
+    proposal-shape requirements."""
+    contact = _scoped_contact("aurora", "personal")
+    plan = validate_plan_payload(
+        _payload_with_proposals({
+            "scope": "aurora", "is_universal": True,
+            "section_heading": "Style", "body": "Prefers terse replies.",
+        }),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert len(plan.note_proposals) == 1
+    p = plan.note_proposals[0]
+    assert p.scope == "aurora"
+    assert p.is_universal is True
+
+
+def test_validate_defaults_is_universal_to_false_when_omitted() -> None:
+    """Field is required by the schema but the validator handles
+    legacy/missing keys defensively — defaults to False, the safer
+    setting."""
+    contact = _scoped_contact("aurora")
+    plan = validate_plan_payload(
+        _payload_with_proposals({
+            "scope": "aurora",
+            "section_heading": "X", "body": "Y",
+        }),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].is_universal is False
+
+
+def test_validate_coerces_non_bool_is_universal_to_false() -> None:
+    """Defensive type check: a string or number in is_universal
+    becomes False, never errors out the plan."""
+    contact = _scoped_contact("aurora")
+    plan = validate_plan_payload(
+        _payload_with_proposals({
+            "scope": "aurora", "is_universal": "yes",  # not a bool
+            "section_heading": "X", "body": "Y",
+        }),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].is_universal is False
+
+
+def test_validate_forces_is_universal_false_for_unscoped_contact() -> None:
+    """Unscoped contact has no scope vocabulary, so is_universal has
+    no semantic meaning — forced to False even if model sets it."""
+    contact = _contact()  # default scopes=()
+    plan = validate_plan_payload(
+        _payload_with_proposals({
+            "scope": None, "is_universal": True,
+            "section_heading": "X", "body": "Y",
+        }),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].is_universal is False
+
+
+def test_build_draft_plan_tool_scoped_contact_uses_enum() -> None:
+    """The tool schema emitted for a scoped contact must put scope
+    in an enum (not allow null). This is the wall the model hits
+    BEFORE returning a proposal — without this, the model can pick
+    null and we fall back to soft-prompting."""
+    from daemon.triage import build_draft_plan_tool
+    contact = _scoped_contact("aurora", "personal")
+    tool = build_draft_plan_tool(contact)
+    proposal_schema = tool["input_schema"]["properties"]["note_proposals"]["items"]
+    scope_schema = proposal_schema["properties"]["scope"]
+    assert scope_schema["type"] == "string"
+    assert "null" not in (scope_schema.get("type") if isinstance(scope_schema.get("type"), list) else [])
+    assert scope_schema["enum"] == ["aurora", "personal"]
+    # is_universal MUST be present and required.
+    assert "is_universal" in proposal_schema["properties"]
+    assert proposal_schema["properties"]["is_universal"]["type"] == "boolean"
+    assert "is_universal" in proposal_schema["required"]
+    assert "scope" in proposal_schema["required"]
+
+
+def test_build_draft_plan_tool_unscoped_contact_legacy_shape() -> None:
+    """Unscoped contact (or no contact context) gets the legacy shape:
+    scope is string|null, no is_universal field. Preserves backwards
+    compatibility for the direct triage_contact_mail path."""
+    from daemon.triage import build_draft_plan_tool
+    tool = build_draft_plan_tool(None)
+    proposal_schema = tool["input_schema"]["properties"]["note_proposals"]["items"]
+    scope_schema = proposal_schema["properties"]["scope"]
+    assert "null" in scope_schema["type"]
+    assert "string" in scope_schema["type"]
+    assert "is_universal" not in proposal_schema["properties"]
+    # Same for an empty-scopes contact:
+    contact = _contact()  # scopes=()
+    tool = build_draft_plan_tool(contact)
+    proposal_schema = tool["input_schema"]["properties"]["note_proposals"]["items"]
+    assert "is_universal" not in proposal_schema["properties"]
+
+
 # ---- triage_contact_mail (top-level) ---------------------------------------
 
 
@@ -812,3 +958,106 @@ def test_triage_does_not_send_api_key_to_model() -> None:
     call = client.calls[0]
     assert config.api_key not in call["system"]
     assert config.api_key not in call["user"]
+
+
+# ---- Provenance / attribution (drift-attack mitigation) -------------------
+
+
+def test_validate_extracts_attribution_observed() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "General",
+         "body": "Terse style.",
+         "attribution": "observed"},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "observed"
+
+
+def test_validate_extracts_attribution_asserted() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "Project",
+         "body": "Sender claims X said Y.",
+         "attribution": "asserted"},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "asserted"
+
+
+def test_validate_extracts_attribution_self() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "Prefs",
+         "body": "Sender said they prefer mornings.",
+         "attribution": "self"},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "self"
+
+
+def test_validate_unknown_attribution_falls_back_to_asserted() -> None:
+    """Fail-pessimistic: if the model garbles attribution, treat it as
+    asserted (the highest-suspicion bucket). Prevents a model that
+    omits the field from downgrading its claim to 'observed'."""
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "X",
+         "body": "Y.",
+         "attribution": "hearsay"},  # unknown
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "asserted"
+
+
+def test_validate_missing_attribution_falls_back_to_asserted() -> None:
+    """No attribution field → treat as asserted (fail-pessimistic).
+    The schema says it's required, but if the model skips it anyway,
+    the validator's job is to refuse to hand the model a free pass."""
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "X", "body": "Y."},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "asserted"
+
+
+def test_validate_non_string_attribution_falls_back_to_asserted() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "X", "body": "Y.",
+         "attribution": 42},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].attribution == "asserted"
+
+
+def test_build_draft_plan_tool_scoped_includes_attribution_enum() -> None:
+    from daemon.triage import build_draft_plan_tool
+    contact = _contact()
+    contact = Contact(
+        contact_id=contact.contact_id, addresses=contact.addresses,
+        display_name=contact.display_name, relationship=contact.relationship,
+        daily_limit=contact.daily_limit, is_principal=contact.is_principal,
+        inboxes=contact.inboxes, scopes=("nightjar-dev", "ops"),
+    )
+    tool = build_draft_plan_tool(contact)
+    proposal_schema = tool["input_schema"]["properties"]["note_proposals"]["items"]
+    attr = proposal_schema["properties"]["attribution"]
+    assert attr["type"] == "string"
+    assert set(attr["enum"]) == {"observed", "asserted", "self"}
+    assert "attribution" in proposal_schema["required"]
+
+
+def test_build_draft_plan_tool_unscoped_includes_attribution_enum() -> None:
+    """Even for unscoped contacts, attribution is required — provenance
+    is universal across both shapes."""
+    from daemon.triage import build_draft_plan_tool
+    tool = build_draft_plan_tool(None)
+    proposal_schema = tool["input_schema"]["properties"]["note_proposals"]["items"]
+    attr = proposal_schema["properties"]["attribution"]
+    assert set(attr["enum"]) == {"observed", "asserted", "self"}
+    assert "attribution" in proposal_schema["required"]
+
+
+def test_note_proposal_default_attribution_is_observed() -> None:
+    """Backwards compat for code that constructs NoteProposal directly
+    without specifying attribution. Default is 'observed' (the
+    least-cautious value) because that path is only used by tests
+    and pre-existing internal callers, not by validator output."""
+    p = NoteProposal(scope=None, section_heading="X", body="Y")
+    assert p.attribution == "observed"

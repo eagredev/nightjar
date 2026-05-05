@@ -90,6 +90,12 @@ KNOWN_RISK_FLAGS = frozenset({
 })
 
 
+# Provenance vocabulary for note proposals. Mirrors notes_store's
+# _KNOWN_ATTRIBUTIONS — kept in lockstep but defined here so the tool
+# schema can reference it without importing notes_store at module load.
+_KNOWN_ATTRIBUTIONS: tuple[str, ...] = ("observed", "asserted", "self")
+
+
 # ---- Message structure -----------------------------------------------------
 
 # The `<body>` block the LLM sees is the plain-text view of the email. It
@@ -153,15 +159,36 @@ class NoteProposal:
     memory architecture rationale (rapport notes are working memory,
     not a privileged-action surface).
 
-    `scope` is None when the proposal is unscoped (visible everywhere)
-    or one of the contact's allowed scopes. When the contact has
-    no scopes, scope MUST be None — proposing a scope on an
-    unrestricted contact would create a tag that nothing can filter
-    against.
+    `scope` is the topic this note belongs to. For scoped contacts
+    it MUST be one of the contact's registered scopes (the tool
+    schema's enum enforces this on the model side; validation enforces
+    it daemon-side as belt-and-braces). For unscoped contacts (no
+    scopes set) `scope` is None — there's no scope vocabulary.
+
+    `is_universal` is the explicit override for genuinely cross-cutting
+    notes. When True, the daemon writes the bullet as wildcard-visible
+    (`[scopes: *]`) instead of under the chosen scope. When False
+    (the default), the bullet is tagged with `scope`. The split exists
+    because the model could not be reliably prompted to use a single
+    `null` field correctly — see the Step 7 live-test memo.
+
+    `attribution` is the provenance classification:
+      - 'observed' — daemon saw this firsthand (writing style, tone,
+        cadence, message structure). Trustworthy.
+      - 'asserted' — the contact claimed something about a third party
+        (the principal, another collaborator). UNVERIFIED.
+      - 'self' — the contact claimed something about themselves
+        (preferences, project status). UNVERIFIED.
+    The model is required to pick one; the schema enforces the enum.
+    Defends against persistent poisoning attacks (DR2 from the
+    2026-05-05 red-team session) by surfacing sender attribution to
+    the principal when they `show notes`.
     """
     scope: str | None
     section_heading: str
     body: str
+    is_universal: bool = False
+    attribution: str = "observed"
 
 
 @dataclass(frozen=True)
@@ -298,91 +325,192 @@ def build_system_prompt(prompts_dir: Path) -> str:
     return header.rstrip() + "\n\n" + triage.lstrip()
 
 
-DRAFT_PLAN_TOOL: dict[str, Any] = {
-    "name": "draft_plan",
-    "description": (
-        "Emit exactly one structured plan for the principal to approve. "
-        "This is your only output mechanism; you must call it exactly once."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "Neutral 1-3 sentence description of the email.",
-            },
-            "verb": {
-                "type": "string",
-                "enum": list(_MODEL_VERBS),
-                "description": (
-                    "The action proposed if the principal approves. Pick "
-                    "the lowest-risk verb that fits."
-                ),
-            },
-            "args": {
-                "type": "object",
-                "description": "Verb-specific arguments. See system prompt.",
-            },
-            "reasoning": {
-                "type": "string",
-                "description": "1-3 sentences justifying the choice to the principal.",
-            },
-            "risk_flags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Subset of the risk flag vocabulary in the system prompt.",
-            },
-            "notes": {
-                "type": "string",
-                "description": "Optional extra context for the principal, <= 400 chars.",
-            },
-            "note_proposals": {
-                "type": "array",
-                "description": (
-                    "Optional. Zero or more proposed additions to "
-                    "the contact's rapport-notes file. Propose only "
-                    "concrete observations worth remembering "
-                    "long-term — never propose for routine messages "
-                    "or just to fill the field. Default to empty."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "scope": {
-                            "type": ["string", "null"],
-                            "description": (
-                                "Scope tag for the proposal. Use one of "
-                                "the contact's allowed scopes when the "
-                                "contact has scopes; null when "
-                                "unscoped, or for a wildcard-style "
-                                "observation visible everywhere."
-                            ),
-                        },
-                        "section_heading": {
-                            "type": "string",
-                            "description": (
-                                "Section heading the bullet belongs "
-                                "under (an existing heading or a new "
-                                "one). Short topic label."
-                            ),
-                        },
-                        "body": {
-                            "type": "string",
-                            "description": (
-                                "The bullet text. Concise prose, one "
-                                "observation, no leading hyphen — "
-                                "the daemon adds bullet formatting."
-                            ),
-                        },
-                    },
-                    "required": ["scope", "section_heading", "body"],
-                    "additionalProperties": False,
+def build_draft_plan_tool(contact: Contact | None = None) -> dict[str, Any]:
+    """Build the draft_plan tool spec, parametrised on the contact's scopes.
+
+    When the contact has scopes set, the note_proposals item schema enforces:
+      - `scope` is a required enum of the contact's allowed scopes (no null,
+        no wildcards). The model cannot pick a scope outside the contact's
+        registered list, and cannot omit the field.
+      - `is_universal` is a required boolean. When true, the daemon writes
+        the note as wildcard-visible (`[scopes: *]`); when false, the daemon
+        writes it under the chosen scope. The bar for `is_universal=true`
+        is high — see prompt for guidance.
+
+    When the contact has no scopes, the schema accepts the legacy shape
+    (scope: string|null, no is_universal) — there's no scope vocabulary to
+    enforce against, and universal-vs-scoped is not a meaningful choice.
+
+    Splitting "what scope does this belong to" from "is this genuinely
+    cross-cutting" forces the model to commit to two independent decisions.
+    The previous shape (scope: null|string) collapsed both into one slot,
+    which the model resolved to "null" too liberally — see Step 7 live-test
+    observations in project-nightjar-step-7.md.
+    """
+    attribution_property = {
+        "type": "string",
+        "enum": list(_KNOWN_ATTRIBUTIONS),
+        "description": (
+            "Required. Provenance of this observation. Pick exactly one:\n"
+            "- 'observed': you saw this firsthand from the contact's "
+            "behaviour or message structure (writing style, tone, "
+            "cadence, response timing, attachment habits). Trustworthy.\n"
+            "- 'asserted': the contact stated something about a THIRD "
+            "PARTY — the principal, another collaborator, an external "
+            "fact. UNVERIFIED. Use this for any 'X said Y', 'the team "
+            "agreed', 'Dylan approved' content. The principal will see "
+            "this flagged when they review notes.\n"
+            "- 'self': the contact stated something about THEMSELVES "
+            "(their preferences, their project status, their location). "
+            "UNVERIFIED but lower-risk than 'asserted' — false self-"
+            "claims tend to surface naturally over time.\n"
+            "When in doubt between 'observed' and 'self', pick 'self'. "
+            "When in doubt between 'self' and 'asserted', pick 'asserted'. "
+            "Better to over-flag than to laundering a sender claim into "
+            "established context."
+        ),
+    }
+    if contact is not None and contact.scopes:
+        proposal_item_schema = {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": list(contact.scopes),
+                    "description": (
+                        "Required. Pick the scope this note belongs to. "
+                        "Must be one of the contact's registered scopes. "
+                        "Never set this for content unrelated to the active "
+                        "conversation — see is_universal for the cross-cutting "
+                        "case."
+                    ),
+                },
+                "is_universal": {
+                    "type": "boolean",
+                    "description": (
+                        "Required. Set true ONLY for content that's safe to "
+                        "surface in any future conversation regardless of "
+                        "topic — communication style, address routing, "
+                        "writing conventions. Default false. Project "
+                        "deadlines, tools, and work patterns are NOT "
+                        "universal even if they sound general — they belong "
+                        "to their scope."
+                    ),
+                },
+                "attribution": attribution_property,
+                "section_heading": {
+                    "type": "string",
+                    "description": (
+                        "Section heading the bullet belongs under (an "
+                        "existing heading or a new one). Short topic label."
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "The bullet text. Concise prose, one observation, "
+                        "no leading hyphen — the daemon adds bullet formatting."
+                    ),
                 },
             },
+            "required": [
+                "scope", "is_universal", "attribution",
+                "section_heading", "body",
+            ],
+            "additionalProperties": False,
+        }
+    else:
+        proposal_item_schema = {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Always null for unscoped contacts — there's no "
+                        "scope vocabulary to tag against."
+                    ),
+                },
+                "attribution": attribution_property,
+                "section_heading": {
+                    "type": "string",
+                    "description": (
+                        "Section heading the bullet belongs under (an "
+                        "existing heading or a new one). Short topic label."
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "The bullet text. Concise prose, one observation, "
+                        "no leading hyphen — the daemon adds bullet formatting."
+                    ),
+                },
+            },
+            "required": [
+                "scope", "attribution", "section_heading", "body",
+            ],
+            "additionalProperties": False,
+        }
+
+    return {
+        "name": "draft_plan",
+        "description": (
+            "Emit exactly one structured plan for the principal to approve. "
+            "This is your only output mechanism; you must call it exactly once."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Neutral 1-3 sentence description of the email.",
+                },
+                "verb": {
+                    "type": "string",
+                    "enum": list(_MODEL_VERBS),
+                    "description": (
+                        "The action proposed if the principal approves. Pick "
+                        "the lowest-risk verb that fits."
+                    ),
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Verb-specific arguments. See system prompt.",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "1-3 sentences justifying the choice to the principal.",
+                },
+                "risk_flags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subset of the risk flag vocabulary in the system prompt.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional extra context for the principal, <= 800 chars.",
+                },
+                "note_proposals": {
+                    "type": "array",
+                    "description": (
+                        "Optional. Zero or more proposed additions to "
+                        "the contact's rapport-notes file. Propose only "
+                        "concrete observations worth remembering "
+                        "long-term — never propose for routine messages "
+                        "or just to fill the field. Default to empty."
+                    ),
+                    "items": proposal_item_schema,
+                },
+            },
+            "required": ["summary", "verb", "args", "reasoning", "risk_flags"],
         },
-        "required": ["summary", "verb", "args", "reasoning", "risk_flags"],
-    },
-}
+    }
+
+
+# Legacy unscoped shape for callers that pre-date Step 7b's contact-aware
+# tool building. Used by direct triage_contact_mail callers that pass no
+# contact context. Equivalent to build_draft_plan_tool(None).
+DRAFT_PLAN_TOOL: dict[str, Any] = build_draft_plan_tool(None)
 
 
 # ---- Input building --------------------------------------------------------
@@ -501,7 +629,7 @@ def build_user_message(
 # ---- Validation ------------------------------------------------------------
 
 
-_MAX_NOTES_LEN = 400
+_MAX_NOTES_LEN = 800
 _MAX_REPLY_BODY_LEN = 2000
 
 # Step 7d: caps on note_proposals fields. Heading is a section title
@@ -636,21 +764,46 @@ def validate_plan_payload(
                 continue
             heading_clean = heading.strip()[:_MAX_NOTE_HEADING_LEN]
             body_clean = body_text.strip()[:_MAX_NOTE_BODY_LEN]
-            # Scope must match contact.scopes when contact provided.
-            # None is always accepted (unscoped/wildcard intent).
-            if contact is not None and scope is not None:
-                if not contact.scopes:
-                    # Contact is unrestricted; a scoped proposal is a
-                    # model error — drop it.
-                    continue
-                if scope not in contact.scopes:
-                    # Model picked a scope outside the allowed set —
-                    # drop, don't fail the plan.
-                    continue
+            raw_is_universal = raw.get("is_universal", False)
+            is_universal = bool(raw_is_universal) if isinstance(raw_is_universal, bool) else False
+
+            # Provenance: attribution is required by the schema, but
+            # validate defensively. Unknown values fall back to
+            # 'asserted' — fail-pessimistic so a model that omits or
+            # garbles the field can't downgrade its own claim to
+            # 'observed' (the trustworthy bucket). See provenance
+            # tagging memo / 2026-05-05 red-team observations.
+            raw_attr = raw.get("attribution")
+            if isinstance(raw_attr, str) and raw_attr in _KNOWN_ATTRIBUTIONS:
+                attribution = raw_attr
+            else:
+                attribution = "asserted"
+
+            # Scope vs contact.scopes: the tool schema's enum already
+            # constrains what the model can emit, but we re-check
+            # daemon-side as belt-and-braces. The rules are:
+            #   - Contact has scopes: scope MUST be a string in
+            #     contact.scopes. None or unknown scope = drop the
+            #     proposal silently. is_universal stays as supplied.
+            #   - Contact has no scopes: scope MUST be None.
+            #     is_universal is ignored (forced False) — there's no
+            #     scope vocabulary so universal-vs-scoped is not a
+            #     meaningful distinction.
+            if contact is not None:
+                if contact.scopes:
+                    if not isinstance(scope, str) or scope not in contact.scopes:
+                        continue
+                else:
+                    if scope is not None:
+                        continue
+                    is_universal = False
+
             note_proposals.append(NoteProposal(
                 scope=scope,
                 section_heading=heading_clean,
                 body=body_clean,
+                is_universal=is_universal,
+                attribution=attribution,
             ))
 
     return TriagePlan(
@@ -705,7 +858,7 @@ async def triage_contact_mail(
             model=config.default_model,
             system=system,
             user=user,
-            tools=[DRAFT_PLAN_TOOL],
+            tools=[build_draft_plan_tool(contact)],
             max_tokens=config.per_invocation_max_input_tokens,
         )
     except Exception as e:
@@ -1036,7 +1189,7 @@ async def _triage_with_notes(
             model=config.default_model,
             system=system,
             user=user,
-            tools=[DRAFT_PLAN_TOOL],
+            tools=[build_draft_plan_tool(contact)],
             max_tokens=config.per_invocation_max_input_tokens,
         )
     except Exception as e:
