@@ -16,6 +16,7 @@ import datetime
 import json
 from pathlib import Path
 
+from . import notes_store
 from .config import Config
 from .principal_commands import ParsedCommand
 from .state import State
@@ -225,19 +226,52 @@ def handle_show_contact(*, config: Config, state: State, args: dict[str, str]) -
 
 
 def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> tuple[str, str]:
-    """Rapport notes file content. Placeholder until Step 7 ships notes."""
+    """Dump a contact's rapport-notes file inline.
+
+    Returns the full notes content (no scope filtering — this is an
+    audit verb, the principal sees everything). Frontmatter is omitted
+    via the same `filtered_text(..., None)` path triage uses, since
+    the principal doesn't need to see the daemon's metadata.
+    """
     contact_id = args.get("contact", "").strip()
     if not contact_id:
-        body = "Rapport notes ship in Step 7. Usage will be: Nightjar, show notes <contact>\n"
+        body = (
+            "Usage: Nightjar, show notes <contact>\n"
+            "\n"
+            f"Known contacts: {_known_contacts(config)}\n"
+        )
         return _subject("show notes"), body
     if contact_id not in config.contacts:
-        known = ", ".join(sorted(config.contacts.keys())) or "(none)"
-        return _subject("show notes"), f"No contact {contact_id!r}. Known: {known}\n"
-    body = (
-        f"No rapport notes for {contact_id} yet.\n"
-        "Note storage and the three-test rule ship with Step 7.\n"
-    )
+        return (
+            _subject("show notes"),
+            f"No contact {contact_id!r}. Known: {_known_contacts(config)}\n",
+        )
+    notes_path = config.daemon.notes_dir / f"{contact_id}.md"
+    try:
+        rendered = notes_store.read_notes(notes_path, active_scope=None)
+    except notes_store.NotesParseError as e:
+        body = (
+            f"Notes file for {contact_id} is malformed and cannot be parsed.\n"
+            f"Path: {notes_path}\n"
+            f"Error: {e}\n"
+            "\n"
+            "Edit the file directly to fix; the daemon refuses to guess\n"
+            "at unparseable content.\n"
+        )
+        return _subject("show notes", contact_id), body
+    if not rendered.strip():
+        body = (
+            f"No rapport notes for {contact_id} yet.\n"
+            "Triage may propose notes after future interactions; you'll\n"
+            "see them in `list pending` when ready for review.\n"
+        )
+        return _subject("show notes", contact_id), body
+    body = f"Rapport notes for {contact_id}:\n\n{rendered}\n"
     return _subject("show notes", contact_id), body
+
+
+def _known_contacts(config: Config) -> str:
+    return ", ".join(sorted(config.contacts.keys())) or "(none)"
 
 
 # ---- dispatch --------------------------------------------------------------

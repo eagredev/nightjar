@@ -161,7 +161,6 @@ def apply_add(*, request: AddContactRequest, config: Config) -> None:
         daily_limit=request.daily_limit,
         is_principal=False,
         inboxes=request.inboxes,
-        auto_approve_notes=False,
     )
     config.contacts[request.contact_id] = contact
     config.address_index[request.address.lower()] = request.contact_id
@@ -240,7 +239,10 @@ def _render_contact_toml(req: AddContactRequest) -> str:
         f"daily_limit = {daily_limit_field}",
         "is_principal = false",
         f"inboxes = [{inboxes_inline}]",
-        "auto_approve_notes = false",
+        # Step 7b: scopes default empty = unrestricted. Operators add
+        # tags to gate topical access; until they do, behaviour matches
+        # pre-Step-7b (no scope classification, all notes visible).
+        "scopes = []",
     ]
     return "\n".join(lines) + "\n"
 

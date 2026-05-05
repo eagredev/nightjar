@@ -1037,3 +1037,4 @@ class State:
             if row is None or row["last_ts"] is None:
                 return None
             return int(row["last_ts"])
+

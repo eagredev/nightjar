@@ -779,3 +779,196 @@ def test_catchup_window_rejects_non_integer(tmp_path: Path) -> None:
     """)
     with pytest.raises(ConfigError, match="catchup_window_days"):
         load_config(path)
+
+
+# ---- Step 7b: scopes registry ---------------------------------------------
+
+
+def _minimal_inbox_block(tmp_path: Path) -> str:
+    """Standard [daemon] + [inbox:nightjar] block for scope tests."""
+    return f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        trusted_authserv = mx.google.com
+    """
+
+
+def test_scopes_section_absent_yields_empty_registry(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    assert cfg.scopes == {}
+
+
+def test_scopes_section_parses_descriptions(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = the Aurora redesign work
+        music-tech = music production and chiptune workflows
+    """)
+    cfg = load_config(path)
+    assert cfg.scopes == {
+        "aurora": "the Aurora redesign work",
+        "music-tech": "music production and chiptune workflows",
+    }
+
+
+def test_scopes_lowercases_uppercase_keys(tmp_path: Path) -> None:
+    """ConfigParser auto-lowercases keys (default behaviour). The
+    registry stores the lowercased form, so `Aurora` in the INI is
+    accepted as `aurora`. Operators get graceful normalisation."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        Aurora = the Aurora work
+    """)
+    cfg = load_config(path)
+    assert "aurora" in cfg.scopes
+    assert "Aurora" not in cfg.scopes
+
+
+def test_scopes_rejects_invalid_chars(tmp_path: Path) -> None:
+    """A scope key that doesn't normalise to a valid name is rejected.
+    INI keys can contain dots, which we want to reject because they'd
+    confuse the LLM if it tried to dot-walk into a scope name."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        my.scope = nope
+    """)
+    with pytest.raises(ConfigError, match="scope name"):
+        load_config(path)
+
+
+def test_scopes_rejects_empty_description(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora =
+    """)
+    with pytest.raises(ConfigError, match="empty description"):
+        load_config(path)
+
+
+def test_contact_with_unknown_scope_rejected(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = ["aurora"]
+    """)
+    # No [scopes] section — aurora is unknown.
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    with pytest.raises(ConfigError, match="not defined in the \\[scopes\\] registry"):
+        load_config(path)
+
+
+def test_contact_with_known_scope_accepted(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = ["aurora", "music-tech"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = the Aurora redesign work
+        music-tech = music production
+    """)
+    cfg = load_config(path)
+    assert cfg.contacts["fraser"].scopes == ("aurora", "music-tech")
+
+
+def test_contact_with_empty_scopes_default(tmp_path: Path) -> None:
+    """A contact without a `scopes` field defaults to () — unrestricted."""
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    assert cfg.contacts["fraser"].scopes == ()
+
+
+def test_contact_with_explicit_empty_scopes(tmp_path: Path) -> None:
+    """`scopes = []` is the explicit unrestricted form."""
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = []
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    assert cfg.contacts["fraser"].scopes == ()
+
+
+def test_contact_rejects_invalid_scope_name(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = ["BadScope"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    with pytest.raises(ConfigError, match="scope name"):
+        load_config(path)
+
+
+def test_contact_rejects_duplicate_scope(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = ["aurora", "aurora"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = the Aurora work
+    """)
+    with pytest.raises(ConfigError, match="duplicate scope"):
+        load_config(path)
+
+
+def test_contact_scopes_must_be_list_of_strings(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = "aurora"
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = the Aurora work
+    """)
+    with pytest.raises(ConfigError, match="scopes must be a list"):
+        load_config(path)

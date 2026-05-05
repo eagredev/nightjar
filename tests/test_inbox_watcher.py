@@ -398,3 +398,187 @@ def test_extract_structure_handles_unnamed_attachment() -> None:
     )
     assert s.attachment_count == 1
     assert "(unnamed application/octet-stream)" in s.attachment_names
+
+
+# ---- Step 7d (per Step 8): _handle_note_proposals -------------------------
+
+
+def _make_watcher_for_notes(tmp_path):
+    """Construct a minimal InboxWatcher just for testing
+    _handle_note_proposals. No IMAP, no Claude, no real config —
+    just enough state for the helper to write to the right paths
+    and emit log events."""
+    from daemon.config import (
+        Config, Contact, DaemonConfig, InboxConfig,
+    )
+    from daemon.log import JSONLLogger
+    from daemon.state import State
+
+    daemon_cfg = DaemonConfig(
+        state_dir=tmp_path / "state",
+        log_dir=tmp_path / "logs",
+        notes_dir=tmp_path / "notes",
+    )
+    daemon_cfg.state_dir.mkdir(parents=True)
+    daemon_cfg.log_dir.mkdir(parents=True)
+    daemon_cfg.notes_dir.mkdir(parents=True)
+    contacts = {
+        "fraser": Contact(
+            contact_id="fraser",
+            addresses=("fraser@example.com",),
+            display_name="Fraser",
+            relationship="collaborator",
+            daily_limit=3,
+            is_principal=False,
+            inboxes=("nightjar",),
+        ),
+    }
+    inbox = InboxConfig(
+        name="nightjar",
+        enabled=True,
+        imap_host="imap.example.com",
+        imap_port=993,
+        imap_user="bot@example.com",
+        imap_password="x",
+        allowed_contacts=("fraser",),
+        trusted_authserv="mx.google.com",
+    )
+    config = Config(
+        daemon=daemon_cfg,
+        contacts=contacts,
+        inboxes={"nightjar": inbox},
+    )
+    state = State(db_path=daemon_cfg.state_dir / "state.db")
+    logger = JSONLLogger(daemon_cfg.log_dir)
+    return InboxWatcher(
+        inbox=inbox, config=config, state=state, logger=logger,
+    )
+
+
+def _make_plan(*proposals):
+    """Construct a TriagePlan stub carrying the given note_proposals."""
+    from daemon.triage import NoteProposal, TriagePlan
+    return TriagePlan(
+        verb="reply", tier=3,
+        args={"body": "ok"},
+        summary="s", reasoning="r",
+        risk_flags=(),
+        notes="",
+        raw_input_tokens=100, raw_output_tokens=10,
+        note_proposals=tuple(
+            NoteProposal(scope=p.get("scope"),
+                         section_heading=p["section_heading"],
+                         body=p["body"])
+            for p in proposals
+        ),
+    )
+
+
+def test_handle_note_proposals_writes_directly_no_queue(tmp_path):
+    """7d (per Step 8): proposals are applied autonomously to the
+    contact's .md file. No state-db queue, no approval flow."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None,
+         "section_heading": "General",
+         "body": "Replies fastest in evenings."},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    assert notes_path.exists()
+    text = notes_path.read_text(encoding="utf-8")
+    assert "## General" in text
+    assert "Replies fastest in evenings" in text
+    assert "contact_id: fraser" in text
+
+
+def test_handle_note_proposals_no_proposals_is_noop(tmp_path):
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan()  # empty proposals
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    # No file created when no proposals.
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    assert not notes_path.exists()
+
+
+def test_handle_note_proposals_appends_to_existing_file(tmp_path):
+    watcher = _make_watcher_for_notes(tmp_path)
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    notes_path.write_text(
+        "---\ncontact_id: fraser\n---\n\n"
+        "## Existing\n\n- prior bullet\n",
+        encoding="utf-8",
+    )
+    plan = _make_plan(
+        {"scope": None, "section_heading": "Existing", "body": "new bullet"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    text = notes_path.read_text(encoding="utf-8")
+    assert "prior bullet" in text
+    assert "new bullet" in text
+
+
+def test_handle_note_proposals_writes_multiple_to_same_file(tmp_path):
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "A", "body": "a-bullet"},
+        {"scope": None, "section_heading": "B", "body": "b-bullet"},
+        {"scope": None, "section_heading": "A", "body": "a-bullet-2"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    text = notes_path.read_text(encoding="utf-8")
+    assert "## A" in text
+    assert "## B" in text
+    assert "a-bullet" in text
+    assert "a-bullet-2" in text
+    assert "b-bullet" in text
+
+
+def test_handle_note_proposals_logs_each_write(tmp_path):
+    """JSONL log carries note_written events with full provenance —
+    the audit trail since there's no state-db queue."""
+    watcher = _make_watcher_for_notes(tmp_path)
+    plan = _make_plan(
+        {"scope": None, "section_heading": "X", "body": "first"},
+        {"scope": None, "section_heading": "Y", "body": "second"},
+    )
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    log_files = list(watcher.config.daemon.log_dir.iterdir())
+    assert log_files, "expected at least one JSONL log file"
+    log_text = "\n".join(p.read_text() for p in log_files)
+    assert log_text.count("note_written") == 2
+    assert "fraser" in log_text
+
+
+def test_handle_note_proposals_continues_on_partial_failure(tmp_path):
+    """If one proposal write fails, others still apply. Error logged
+    but does not propagate."""
+    import os
+    watcher = _make_watcher_for_notes(tmp_path)
+    # Pre-create the .md file as something the parser can't read,
+    # forcing the first append's parse to fail.
+    notes_path = watcher.config.daemon.notes_dir / "fraser.md"
+    notes_path.write_text("---\nthis is malformed frontmatter\n",
+                          encoding="utf-8")
+    plan = _make_plan(
+        {"scope": None, "section_heading": "X", "body": "first"},
+    )
+    # Should not raise.
+    watcher._handle_note_proposals(
+        contact_id="fraser", plan=plan, now=1000,
+    )
+    # And the JSONL log records the failure.
+    log_files = list(watcher.config.daemon.log_dir.iterdir())
+    log_text = "\n".join(p.read_text() for p in log_files)
+    assert "note_write_failed" in log_text

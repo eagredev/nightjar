@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,10 +52,14 @@ class Contact:
     # the contact; the loader inverts it into inbox.allowed_contacts.
     # Empty tuple is a misconfigured contact (parser rejects it).
     inboxes: tuple[str, ...] = ()
-    # Step 7 forward-compat: when true, the daemon may append rapport
-    # notes proposed by triage without a separate per-note approval.
-    # Default false — every note proposal goes to the principal first.
-    auto_approve_notes: bool = False
+    # Step 7b: topical scopes the contact is allowed to discuss. Empty
+    # tuple = unrestricted (the historical default; preserves existing
+    # behaviour). Non-empty = triage classifies each inbound message
+    # into one of these scopes (or out_of_scope) and the out-of-scope
+    # default is a polite decline. Every named scope must exist in
+    # `Config.scopes` (the [scopes] registry); cross-validation
+    # happens in load() because the loader can't see the registry.
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ AUTH_MODES = ("hotp", "totp")
 DEFAULT_AUTH_MODE = "hotp"
 
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
+DEFAULT_SCOPE_CLASSIFIER_MODEL = "claude-haiku-4-5"
 DEFAULT_PER_HOUR_MAX_INVOCATIONS = 30
 DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS = 8000
 DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS = 10  # $0.10 soft cap
@@ -174,6 +180,13 @@ class ClaudeConfig:
     principal_per_message_cost_cents: int = DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS
     principal_hard_kill_multiplier: int = DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER
     principal_always_direct: bool = DEFAULT_PRINCIPAL_ALWAYS_DIRECT
+    # Step 7b: model used for the pass-1 scope classifier when a
+    # contact has non-empty scopes. Defaulted to Haiku regardless of
+    # what the main triage model is, because scope classification is
+    # a small structured task and Haiku is cheapest+fastest. Bump to
+    # a stronger model only if classification accuracy on real
+    # contacts proves a problem.
+    scope_classifier_model: str = DEFAULT_SCOPE_CLASSIFIER_MODEL
 
 
 @dataclass(frozen=True)
@@ -206,6 +219,13 @@ class Config:
     claude: ClaudeConfig | None = None
     address_index: dict[str, str] = field(default_factory=dict)
     """Maps lowercased email address to contact_id. Built at load time."""
+    scopes: dict[str, str] = field(default_factory=dict)
+    """Step 7b: topical scope registry. {scope_name: human_description}.
+    Empty = no scopes defined; contacts must have empty `scopes = []`
+    (any non-empty scope reference fails cross-validation). The
+    descriptions are fed into triage's prompt so the LLM has a
+    concrete anchor for what each tag means.
+    """
 
 
 def _parse_daily_limit(raw: str) -> int:
@@ -232,6 +252,23 @@ def _parse_bool(raw: str, *, field_name: str) -> bool:
 
 def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+# Scope names: lowercase ASCII, kebab-case, no leading digits. Tight
+# enough that the LLM can echo them back without tokenisation surprises.
+_SCOPE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def _validate_scope_name(name: str, *, source: str) -> None:
+    """Raise ConfigError if `name` doesn't fit the scope-name shape.
+    `source` names the location for the error message (e.g. 'scopes
+    registry' or contact filename)."""
+    if not _SCOPE_NAME_RE.match(name):
+        raise ConfigError(
+            f"{source}: scope name {name!r} is invalid; must match "
+            f"{_SCOPE_NAME_RE.pattern} (lowercase letters, digits, "
+            "underscore, hyphen; first char must be a letter)"
+        )
 
 
 def load(
@@ -439,6 +476,37 @@ def load(
                     f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
                 )
 
+    # Step 7b: [scopes] registry. Optional section; absence == no
+    # scopes defined, which means every contact must have empty scopes.
+    scopes: dict[str, str] = {}
+    if "scopes" in parser:
+        scopes_section = parser["scopes"]
+        for name, description in scopes_section.items():
+            _validate_scope_name(name, source="[scopes]")
+            description = description.strip()
+            if not description:
+                raise ConfigError(
+                    f"[scopes].{name} has empty description; every scope "
+                    "must have a one-line description (it's fed into the "
+                    "triage prompt)"
+                )
+            scopes[name] = description
+
+    # Cross-check: every scope referenced by any contact must exist in
+    # the registry. We deferred this from the contacts_loader because
+    # the loader can't see the [scopes] section.
+    for contact in contacts.values():
+        for scope in contact.scopes:
+            if scope not in scopes:
+                raise ConfigError(
+                    f"contact {contact.contact_id!r} lists scope "
+                    f"{scope!r} but it is not defined in the [scopes] "
+                    f"registry in {path}. Either add a "
+                    f"{scope} = <description> entry under [scopes], "
+                    f"or remove it from "
+                    f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
+                )
+
     security: SecurityConfig | None = None
     if "security" in parser:
         sec_section = parser["security"]
@@ -544,6 +612,13 @@ def load(
         default_model = claude_section.get("default_model", DEFAULT_CLAUDE_MODEL).strip()
         if not default_model:
             raise ConfigError("[claude].default_model must not be empty")
+        scope_classifier_model = claude_section.get(
+            "scope_classifier_model", DEFAULT_SCOPE_CLASSIFIER_MODEL,
+        ).strip()
+        if not scope_classifier_model:
+            raise ConfigError(
+                "[claude].scope_classifier_model must not be empty"
+            )
         try:
             per_hour = int(claude_section.get(
                 "per_hour_max_invocations", str(DEFAULT_PER_HOUR_MAX_INVOCATIONS)
@@ -591,6 +666,7 @@ def load(
             principal_per_message_cost_cents=cost_cents,
             principal_hard_kill_multiplier=kill_multiplier,
             principal_always_direct=always_direct,
+            scope_classifier_model=scope_classifier_model,
         )
 
     return Config(
@@ -601,4 +677,5 @@ def load(
         smtp=smtp,
         claude=claude,
         address_index=address_index,
+        scopes=scopes,
     )

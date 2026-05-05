@@ -55,7 +55,26 @@ TRIAGE_VERBS: dict[str, dict[str, Any]] = {
     "noop": {"tier": 1, "required_args": ()},
     "forward_to_principal": {"tier": 3, "required_args": ()},
     "flag_for_review": {"tier": 1, "required_args": ()},
+    # Step 7b: synthetic verb produced ONLY by the orchestrator's
+    # out-of-scope path (classify-as-out_of_scope or classifier
+    # failure). NOT in the model's tool enum (see _MODEL_VERBS
+    # below) — triage cannot pick this. Tier 3 because the result
+    # composes a reply body and sends it, which still routes
+    # through the principal's normal approval flow.
+    "out_of_scope_decline": {"tier": 3, "required_args": ("body",)},
 }
+
+# Subset of TRIAGE_VERBS that the model is allowed to emit. Synthetic
+# verbs (currently just out_of_scope_decline) are excluded from the
+# enum so the model has no path to produce them. The executor still
+# accepts them via TRIAGE_VERBS for the orchestrator's synthetic
+# plans.
+_MODEL_VERBS = (
+    "reply",
+    "noop",
+    "forward_to_principal",
+    "flag_for_review",
+)
 
 # Risk flags the prompt may emit. Unknown flags are dropped silently
 # (forward-compatible: a future prompt revision that adds a flag won't
@@ -122,6 +141,30 @@ class MessageStructure:
 
 
 @dataclass(frozen=True)
+class NoteProposal:
+    """One proposed addition to a contact's rapport-notes file.
+
+    Triage emits these in the `note_proposals` array on its plan when
+    it judges something worth recording about the contact. The watcher
+    applies them directly to the contact's notes file via
+    notes_store.append_note() — no approval queue, no per-contact
+    auto-approve flag. The principal reviews via `show notes` and
+    deletes via `forget`. See project-nightjar-step-8.md for the
+    memory architecture rationale (rapport notes are working memory,
+    not a privileged-action surface).
+
+    `scope` is None when the proposal is unscoped (visible everywhere)
+    or one of the contact's allowed scopes. When the contact has
+    no scopes, scope MUST be None — proposing a scope on an
+    unrestricted contact would create a tag that nothing can filter
+    against.
+    """
+    scope: str | None
+    section_heading: str
+    body: str
+
+
+@dataclass(frozen=True)
 class TriagePlan:
     """A validated plan ready for the approval-queue path.
 
@@ -138,6 +181,12 @@ class TriagePlan:
     notes: str
     raw_input_tokens: int
     raw_output_tokens: int
+    # Step 7d: zero or more proposed additions to the contact's
+    # rapport-notes file. Default empty tuple — many plans propose no
+    # notes (routine messages, attempts that failed, low-content
+    # interactions). The watcher iterates these and enqueues each one
+    # into note_proposals after the plan transitions to TRIAGED.
+    note_proposals: tuple[NoteProposal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -264,7 +313,7 @@ DRAFT_PLAN_TOOL: dict[str, Any] = {
             },
             "verb": {
                 "type": "string",
-                "enum": list(TRIAGE_VERBS.keys()),
+                "enum": list(_MODEL_VERBS),
                 "description": (
                     "The action proposed if the principal approves. Pick "
                     "the lowest-risk verb that fits."
@@ -286,6 +335,49 @@ DRAFT_PLAN_TOOL: dict[str, Any] = {
             "notes": {
                 "type": "string",
                 "description": "Optional extra context for the principal, <= 400 chars.",
+            },
+            "note_proposals": {
+                "type": "array",
+                "description": (
+                    "Optional. Zero or more proposed additions to "
+                    "the contact's rapport-notes file. Propose only "
+                    "concrete observations worth remembering "
+                    "long-term — never propose for routine messages "
+                    "or just to fill the field. Default to empty."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Scope tag for the proposal. Use one of "
+                                "the contact's allowed scopes when the "
+                                "contact has scopes; null when "
+                                "unscoped, or for a wildcard-style "
+                                "observation visible everywhere."
+                            ),
+                        },
+                        "section_heading": {
+                            "type": "string",
+                            "description": (
+                                "Section heading the bullet belongs "
+                                "under (an existing heading or a new "
+                                "one). Short topic label."
+                            ),
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "The bullet text. Concise prose, one "
+                                "observation, no leading hyphen — "
+                                "the daemon adds bullet formatting."
+                            ),
+                        },
+                    },
+                    "required": ["scope", "section_heading", "body"],
+                    "additionalProperties": False,
+                },
             },
         },
         "required": ["summary", "verb", "args", "reasoning", "risk_flags"],
@@ -310,6 +402,7 @@ def _strip_block_delimiters(text: str) -> str:
         "</subject>",
         "</message_structure>",
         "</body>",
+        "</notes>",
     ):
         text = text.replace(tag, "[stripped: closing-tag]")
     return text
@@ -344,19 +437,30 @@ def build_user_message(
     subject: str,
     body: str,
     structure: MessageStructure,
+    notes: str = "",
 ) -> str:
-    """Format the five-block delimited input the prompt expects.
+    """Format the delimited input the prompt expects.
+
+    Six blocks total: contact_metadata, sender, subject,
+    message_structure, notes, body. The notes block is Step 7b and
+    carries scope-filtered rapport notes when the daemon has any to
+    inject. Empty `notes` produces an empty `<notes>` block; the
+    prompt instructs the LLM to treat that as "no recorded context."
 
     Untrusted fields (sender, subject, body) get a strip pass so an
     attacker cannot inject a fake `</body>` to escape the block.
     contact_metadata is trusted (config-sourced) and not stripped.
     The `<message_structure>` block is daemon-derived facts about the
     raw MIME structure. Filenames inside it are also stripped because
-    a contact controls what they're called.
+    a contact controls what they're called. Notes are operator-
+    authored (or daemon-proposed-then-operator-approved) and treated
+    as trusted, but we still strip the close-tag because a corrupted
+    notes file could still confuse the parser.
     """
     safe_sender = _strip_block_delimiters(sender)
     safe_subject = _strip_block_delimiters(subject)
     safe_body = _strip_block_delimiters(body)
+    safe_notes = _strip_block_delimiters(notes)
     daily_limit_repr = "unlimited" if contact.daily_limit == -1 else str(contact.daily_limit)
     return (
         "<contact_metadata>\n"
@@ -384,6 +488,10 @@ def build_user_message(
         f"body_truncated_in_prompt: {str(structure.body_truncated_in_prompt).lower()}\n"
         "</message_structure>\n"
         "\n"
+        "<notes>\n"
+        f"{safe_notes}\n"
+        "</notes>\n"
+        "\n"
         "<body>\n"
         f"{safe_body}\n"
         "</body>\n"
@@ -396,8 +504,22 @@ def build_user_message(
 _MAX_NOTES_LEN = 400
 _MAX_REPLY_BODY_LEN = 2000
 
+# Step 7d: caps on note_proposals fields. Heading is a section title
+# so it should be short. Body is one bullet — concise prose, not a
+# paragraph. The cap also bounds the cost of a runaway model that
+# tries to dump message body into a proposal body.
+_MAX_NOTE_HEADING_LEN = 80
+_MAX_NOTE_BODY_LEN = 280
+# Cap on how many proposals per plan. The model should propose
+# sparingly; many proposals for one email is a smell.
+_MAX_NOTE_PROPOSALS_PER_PLAN = 5
 
-def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
+
+def validate_plan_payload(
+    payload: dict[str, Any],
+    *,
+    contact: Contact | None = None,
+) -> TriagePlan | TriageError:
     """Turn the raw `draft_plan` tool input into a typed TriagePlan, or
     a TriageError if any rule is broken.
 
@@ -409,6 +531,13 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         future TRIAGE_VERBS edit slips a tier-4 verb in, the cap blocks).
       - reply.args.body is non-empty and length-capped.
       - notes <= MAX_NOTES_LEN.
+      - note_proposals: array if present; each item has scope (str or
+        null) + section_heading + body, length-capped, count-capped.
+        When `contact` is provided, scopes are checked against
+        contact.scopes (None always allowed; non-None must be in
+        contact.scopes). Bad proposals are dropped silently from the
+        plan rather than failing the whole plan — losing one note is
+        recoverable; losing the reply isn't.
       - All required string fields are strings; risk_flags is a list.
 
     Raw-input fields are NOT enforced here for length (sender, subject,
@@ -486,6 +615,44 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         if isinstance(f, str) and f in KNOWN_RISK_FLAGS
     )
 
+    # Step 7d: validate note_proposals leniently. Bad proposals are
+    # dropped from the returned plan; we don't fail the whole plan
+    # because the reply is the main payload. Caps apply per-item
+    # and across-the-list.
+    raw_proposals = payload.get("note_proposals", [])
+    note_proposals: list[NoteProposal] = []
+    if isinstance(raw_proposals, list):
+        for raw in raw_proposals[:_MAX_NOTE_PROPOSALS_PER_PLAN]:
+            if not isinstance(raw, dict):
+                continue
+            scope = raw.get("scope")
+            if scope is not None and not isinstance(scope, str):
+                continue
+            heading = raw.get("section_heading")
+            body_text = raw.get("body")
+            if not isinstance(heading, str) or not heading.strip():
+                continue
+            if not isinstance(body_text, str) or not body_text.strip():
+                continue
+            heading_clean = heading.strip()[:_MAX_NOTE_HEADING_LEN]
+            body_clean = body_text.strip()[:_MAX_NOTE_BODY_LEN]
+            # Scope must match contact.scopes when contact provided.
+            # None is always accepted (unscoped/wildcard intent).
+            if contact is not None and scope is not None:
+                if not contact.scopes:
+                    # Contact is unrestricted; a scoped proposal is a
+                    # model error — drop it.
+                    continue
+                if scope not in contact.scopes:
+                    # Model picked a scope outside the allowed set —
+                    # drop, don't fail the plan.
+                    continue
+            note_proposals.append(NoteProposal(
+                scope=scope,
+                section_heading=heading_clean,
+                body=body_clean,
+            ))
+
     return TriagePlan(
         verb=verb,
         tier=tier,
@@ -496,6 +663,7 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         notes=notes,
         raw_input_tokens=0,   # filled in by caller from ClaudeResponse
         raw_output_tokens=0,
+        note_proposals=tuple(note_proposals),
     )
 
 
@@ -564,7 +732,7 @@ async def triage_contact_mail(
             detail=str(tool_use.get("name")),
         )
 
-    result = validate_plan_payload(tool_use.get("input", {}))
+    result = validate_plan_payload(tool_use.get("input", {}), contact=contact)
     if isinstance(result, TriageError):
         return result
 
@@ -579,4 +747,333 @@ async def triage_contact_mail(
         notes=result.notes,
         raw_input_tokens=response.input_tokens,
         raw_output_tokens=response.output_tokens,
+        note_proposals=result.note_proposals,
+    )
+
+
+# ---- Step 7b orchestrator --------------------------------------------------
+
+
+def _build_decline_body(
+    *,
+    contact: Contact,
+    scopes_registry: dict[str, str],
+    reason_was_classifier_failure: bool,
+) -> str:
+    """Compose the polite decline body for an out-of-scope conversation.
+
+    Templated, not LLM-generated, on purpose — the decline path runs
+    on classifier failures too, and we don't want the daemon producing
+    LLM-authored prose under those conditions. The body cites the
+    contact's allowed scopes (using their human descriptions from the
+    registry) so the contact knows what they can come back with.
+    """
+    if contact.scopes:
+        topic_lines = []
+        for scope_name in contact.scopes:
+            description = scopes_registry.get(scope_name, scope_name)
+            topic_lines.append(f"  - {description}")
+        topics = "\n".join(topic_lines)
+        topic_block = (
+            "I'm only set up to discuss the following topics on this channel:\n"
+            f"\n{topics}\n"
+        )
+    else:
+        # Defensive: orchestrator should never call this for unscoped
+        # contacts, but if it does, fall back to a generic decline.
+        topic_block = "This message falls outside what I can discuss right now."
+
+    if reason_was_classifier_failure:
+        # We don't want to expose internal failure modes to the contact;
+        # the body shape is identical to the genuine out-of-scope case
+        # so an attacker watching the daemon's behaviour can't infer
+        # whether the classifier succeeded or fell over.
+        pass
+
+    greeting = f"Hi {contact.display_name or contact.contact_id},"
+    return (
+        f"{greeting}\n"
+        "\n"
+        "Thanks for getting in touch. "
+        f"{topic_block}"
+        "\n"
+        "If you'd like to chat about something else, please reach me on "
+        "a different channel and I'll get back to you when I can.\n"
+    )
+
+
+def _synth_out_of_scope_plan(
+    *,
+    contact: Contact,
+    scopes_registry: dict[str, str],
+    reason: str,
+    detail: str,
+    classifier_input_tokens: int,
+    classifier_output_tokens: int,
+) -> TriagePlan:
+    """Construct the synthetic plan for an out-of-scope outcome.
+
+    No LLM call goes into this; the body is templated and the metadata
+    is built from the classifier's reason. Tokens are carried through
+    so the cost backstop sees the classifier's spend.
+    """
+    body = _build_decline_body(
+        contact=contact,
+        scopes_registry=scopes_registry,
+        reason_was_classifier_failure=(reason != "out_of_scope"),
+    )
+    if reason == "out_of_scope":
+        summary = (
+            "Message classified out of scope for this contact. "
+            "Daemon proposes a polite decline."
+        )
+        reasoning = (
+            "The pass-1 scope classifier judged the message's primary "
+            "intent did not fit any of this contact's allowed scopes. "
+            "The decline reply is templated, not LLM-generated."
+        )
+    else:
+        summary = (
+            "Scope classifier did not produce a result; defaulting to "
+            "out-of-scope decline (fail closed)."
+        )
+        reasoning = (
+            f"Classifier returned an error ({reason}). Per the daemon's "
+            "fail-closed posture, the message is treated as out of "
+            "scope and a templated decline is offered for principal "
+            "approval."
+        )
+    return TriagePlan(
+        verb="out_of_scope_decline",
+        tier=TRIAGE_VERBS["out_of_scope_decline"]["tier"],
+        args={"body": body},
+        summary=summary,
+        reasoning=reasoning,
+        risk_flags=("off_topic",),
+        notes=(detail or "")[:_MAX_NOTES_LEN],
+        raw_input_tokens=classifier_input_tokens,
+        raw_output_tokens=classifier_output_tokens,
+    )
+
+
+async def triage_with_scope(
+    *,
+    contact: Contact,
+    sender: str,
+    subject: str,
+    body: str,
+    structure: MessageStructure,
+    config: ClaudeConfig,
+    client: ClaudeClient,
+    prompts_dir: Path,
+    notes_dir: Path,
+    scopes_registry: dict[str, str],
+) -> TriagePlan | TriageError:
+    """Step 7b orchestrator. Two-pass triage when the contact has scopes.
+
+    Sequencing:
+      - Empty contact.scopes: skip classification entirely. Read full
+        notes (active_scope=None) for the prompt and run triage as
+        before. Behaviour matches pre-Step-7b for unscoped contacts.
+      - Non-empty contact.scopes: build safe-only notes for pass 1,
+        run scope_classifier. On in-scope result, read scope-filtered
+        notes and run triage. On out-of-scope result OR any classifier
+        error, return a synthetic out_of_scope_decline plan without
+        calling triage proper (fail closed).
+
+    Cost: pass-1 classifier tokens always counted; pass-2 triage
+    tokens added when the in-scope path is taken. Caller's cost
+    backstop should evaluate against the combined sum on the returned
+    plan's `raw_input_tokens` + `raw_output_tokens` fields.
+
+    The notes module is imported lazily so callers that don't go
+    through this function (the existing `triage_contact_mail` direct
+    path) don't pay the import cost. Same reason scope_classifier is
+    a local import.
+    """
+    from . import notes_store
+    from . import scope_classifier as sc_module
+
+    notes_path = notes_dir / f"{contact.contact_id}.md"
+
+    # Empty scopes path: skip classification, read full notes, pass
+    # through to triage_contact_mail. Existing behaviour preserved.
+    if not contact.scopes:
+        try:
+            full_notes = notes_store.read_notes(notes_path, active_scope=None)
+        except notes_store.NotesParseError:
+            # Malformed notes file: fail closed on the notes block
+            # (pass empty notes through) rather than failing the whole
+            # triage. The principal sees the contact's reply with no
+            # notes context, the daemon's error log surfaces the
+            # parse failure for them to fix.
+            full_notes = ""
+        return await _triage_with_notes(
+            contact=contact,
+            sender=sender,
+            subject=subject,
+            body=body,
+            structure=structure,
+            notes=full_notes,
+            config=config,
+            client=client,
+            prompts_dir=prompts_dir,
+        )
+
+    # Scoped path: pass 1 classifier with safe-only notes.
+    try:
+        safe_notes = notes_store.read_safe_notes(notes_path)
+    except notes_store.NotesParseError:
+        # Same fail-closed reasoning as above: empty notes, classifier
+        # still runs (it has the metadata + message body to work on).
+        safe_notes = ""
+
+    classification = await sc_module.classify_scope(
+        contact=contact,
+        sender=sender,
+        subject=subject,
+        body=body,
+        scopes_registry=scopes_registry,
+        safe_notes=safe_notes,
+        config=config,
+        client=client,
+    )
+
+    if isinstance(classification, sc_module.ClassifierError):
+        # Fail closed: synthetic decline plan, classifier tokens
+        # carried through.
+        return _synth_out_of_scope_plan(
+            contact=contact,
+            scopes_registry=scopes_registry,
+            reason=classification.reason,
+            detail=classification.detail,
+            classifier_input_tokens=classification.raw_input_tokens,
+            classifier_output_tokens=classification.raw_output_tokens,
+        )
+
+    if classification.scope == sc_module.OUT_OF_SCOPE:
+        return _synth_out_of_scope_plan(
+            contact=contact,
+            scopes_registry=scopes_registry,
+            reason="out_of_scope",
+            detail="",
+            classifier_input_tokens=classification.raw_input_tokens,
+            classifier_output_tokens=classification.raw_output_tokens,
+        )
+
+    # In-scope: pass 2 with scope-filtered notes.
+    try:
+        scoped_notes = notes_store.read_notes(
+            notes_path, active_scope=classification.scope,
+        )
+    except notes_store.NotesParseError:
+        scoped_notes = ""
+
+    plan_or_error = await _triage_with_notes(
+        contact=contact,
+        sender=sender,
+        subject=subject,
+        body=body,
+        structure=structure,
+        notes=scoped_notes,
+        config=config,
+        client=client,
+        prompts_dir=prompts_dir,
+    )
+
+    if isinstance(plan_or_error, TriageError):
+        return plan_or_error
+
+    # Sum classifier + triage token usage so the cost backstop sees the
+    # combined budget for this message.
+    return TriagePlan(
+        verb=plan_or_error.verb,
+        tier=plan_or_error.tier,
+        args=plan_or_error.args,
+        summary=plan_or_error.summary,
+        reasoning=plan_or_error.reasoning,
+        risk_flags=plan_or_error.risk_flags,
+        notes=plan_or_error.notes,
+        raw_input_tokens=(
+            plan_or_error.raw_input_tokens
+            + classification.raw_input_tokens
+        ),
+        raw_output_tokens=(
+            plan_or_error.raw_output_tokens
+            + classification.raw_output_tokens
+        ),
+        note_proposals=plan_or_error.note_proposals,
+    )
+
+
+async def _triage_with_notes(
+    *,
+    contact: Contact,
+    sender: str,
+    subject: str,
+    body: str,
+    structure: MessageStructure,
+    notes: str,
+    config: ClaudeConfig,
+    client: ClaudeClient,
+    prompts_dir: Path,
+) -> TriagePlan | TriageError:
+    """Inner shape of triage that takes pre-rendered notes.
+
+    Mirrors triage_contact_mail but with the notes string injected into
+    the user message. Kept private; the public entry points are
+    `triage_contact_mail` (no notes — preserves the pre-Step-7b call
+    surface) and `triage_with_scope` (orchestrates pass 1 + 2).
+    """
+    system = build_system_prompt(prompts_dir)
+    user = build_user_message(
+        contact=contact, sender=sender, subject=subject, body=body,
+        structure=structure, notes=notes,
+    )
+
+    try:
+        response = await client.call(
+            model=config.default_model,
+            system=system,
+            user=user,
+            tools=[DRAFT_PLAN_TOOL],
+            max_tokens=config.per_invocation_max_input_tokens,
+        )
+    except Exception as e:
+        return TriageError(reason="sdk_error", detail=str(e))
+
+    if not response.tool_uses:
+        return TriageError(
+            reason="no_tool_call",
+            detail=f"stop_reason={response.stop_reason!r}, "
+                   f"text_blocks={len(response.text_blocks)}",
+        )
+    if len(response.tool_uses) > 1:
+        return TriageError(
+            reason="multiple_tool_calls",
+            detail=f"got {len(response.tool_uses)}",
+        )
+
+    tool_use = response.tool_uses[0]
+    if tool_use.get("name") != "draft_plan":
+        return TriageError(
+            reason="unexpected_tool",
+            detail=str(tool_use.get("name")),
+        )
+
+    result = validate_plan_payload(tool_use.get("input", {}), contact=contact)
+    if isinstance(result, TriageError):
+        return result
+
+    return TriagePlan(
+        verb=result.verb,
+        tier=result.tier,
+        args=result.args,
+        summary=result.summary,
+        reasoning=result.reasoning,
+        risk_flags=result.risk_flags,
+        notes=result.notes,
+        raw_input_tokens=response.input_tokens,
+        raw_output_tokens=response.output_tokens,
+        note_proposals=result.note_proposals,
     )

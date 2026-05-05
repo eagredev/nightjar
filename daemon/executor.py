@@ -334,7 +334,7 @@ def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path
             "The new contact is live: a new TOML file has been written\n"
             "and the daemon's in-memory config updated. No restart needed.\n"
             f"Edit {contact_path} to tweak display_name, relationship,\n"
-            "daily_limit, or auto_approve_notes.\n"
+            "daily_limit, scopes, or inboxes.\n"
         ),
     )
 
@@ -661,4 +661,11 @@ _DISPATCH: dict[str, Callable] = {
     "remove": _exec_remove,
     "reply": _exec_reply,
     "forward_to_principal": _exec_forward,
+    # Step 7b: the synthetic out-of-scope decline. Executes via the
+    # same path as `reply` because the post-approval action is
+    # identical (send a body to the contact, audit-copy the principal).
+    # The verb name is preserved through the audit trail so the
+    # principal can distinguish a routine reply from a scope-driven
+    # decline in the outbound_log.
+    "out_of_scope_decline": _exec_reply,
 }

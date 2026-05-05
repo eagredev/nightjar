@@ -35,6 +35,7 @@ from . import (
     cost_guard,
     dmarc,
     executor,
+    notes_store,
     notifier,
     principal_commands,
     principal_handlers,
@@ -2084,9 +2085,15 @@ class InboxWatcher:
             return
         body_text, body_truncated, structure, raw_rfc822 = body_result
 
-        # 4. The triage call itself.
+        # 4. The triage call itself. Step 7b: routes through
+        # triage_with_scope, which handles the empty-scopes pass-through
+        # (behaves like the old triage_contact_mail) AND the two-pass
+        # scoped path. The orchestrator owns: classifier-then-triage,
+        # scope-filtered notes injection, fail-closed out-of-scope
+        # decline. Existing contacts (with scopes=[]) take the old
+        # path unchanged; opted-in contacts get scope gating.
         contact = self.config.contacts[contact_id]
-        plan_or_err = await triage.triage_contact_mail(
+        plan_or_err = await triage.triage_with_scope(
             contact=contact,
             sender=from_addr,
             subject=subject or "",
@@ -2095,6 +2102,8 @@ class InboxWatcher:
             config=claude_cfg,
             client=self._claude_client,
             prompts_dir=PROMPTS_DIR,
+            notes_dir=self.config.daemon.notes_dir,
+            scopes_registry=self.config.scopes,
         )
 
         # 5. Ledger row regardless of outcome (audit trail, rate counter).
@@ -2165,6 +2174,18 @@ class InboxWatcher:
             detail=f"verb={plan.verb}",
         )
 
+        # Step 7d: enqueue any note proposals triage emitted. Pending
+        # proposals show up in the next status report and via the
+        # notes-pending verb; auto-applied proposals are written to the
+        # contact's .md file immediately. Done before the verb branches
+        # so EVERY triage outcome (including noop/flag) can carry note
+        # proposals back — a routine "no action needed" message can
+        # still be worth noting (e.g. the contact mentioned a milestone
+        # in passing while saying "no reply needed").
+        self._handle_note_proposals(
+            contact_id=contact_id, plan=plan, now=now,
+        )
+
         # noop / flag don't queue an executor verb. They still need a
         # human-visible ping so the principal sees the triage output.
         if plan.verb in ("noop", "flag_for_review"):
@@ -2181,7 +2202,14 @@ class InboxWatcher:
         # tier-3 _exec_reply needs (contact_id, body, subject,
         # in_reply_to). Subject is built from the inbound subject so
         # the reply threads correctly.
-        if plan.verb == "reply":
+        #
+        # Step 7b: `out_of_scope_decline` is structurally identical to
+        # `reply` — the orchestrator constructs a templated decline
+        # body and the dispatch routes through the same executor. The
+        # verb name is preserved through the approval, audit log, and
+        # outbound_log so the principal can distinguish a routine
+        # reply from a scope-driven decline at any point.
+        if plan.verb in ("reply", "out_of_scope_decline"):
             reply_subject = self._build_reply_subject(subject)
             args = {
                 "contact_id": contact_id,
@@ -2193,7 +2221,7 @@ class InboxWatcher:
                 message_id=message_id, contact_id=contact_id,
                 from_addr=from_addr, from_header=from_header,
                 subject=subject, date_header=date_header,
-                plan=plan, verb="reply",
+                plan=plan, verb=plan.verb,
                 args=args, body_text=body_text,
                 body_truncated=body_truncated,
             )
@@ -2235,6 +2263,65 @@ class InboxWatcher:
             inbox=self.inbox.name, message_id=message_id,
             verb=plan.verb,
         )
+
+    def _handle_note_proposals(
+        self,
+        *,
+        contact_id: str,
+        plan: TriagePlan,
+        now: int,
+    ) -> None:
+        """Apply the plan's note_proposals directly to the contact's
+        notes file.
+
+        Writes are autonomous — no approval queue, no per-contact
+        auto-approve flag. The notes are the agent's working memory,
+        not a privileged-action surface; gating each write would
+        kneecap the value. The principal reviews accumulated notes
+        via `show notes` and removes anything they don't like via
+        `forget`. The contact can request deletion at any time.
+
+        See project-nightjar-step-8.md for the full memory architecture
+        rationale; this is ring 1 (per-contact memory) under the
+        broader content-firewall framing.
+
+        On write error, log warn but continue. Losing one note is
+        recoverable; failing the whole triage path because of a notes
+        write isn't. The JSONL log carries full provenance for any
+        principal who wants to grep history.
+        """
+        if not plan.note_proposals:
+            return
+
+        notes_path = self.config.daemon.notes_dir / f"{contact_id}.md"
+        for proposal in plan.note_proposals:
+            try:
+                notes_store.append_note(
+                    notes_path,
+                    contact_id=contact_id,
+                    section_heading=proposal.section_heading,
+                    body=proposal.body,
+                    scope=proposal.scope,
+                )
+            except (OSError, notes_store.NotesParseError) as e:
+                self.logger.event(
+                    "note_write_failed",
+                    level="warn",
+                    inbox=self.inbox.name,
+                    contact_id=contact_id,
+                    scope=proposal.scope,
+                    section_heading=proposal.section_heading,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                continue
+            self.logger.event(
+                "note_written",
+                inbox=self.inbox.name,
+                contact_id=contact_id,
+                scope=proposal.scope,
+                section_heading=proposal.section_heading,
+                body_preview=proposal.body[:100],
+            )
 
     def _send_triage_summary_to_principal(
         self,

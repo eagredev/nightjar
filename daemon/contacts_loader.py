@@ -26,8 +26,8 @@ TOML schema (one file per contact):
     relationship        = "Composer for the project"
     daily_limit         = 3                  # int >= 0, or "unlimited"
     is_principal        = false              # default false
-    auto_approve_notes  = false              # default false (Step 7)
     inboxes             = ["nightjar"]       # which inboxes accept this contact
+    scopes              = []                 # default empty (= unrestricted)
 
 Cross-file invariants (validated at load time):
 
@@ -56,6 +56,11 @@ from .config import Contact, ConfigError
 # contact_id format. Same regex used by config_writer.py for the legacy
 # INI section name validation; keep them aligned.
 _CONTACT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Scope name format. Mirror of the registry-side regex in config.py;
+# kept duplicated to avoid importing config from the loader (load order
+# is loader-then-config; the cross-validation happens in config.load).
+_SCOPE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -187,9 +192,14 @@ def _load_one(path: Path) -> Contact:
     relationship = _optional_str(data, "relationship", "", path)
     daily_limit = _parse_daily_limit(data.get("daily_limit", 3), path)
     is_principal = _parse_bool(data.get("is_principal", False), "is_principal", path)
-    auto_approve_notes = _parse_bool(
-        data.get("auto_approve_notes", False), "auto_approve_notes", path
-    )
+    # Step 7d (per Step 8 memory architecture): the daemon now writes
+    # rapport notes autonomously without per-note approval, so the
+    # legacy `auto_approve_notes` field is ignored. Existing contact
+    # files may still have it set; we read silently to keep
+    # forward-compat with files written by the pre-Step-8 contact
+    # writer / migrator. Operators removing the line is purely
+    # cosmetic — daemon behaviour is unchanged.
+    _ = data.get("auto_approve_notes", None)
 
     inboxes_raw = data.get("inboxes")
     if inboxes_raw is None:
@@ -206,6 +216,32 @@ def _load_one(path: Path) -> Contact:
         raise ConfigError(f"{path}: inboxes list is empty")
     inboxes = tuple(s.strip() for s in inboxes_raw if s.strip())
 
+    # Step 7b: scopes list. Default empty (= unrestricted). The names
+    # are syntactically validated here; cross-validation against the
+    # [scopes] registry happens in config.load().
+    scopes_raw = data.get("scopes", [])
+    if not isinstance(scopes_raw, list) or not all(
+        isinstance(s, str) for s in scopes_raw
+    ):
+        raise ConfigError(f"{path}: scopes must be a list of strings")
+    scopes: list[str] = []
+    seen_scopes: set[str] = set()
+    for raw_scope in scopes_raw:
+        scope = raw_scope.strip()
+        if not scope:
+            continue
+        if not _SCOPE_NAME_RE.match(scope):
+            raise ConfigError(
+                f"{path}: scope name {scope!r} is invalid; must match "
+                f"{_SCOPE_NAME_RE.pattern}"
+            )
+        if scope in seen_scopes:
+            raise ConfigError(
+                f"{path}: duplicate scope {scope!r}"
+            )
+        seen_scopes.add(scope)
+        scopes.append(scope)
+
     return Contact(
         contact_id=contact_id,
         addresses=tuple(addresses),
@@ -214,7 +250,7 @@ def _load_one(path: Path) -> Contact:
         daily_limit=daily_limit,
         is_principal=is_principal,
         inboxes=inboxes,
-        auto_approve_notes=auto_approve_notes,
+        scopes=tuple(scopes),
     )
 
 

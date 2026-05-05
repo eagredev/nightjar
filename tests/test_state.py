@@ -644,8 +644,10 @@ def test_set_last_catchup_at_rejects_negative(tmp_path: Path) -> None:
         s.set_last_catchup_at("nightjar", -1)
 
 
+
+
 def test_schema_version_is_10(tmp_path: Path) -> None:
-    """Step 6e bumped schema to V10."""
+    """Schema version pin. Bumps require a migration plan."""
     import sqlite3
     s = make_state(tmp_path)
     conn = sqlite3.connect(s.db_path)
