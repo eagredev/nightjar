@@ -432,8 +432,18 @@ class InboxWatcher:
             and contact_id is not None
             and self.config.contacts[contact_id].is_principal
         ):
+            # Body is needed for approval-reply verdict extraction
+            # (`yes` / `no` / `YES IRREVERSIBLE` lives in the reply
+            # body, not the subject). For tier-1 verbs and free-form
+            # requests the body is unused but the extra IMAP round-trip
+            # is cheap. None on fetch failure is fine: the parser
+            # tolerates an absent body and routes to UNCLEAR for
+            # approval replies, which prompts the principal to retry.
+            body_result = await self._fetch_body_text(client, uid)
+            body_text = body_result[0] if body_result is not None else None
             self._dispatch_principal_command(
-                message_id=message_id, subject=subject, from_addr=from_addr
+                message_id=message_id, subject=subject,
+                body=body_text, from_addr=from_addr,
             )
 
         # Step 5b: triage for non-principal contact mail. Only runs when
@@ -584,7 +594,12 @@ class InboxWatcher:
         self._stop_event.set()
 
     def _dispatch_principal_command(
-        self, *, message_id: str, subject: str | None, from_addr: str
+        self,
+        *,
+        message_id: str,
+        subject: str | None,
+        body: str | None,
+        from_addr: str,
     ) -> None:
         """Parse and handle one authenticated principal email.
 
@@ -613,7 +628,7 @@ class InboxWatcher:
         recorded; the operator just doesn't get a reply. That's a
         better failure mode than crashing the watcher.
         """
-        cmd = principal_commands.parse_principal_command(subject)
+        cmd = principal_commands.parse_principal_command(subject, body)
 
         if cmd.approval_token is not None:
             self._resolve_approval_reply(
@@ -717,7 +732,7 @@ class InboxWatcher:
         )
         tier_note = (
             "This is a tier-4 verb (irreversible local writes). The reply\n"
-            "must be the literal phrase YES IRREVERSIBLE in uppercase.\n"
+            "body must be the literal phrase YES IRREVERSIBLE in uppercase.\n"
             if command.tier >= 4
             else "This is a tier-2 verb (reversible local writes). A plain\n"
                  "'yes' (or 'approve' / 'go') is enough.\n"
@@ -725,19 +740,22 @@ class InboxWatcher:
         self._send_deterministic_reply(
             message_id=message_id,
             from_addr=from_addr,
-            subject=f"[Nightjar #{token}] approval needed: {command.verb}",
+            subject=f"[Nightjar #{token}]",
             body=(
+                f"Approval needed: {command.verb}\n"
+                "\n"
                 f"Verb:   {command.verb}\n"
                 f"Args:   {dict(command.args)}\n"
                 f"Tier:   {command.tier}\n"
                 "\n"
                 f"{tier_note}"
                 "\n"
-                "To approve, reply with:\n"
-                f"  Subject: [<code>] [Nightjar #{token}] {confirm_phrase}\n"
+                "To approve, hit reply, paste your code at the end of the\n"
+                "auto-filled subject, and put your verdict in the body:\n"
+                f"  Subject: Re: [Nightjar #{token}] <code>\n"
+                f"  Body:    {confirm_phrase}\n"
                 "\n"
-                "To deny, reply with:\n"
-                f"  Subject: [<code>] [Nightjar #{token}] no\n"
+                "To deny, same subject, body 'no'.\n"
                 "\n"
                 "Approval expires in 7 days; offline time is not deducted\n"
                 "automatically (see DESIGN.md).\n"
@@ -874,12 +892,14 @@ class InboxWatcher:
                 subject=f"[Nightjar #{token}] tier-4 needs YES IRREVERSIBLE",
                 body=(
                     f"'{verb}' is a tier-4 verb. A plain 'yes' is not enough.\n"
-                    "Reply with the literal phrase:\n"
+                    "Reply with:\n"
                     "\n"
-                    f"  Subject: [<code>] [Nightjar #{token}] YES IRREVERSIBLE\n"
+                    f"  Subject: Re: [Nightjar #{token}] <code>\n"
+                    f"  Body:    YES IRREVERSIBLE\n"
                     "\n"
-                    "in uppercase, as the entire post-token text. The\n"
-                    "approval is still pending until you do.\n"
+                    "The body must be the literal phrase YES IRREVERSIBLE in\n"
+                    "uppercase, as a standalone first line. The approval is\n"
+                    "still pending until you do.\n"
                 ),
                 next_state="APPROVAL_REPLY_NOTED",
                 event_name="principal_approval_insufficient",
@@ -901,11 +921,11 @@ class InboxWatcher:
                 subject=f"[Nightjar #{token}] verdict unclear",
                 body=(
                     "I couldn't parse your reply as a verdict. Reply with:\n"
-                    f"  Subject: [<code>] [Nightjar #{token}] yes\n"
-                    "       or: [<code>] [Nightjar #{token}] no\n"
+                    f"  Subject: Re: [Nightjar #{token}] <code>\n"
+                    "  Body:    yes      (or 'no' to deny)\n"
                     + (
-                        f"\n  Tier-4 verbs ({verb} is tier 4) require\n"
-                        f"  [<code>] [Nightjar #{token}] YES IRREVERSIBLE\n"
+                        f"\n  Tier-4 verbs ({verb} is tier 4) require body\n"
+                        "  YES IRREVERSIBLE in uppercase.\n"
                         if tier >= 4 else ""
                     )
                 ),
@@ -1487,6 +1507,8 @@ class InboxWatcher:
             )
 
         approval_body = (
+            f"Approval needed: {verb} (triage)\n"
+            f"\n"
             f"Triage of inbound mail from {contact_id} ({from_addr}).\n"
             f"\n"
             f"Verb proposed:  {verb} (tier {plan.tier})\n"
@@ -1498,11 +1520,12 @@ class InboxWatcher:
             f"\n"
             f"{action_block}"
             f"\n"
-            f"To approve, reply with:\n"
-            f"  Subject: [<code>] [Nightjar #{token}] {confirm_phrase}\n"
+            f"To approve, hit reply, paste your code at the end of the\n"
+            f"auto-filled subject, and put your verdict in the body:\n"
+            f"  Subject: Re: [Nightjar #{token}] <code>\n"
+            f"  Body:    {confirm_phrase}\n"
             f"\n"
-            f"To deny, reply with:\n"
-            f"  Subject: [<code>] [Nightjar #{token}] no\n"
+            f"To deny, same subject, body 'no'.\n"
             f"\n"
             f"Approval expires in 7 days.\n"
             + self._format_original_email_block(
@@ -1514,7 +1537,7 @@ class InboxWatcher:
         send = notifier.notify_principal(
             smtp=self.config.smtp,
             principal_addr=self._principal_addr(),
-            subject=f"[Nightjar #{token}] approval needed: {verb} (triage)",
+            subject=f"[Nightjar #{token}]",
             body=approval_body,
             jlogger=self.logger, state=self.state, related_message_id=message_id,
         )
