@@ -121,10 +121,16 @@ def handle_list_pending(*, config: Config, state: State, args: dict[str, str]) -
             )
         lines.append("")
         lines.append(
-            "Reply with subject:  [<code>] [Nightjar #<token>] yes"
+            "Reply to the original approval ping:"
         )
         lines.append(
-            "  (tier-4 needs YES IRREVERSIBLE instead of yes)"
+            "  Subject: Re: [Nightjar #<token>] <code>"
+        )
+        lines.append(
+            "  Body:    yes      (or 'no' to deny)"
+        )
+        lines.append(
+            "  (tier-4 needs body 'YES IRREVERSIBLE' uppercase)"
         )
     elif awaiting == 0 and interpret == 0:
         lines.append("Nothing pending.")

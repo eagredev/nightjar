@@ -85,9 +85,42 @@ def test_extract_code_from_subject_returns_none_when_missing() -> None:
     assert auth.extract_code_from_subject("[abcdef] alpha") is None
 
 
-def test_extract_code_only_matches_at_start() -> None:
-    """Code must be the leading prefix, not buried in the middle."""
+def test_extract_code_does_not_match_in_middle() -> None:
+    """Code must be at one of the ends, not buried in the middle."""
     assert auth.extract_code_from_subject("hello [123456] world") is None
+    assert auth.extract_code_from_subject("hello 123456 world") is None
+
+
+def test_extract_code_accepts_trailing_position() -> None:
+    """The new ergonomic format puts the code at the end of the subject,
+    where the cursor sits after hitting Reply: `Re: [Nightjar #abc] 123456`."""
+    assert auth.extract_code_from_subject(
+        "Re: [Nightjar #abc1234] 123456"
+    ) == "123456"
+    assert auth.extract_code_from_subject(
+        "Re: [Nightjar #abc1234] [123456]"
+    ) == "123456"
+    # Trailing whitespace tolerated.
+    assert auth.extract_code_from_subject(
+        "Re: [Nightjar #abc1234] 123456  "
+    ) == "123456"
+
+
+def test_extract_code_trailing_bare_requires_whitespace_boundary() -> None:
+    """Bare trailing 123456 needs whitespace before it so a verb that
+    happens to end with digits doesn't false-match."""
+    # `tail log 2026 123456` -> trailing 123456 has whitespace before it: match.
+    assert auth.extract_code_from_subject("tail log 2026 123456") == "123456"
+    # No whitespace boundary -> no match for the trailing form.
+    assert auth.extract_code_from_subject("foo123456") is None
+
+
+def test_extract_code_prefers_trailing_when_both_present() -> None:
+    """If a code is at BOTH ends, prefer the trailing one (the new
+    convention). The leading is then decorative."""
+    assert auth.extract_code_from_subject(
+        "[111111] [Nightjar #abc] 123456"
+    ) == "123456"
 
 
 def test_extract_code_accepts_bare_form() -> None:

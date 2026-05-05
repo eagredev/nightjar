@@ -96,17 +96,24 @@ def test_parse_strips_bare_leading_code() -> None:
     assert cmd.args == {"date": "2026-05-04"}
 
 
-def test_parse_bare_code_with_approval_verdict() -> None:
-    """The realistic verdict subject is `[code] [Nightjar #token]
-    VERDICT` — bare code form should match the bracketed-form path."""
-    cmd = parse_principal_command("123456 [Nightjar #abc1234] YES IRREVERSIBLE")
+def test_parse_trailing_code_after_token() -> None:
+    """The new ergonomic format puts the auth code AFTER the token tag,
+    where the cursor sits after Reply: `Re: [Nightjar #abc] 123456`.
+    Verdict comes from the body."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc1234] 123456",
+        body="YES IRREVERSIBLE\n",
+    )
     assert cmd.approval_token == "abc1234"
     assert cmd.approval_verdict == "IRREVERSIBLE"
 
 
-def test_parse_bare_code_with_reply_prefix_first() -> None:
-    """`Re: 123456 [Nightjar #...] verdict` order also works."""
-    cmd = parse_principal_command("Re: 123456 [Nightjar #abc1234] yes")
+def test_parse_trailing_bracketed_code_after_token() -> None:
+    """Bracketed form at the trailing position also accepted."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc1234] [123456]",
+        body="yes\n",
+    )
     assert cmd.approval_token == "abc1234"
     assert cmd.approval_verdict == "APPROVE"
 
@@ -170,46 +177,166 @@ def test_parse_add_rejects_non_email_arg() -> None:
     assert cmd.is_free_form is True
 
 
-# ---- Approval verdict extraction (Build Step 4b) --------------------------
+# ---- Approval verdict extraction (verdict in body, code in subject) -------
 
 
-@pytest.mark.parametrize("subject,expected_verdict", [
-    ("Re: [Nightjar #abc123] yes", "APPROVE"),
-    ("Re: [Nightjar #abc123] approve", "APPROVE"),
-    ("Re: [Nightjar #abc123] go", "APPROVE"),
-    ("Re: [Nightjar #abc123] YES", "APPROVE"),  # case-insensitive
-    ("Re: [Nightjar #abc123] no", "DENY"),
-    ("Re: [Nightjar #abc123] deny", "DENY"),
-    ("Re: [Nightjar #abc123] stop", "DENY"),
-    ("Re: [Nightjar #abc123] YES IRREVERSIBLE", "IRREVERSIBLE"),
+@pytest.mark.parametrize("body,expected_verdict", [
+    # APPROVE synonyms
+    ("yes", "APPROVE"),
+    ("yes please", "APPROVE"),
+    ("approve", "APPROVE"),
+    ("approved", "APPROVE"),
+    ("go", "APPROVE"),
+    ("go for it", "APPROVE"),
+    ("go ahead", "APPROVE"),
+    ("ok", "APPROVE"),
+    ("okay", "APPROVE"),
+    ("confirm", "APPROVE"),
+    ("confirmed", "APPROVE"),
+    ("do it", "APPROVE"),
+    ("YES", "APPROVE"),  # case-insensitive
+    ("Approve", "APPROVE"),
+    # DENY synonyms
+    ("no", "DENY"),
+    ("no thanks", "DENY"),
+    ("deny", "DENY"),
+    ("denied", "DENY"),
+    ("refuse", "DENY"),
+    ("refused", "DENY"),
+    ("reject", "DENY"),
+    ("rejected", "DENY"),
+    ("stop", "DENY"),
+    ("cancel", "DENY"),
+    ("nope", "DENY"),
+    # Tier-4 (uppercase exact)
+    ("YES IRREVERSIBLE", "IRREVERSIBLE"),
 ])
-def test_parse_approval_verdict(subject: str, expected_verdict: str) -> None:
-    cmd = parse_principal_command(subject)
+def test_parse_approval_verdict_from_body(body: str, expected_verdict: str) -> None:
+    """Verdict lives in the body. Subject is just `Re: [Nightjar #token] code`."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456", body=body,
+    )
     assert cmd.approval_token == "abc123"
     assert cmd.approval_verdict == expected_verdict
 
 
 def test_parse_approval_verdict_unclear_when_extra_words() -> None:
-    """Strict match: extra words make the verdict UNCLEAR rather than
-    accidentally approving."""
-    cmd = parse_principal_command("Re: [Nightjar #abc123] yes please")
+    """Strict match: extra words past the synonym make UNCLEAR rather
+    than accidental approve."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456", body="yes if you must\n",
+    )
     assert cmd.approval_token == "abc123"
     assert cmd.approval_verdict == "UNCLEAR"
 
 
 def test_parse_tier4_confirm_must_be_uppercase() -> None:
-    """Lowercase 'yes irreversible' is NOT a valid tier-4 confirm. The
-    UPPERCASE EXACT requirement is the friction that makes tier-4
-    deliberate."""
-    cmd = parse_principal_command("Re: [Nightjar #abc123] yes irreversible")
+    """Lowercase 'yes irreversible' is NOT a valid tier-4 confirm.
+    UPPERCASE EXACT is the friction that makes tier-4 deliberate."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456", body="yes irreversible\n",
+    )
     assert cmd.approval_token == "abc123"
     assert cmd.approval_verdict == "UNCLEAR"
 
 
-def test_parse_approval_verdict_with_leading_code() -> None:
-    """The verdict reply still has a [123456] auth code prefix; we
-    strip it before classifying."""
-    cmd = parse_principal_command("Re: [Nightjar #abc123] [654321] yes")
+def test_parse_approval_verdict_unclear_when_body_missing() -> None:
+    """Token present but no body -> UNCLEAR (resolver prompts retry)."""
+    cmd = parse_principal_command("Re: [Nightjar #abc123] 123456", body=None)
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+def test_parse_approval_verdict_unclear_when_body_empty() -> None:
+    cmd = parse_principal_command("Re: [Nightjar #abc123] 123456", body="")
+    assert cmd.approval_token == "abc123"
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+# ---- Quoted-reply stripping in body ---------------------------------------
+
+
+def test_parse_skips_blank_leading_lines() -> None:
+    """Mail clients sometimes start the body with a blank line; the
+    first non-blank line is what counts."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="\n\nyes\n\nOn Mon, May 5 ... wrote:\n> stuff\n",
+    )
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_strips_gmail_attribution() -> None:
+    """A Gmail-style `On ... wrote:` line is the quoted-block boundary.
+    Anything after is original ping content, not the principal's verdict."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="approve\n\nOn Mon, May 5, 2026 at 12:34 AM Nightjar <bot@x.com> wrote:\n> Approval needed: reply\n> Body: yes\n",
+    )
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_strips_outlook_attribution() -> None:
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="no thanks\n\n-----Original Message-----\nFrom: Nightjar\n",
+    )
+    assert cmd.approval_verdict == "DENY"
+
+
+def test_parse_strips_apple_mail_forwarded_marker() -> None:
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="confirm\n\nBegin forwarded message:\nFrom: ...\n",
+    )
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_skips_signature_block() -> None:
+    """A `-- ` separator line marks the start of the signature; the
+    verdict above it still wins."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="yes\n\n-- \nDylan\nSent from my phone\n",
+    )
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_signature_above_verdict_returns_unclear() -> None:
+    """If the body is just a signature block (no verdict above it),
+    classification is UNCLEAR."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="-- \nDylan\n",
+    )
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+def test_parse_quoted_only_body_returns_unclear() -> None:
+    """A reply that is *just* the quoted original (no fresh content)
+    must NOT classify as a verdict from a quoted line."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="On Mon, May 5 ... wrote:\n> Body: yes\n> Approval needed.\n",
+    )
+    assert cmd.approval_verdict == "UNCLEAR"
+
+
+def test_parse_ignores_quoted_verdict_below_real_verdict() -> None:
+    """A `>`-prefixed line containing 'no' must not flip an APPROVE."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] 123456",
+        body="approved\n> previous: no\n> someone said no\n",
+    )
+    assert cmd.approval_verdict == "APPROVE"
+
+
+def test_parse_approval_verdict_with_leading_code_in_subject() -> None:
+    """Auth layer normally strips the code, but defensive: a leftover
+    [code] in the subject is tolerated."""
+    cmd = parse_principal_command(
+        "Re: [Nightjar #abc123] [654321]", body="yes\n",
+    )
     assert cmd.approval_token == "abc123"
     assert cmd.approval_verdict == "APPROVE"
 

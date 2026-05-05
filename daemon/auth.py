@@ -38,12 +38,16 @@ TOTP_PERIOD_SECONDS = 30
 # ±1 window of clock skew tolerance, per RFC 6238 §6 implementation note.
 TOTP_GRACE_WINDOWS = 1
 
-# Subject-line code format: leading 6-digit code, optionally bracketed.
-# Either `[123456] verb...` or `123456 verb...` is accepted; the bare
-# form must be followed by whitespace (or end-of-string) so that
-# `123456foo` does not match. The bracketed form is unambiguous on
-# its own. Anchored to the start of the subject.
-_SUBJECT_CODE_RE = re.compile(r"^\s*(?:\[(\d{6})\]|(\d{6})(?=\s|$))")
+# Subject-line code format: 6-digit code, optionally bracketed, at
+# either end of the subject. Either `[123456] verb...` or `123456 verb...`
+# (leading) or `... [Nightjar #abc123] 123456` (trailing) is accepted;
+# the bare form must have a whitespace boundary on the inward side so
+# that `123456foo` / `foo123456` do not match. The bracketed form is
+# unambiguous on its own. Trailing position is the ergonomic default
+# for approval replies (the code lands where the cursor naturally sits
+# after hitting Reply).
+_SUBJECT_CODE_LEADING_RE = re.compile(r"^\s*(?:\[(\d{6})\]|(\d{6})(?=\s|$))")
+_SUBJECT_CODE_TRAILING_RE = re.compile(r"(?:\[(\d{6})\]|(?<=\s)(\d{6}))\s*$")
 
 # Base32 alphabet for secret validation.
 _BASE32_RE = re.compile(r"^[A-Z2-7]+=*$")
@@ -241,13 +245,19 @@ def hotp_provisioning_uri(
 
 
 def extract_code_from_subject(subject: str | None) -> str | None:
-    """Pull a 6-digit auth code prefix out of a Subject header.
+    """Pull a 6-digit auth code out of a Subject header.
 
-    Accepts either `[123456] verb` or bare `123456 verb`. The bare
-    form must be followed by whitespace so a verb that happens to
-    begin with digits is not misread. Returns the 6-digit code or
-    None. Tolerates leading whitespace and common Re:/Fwd: prefixes
-    by stripping one once before matching.
+    Accepts the code at either end of the subject:
+      - leading: `[123456] verb`, `123456 verb`
+      - trailing: `Re: [Nightjar #abc123] 123456`, `Re: [Nightjar #abc123] [123456]`
+
+    The bare form needs a whitespace boundary on the inward side so a
+    verb that happens to begin/end with digits is not misread. Tolerates
+    leading whitespace and a single common Re:/Fwd: prefix.
+
+    If both ends contain a code, prefer the trailing one (the new
+    convention for approval replies). The leading position is kept
+    working for principal-initiated tier-1 verbs like `[123456] status`.
     """
     if not subject:
         return None
@@ -255,7 +265,10 @@ def extract_code_from_subject(subject: str | None) -> str | None:
     # Strip a single leading reply/forward prefix if present, so that
     # `Re: [123456] foo` still works for back-and-forth threads.
     s = re.sub(r"^(?:re|fwd|fw)\s*:\s*", "", s, flags=re.IGNORECASE)
-    m = _SUBJECT_CODE_RE.match(s)
-    if not m:
-        return None
-    return m.group(1) or m.group(2)
+    trailing = _SUBJECT_CODE_TRAILING_RE.search(s)
+    if trailing:
+        return trailing.group(1) or trailing.group(2)
+    leading = _SUBJECT_CODE_LEADING_RE.match(s)
+    if leading:
+        return leading.group(1) or leading.group(2)
+    return None

@@ -134,21 +134,44 @@ VERB_REGISTRY: tuple[VerbSpec, ...] = (
 )
 
 
-# Approval verdict words. The principal types these as the entire
-# subject (after the [123456] prefix) when responding to a [Nightjar
-# #abc123] approval ping. Strict matching: any decoration around the
-# word, or any extra trailing words, classifies as a free-form reply
-# instead of a verdict. This prevents accidental approval from a
-# principal who quoted the previous email's body.
-_APPROVE_WORDS = ("yes", "approve", "go")
-_DENY_WORDS = ("no", "deny", "stop")
-# Tier-4 double-confirm phrase. UPPERCASE EXACT, no leading code is
-# stripped before this match (so the strict-uppercase test catches
-# sloppy approvals).
+# Approval verdict synonyms. Curated list — strict whole-line match
+# (case-insensitive for these two sets), no extra trailing words. The
+# principal types these in the BODY of an approval reply, after a
+# `Re: [Nightjar #abc123] <code>` subject. The strict-line rule prevents
+# an accidental approval from a quoted line in a back-and-forth thread.
+_APPROVE_PHRASES = frozenset({
+    "yes",
+    "yes please",
+    "approve",
+    "approved",
+    "go",
+    "go for it",
+    "go ahead",
+    "ok",
+    "okay",
+    "confirm",
+    "confirmed",
+    "do it",
+})
+_DENY_PHRASES = frozenset({
+    "no",
+    "no thanks",
+    "deny",
+    "denied",
+    "refuse",
+    "refused",
+    "reject",
+    "rejected",
+    "stop",
+    "cancel",
+    "nope",
+})
+# Tier-4 double-confirm phrase. UPPERCASE EXACT, no case folding;
+# must be a standalone first non-quoted line in the body.
 _TIER4_CONFIRM = "YES IRREVERSIBLE"
 
 
-# Approval-token subjects look like:  re: [Nightjar #a4f2c1] approval needed
+# Approval-token subjects look like:  re: [Nightjar #a4f2c1] 123456
 # Token is hex, 6+ chars; we don't enforce a fixed length so future tokens
 # can grow without changing the parser.
 _APPROVAL_TOKEN_RE = re.compile(
@@ -158,12 +181,30 @@ _APPROVAL_TOKEN_RE = re.compile(
 
 # The TOTP/HOTP prefix is normally stripped by the auth layer, but the
 # parser tolerates a leftover 6-digit code in case the caller forgets.
-# Either `[123456]` or bare `123456` (the bare form requires a trailing
-# whitespace boundary so a future digit-prefixed verb is not misread).
+# Codes can be at either end of the subject; the trailing form is the
+# ergonomic default for approval replies.
 _LEADING_CODE_RE = re.compile(r"^\s*(?:\[\d{6}\]|\d{6}(?=\s|$))\s*")
+_TRAILING_CODE_RE = re.compile(r"\s*(?:\[\d{6}\]|(?<=\s)\d{6})\s*$")
 
 # Common reply prefixes. Stripped before approval-token detection.
 _REPLY_PREFIX_RE = re.compile(r"^(?:re|fwd|fw)\s*:\s*", re.IGNORECASE)
+
+# Quoted-reply attribution lines. Anything from one of these onward is
+# treated as quoted original, not the principal's verdict. Patterns
+# cover Gmail/Apple Mail/Outlook conventions.
+_QUOTE_ATTRIBUTION_RE = re.compile(
+    r"^(?:"
+    r"On\s.+wrote:\s*$"           # Gmail: `On Mon, May 5, 2026 at 12:34 ... wrote:`
+    r"|-+\s*Original\s+Message\s*-+\s*$"  # Outlook: `-----Original Message-----`
+    r"|From:\s.+$"                 # Outlook header-block start (rare in plain reply)
+    r"|Begin\s+forwarded\s+message:\s*$"  # Apple Mail forward
+    r")",
+    re.IGNORECASE,
+)
+# Signature separator per RFC 3676 §4.3: a line consisting solely of
+# "-- " (dash dash space). Anything below is the principal's signature
+# and not part of the verdict.
+_SIG_SEPARATOR = "-- "
 
 
 # ---- ParsedCommand --------------------------------------------------------
@@ -203,14 +244,19 @@ class ParsedCommand:
 # ---- Public parser --------------------------------------------------------
 
 
-def parse_principal_command(subject: str | None) -> ParsedCommand:
-    """Parse a principal-mail subject into a structured command.
+def parse_principal_command(
+    subject: str | None, body: str | None = None
+) -> ParsedCommand:
+    """Parse a principal-mail subject (and optional body) into a structured command.
 
-    Body is intentionally not consulted at this stage: the entire
-    grammar lives in the subject. This keeps the parser cheap, makes
-    the threat surface narrow (a contact can't smuggle commands by
-    quoting them in a body Nightjar later parses), and matches how
-    operators interact with the daemon from a phone keyboard.
+    For tier-1 verbs and free-form requests, the entire grammar lives
+    in the subject and the body is ignored. For approval replies (the
+    `[Nightjar #abc123]` shape), the verdict is extracted from the
+    BODY: the first non-quoted, non-empty line of the reply is matched
+    against the curated APPROVE / DENY synonym sets (or the literal
+    `YES IRREVERSIBLE` for tier-4). This format puts the code at the
+    end of the subject (where the cursor naturally sits after Reply)
+    and frees the subject line to act as a stable thread identifier.
     """
     raw = subject or ""
 
@@ -222,18 +268,18 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
 
     token_match = _APPROVAL_TOKEN_RE.search(no_reply_prefix)
     if token_match:
-        # Verdict-word extraction: the principal's verdict is the rest of
-        # the subject after the [Nightjar #token] tag is stripped, plus
-        # any leading [123456] code. We classify into APPROVE / DENY /
-        # IRREVERSIBLE / UNCLEAR. UNCLEAR is preserved (rather than
-        # falling back to free-form) because the resolver needs to email
-        # the principal a "your reply didn't parse" hint instead of the
-        # generic free-form prompt.
+        # Approval reply: the verdict is in the BODY. We strip the
+        # token tag and any stray code(s) from the subject for the
+        # payload field (useful for logs), then classify body content
+        # into APPROVE / DENY / IRREVERSIBLE / UNCLEAR. UNCLEAR is
+        # preserved (rather than falling back to free-form) because
+        # the resolver needs to email a "your reply didn't parse" hint
+        # rather than the generic free-form prompt.
         token = token_match.group("token").lower()
-        # Remove the [Nightjar #token] tag, then strip leading code.
         leftover = _APPROVAL_TOKEN_RE.sub("", no_reply_prefix, count=1)
-        leftover = _LEADING_CODE_RE.sub("", leftover).strip()
-        verdict = _classify_verdict(leftover)
+        leftover = _LEADING_CODE_RE.sub("", leftover)
+        leftover = _TRAILING_CODE_RE.sub("", leftover).strip()
+        verdict = _classify_body_verdict(body)
         return ParsedCommand(
             raw_subject=raw,
             approval_token=token,
@@ -241,9 +287,10 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
             payload=no_reply_prefix.strip(),
         )
 
-    # Strip the leading [123456] code if the auth layer left it on. (It
-    # normally doesn't, but defensive against future refactors.)
+    # Strip a leading or trailing [123456] code if the auth layer left
+    # it on. (It normally doesn't, but defensive against future refactors.)
     stripped = _LEADING_CODE_RE.sub("", raw)
+    stripped = _TRAILING_CODE_RE.sub("", stripped)
     payload = stripped.strip()
 
     if not payload:
@@ -284,29 +331,61 @@ def parse_principal_command(subject: str | None) -> ParsedCommand:
     return ParsedCommand(raw_subject=raw, is_free_form=True, payload=payload)
 
 
-def _classify_verdict(leftover: str) -> str:
-    """Classify the post-token text of an approval reply.
+def _classify_body_verdict(body: str | None) -> str:
+    """Classify the verdict from an approval reply body.
 
-    Returns one of APPROVE, DENY, IRREVERSIBLE, UNCLEAR. The leftover
-    has already had Re:, the [Nightjar #token] tag, and the [123456]
-    code stripped, so what remains should be just the verdict word.
+    Returns one of APPROVE, DENY, IRREVERSIBLE, UNCLEAR.
 
-    Strict match: extra trailing words make it UNCLEAR. The principal
-    might think "yes please" is approval, but we want explicit single
-    verdict words to keep the audit trail clean.
+    Strategy: walk the body line by line, stopping at the first
+    quoted-block boundary (Gmail "On ... wrote:" attribution, Apple
+    "Begin forwarded message:", Outlook "-----Original Message-----",
+    or a `>`-prefixed quoted line). Of the lines BEFORE that boundary,
+    take the first non-blank one and match it against the synonym
+    sets. Tier-4 IRREVERSIBLE requires the literal uppercase phrase
+    `YES IRREVERSIBLE` as its own line.
+
+    Strict match: extra trailing words on the verdict line make it
+    UNCLEAR. The synonym list is the curated allowlist of phrases an
+    operator might naturally type. Anything else routes to UNCLEAR so
+    the daemon can prompt for a clearer verdict instead of guessing.
     """
-    if not leftover:
+    line = _first_nonquoted_line(body)
+    if line is None:
         return "UNCLEAR"
     # Tier-4 confirm is case-sensitive on purpose; lowercase "yes
     # irreversible" must NOT pass.
-    if leftover == _TIER4_CONFIRM:
+    if line == _TIER4_CONFIRM:
         return "IRREVERSIBLE"
-    word = leftover.lower()
-    if word in _APPROVE_WORDS:
+    folded = line.lower()
+    if folded in _APPROVE_PHRASES:
         return "APPROVE"
-    if word in _DENY_WORDS:
+    if folded in _DENY_PHRASES:
         return "DENY"
     return "UNCLEAR"
+
+
+def _first_nonquoted_line(body: str | None) -> str | None:
+    """Return the first non-empty, non-quoted line of an email body.
+
+    Lines are stripped of trailing whitespace before matching but the
+    raw line is returned (so the tier-4 uppercase check sees the
+    original casing). Returns None if no such line exists before a
+    quoted-block boundary.
+    """
+    if not body:
+        return None
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip()
+        if line == _SIG_SEPARATOR:
+            return None
+        if line.startswith(">"):
+            return None
+        if _QUOTE_ATTRIBUTION_RE.match(line):
+            return None
+        if line.strip() == "":
+            continue
+        return line.strip()
+    return None
 
 
 def describe_grammar() -> str:
