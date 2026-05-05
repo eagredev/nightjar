@@ -120,6 +120,7 @@ AUTH_MODES = ("hotp", "totp")
 DEFAULT_AUTH_MODE = "hotp"
 
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
+DEFAULT_SCOPE_CLASSIFIER_MODEL = "claude-haiku-4-5"
 DEFAULT_PER_HOUR_MAX_INVOCATIONS = 30
 DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS = 8000
 DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS = 10  # $0.10 soft cap
@@ -183,6 +184,13 @@ class ClaudeConfig:
     principal_per_message_cost_cents: int = DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS
     principal_hard_kill_multiplier: int = DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER
     principal_always_direct: bool = DEFAULT_PRINCIPAL_ALWAYS_DIRECT
+    # Step 7b: model used for the pass-1 scope classifier when a
+    # contact has non-empty scopes. Defaulted to Haiku regardless of
+    # what the main triage model is, because scope classification is
+    # a small structured task and Haiku is cheapest+fastest. Bump to
+    # a stronger model only if classification accuracy on real
+    # contacts proves a problem.
+    scope_classifier_model: str = DEFAULT_SCOPE_CLASSIFIER_MODEL
 
 
 @dataclass(frozen=True)
@@ -608,6 +616,13 @@ def load(
         default_model = claude_section.get("default_model", DEFAULT_CLAUDE_MODEL).strip()
         if not default_model:
             raise ConfigError("[claude].default_model must not be empty")
+        scope_classifier_model = claude_section.get(
+            "scope_classifier_model", DEFAULT_SCOPE_CLASSIFIER_MODEL,
+        ).strip()
+        if not scope_classifier_model:
+            raise ConfigError(
+                "[claude].scope_classifier_model must not be empty"
+            )
         try:
             per_hour = int(claude_section.get(
                 "per_hour_max_invocations", str(DEFAULT_PER_HOUR_MAX_INVOCATIONS)
@@ -655,6 +670,7 @@ def load(
             principal_per_message_cost_cents=cost_cents,
             principal_hard_kill_multiplier=kill_multiplier,
             principal_always_direct=always_direct,
+            scope_classifier_model=scope_classifier_model,
         )
 
     return Config(
