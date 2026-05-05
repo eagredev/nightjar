@@ -187,31 +187,41 @@ def test_forget_unknown_contact_fails(tmp_path: Path) -> None:
     assert "no contact" in result.summary
 
 
-# ---- tier-4: add ----------------------------------------------------------
+# ---- tier-2: add / remove (per-file TOML, post-Step-6c) -------------------
 # These tests use a real on-disk nightjar.conf at tmp_path/nightjar.conf
-# so config_writer's atomic-write + validation path is exercised end to end.
+# AND real contact TOML files in tmp_path/contacts/, so the writer's
+# atomic-write + validation path is exercised end to end.
 
 
 def write_baseline_conf(tmp_path: Path) -> Path:
     import textwrap
+    contacts_dir = tmp_path / "contacts"
+    contacts_dir.mkdir(exist_ok=True)
+    (contacts_dir / "principal.toml").write_text(textwrap.dedent("""
+        contact_id = "principal"
+        addresses = ["me@example.com"]
+        display_name = "Operator"
+        relationship = "Administrator"
+        daily_limit = "unlimited"
+        is_principal = true
+        inboxes = ["nightjar"]
+    """).strip() + "\n", encoding="utf-8")
+    (contacts_dir / "composer.toml").write_text(textwrap.dedent("""
+        contact_id = "composer"
+        addresses = ["composer@example.com"]
+        display_name = "Composer"
+        relationship = "Project composer"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+    """).strip() + "\n", encoding="utf-8")
     path = tmp_path / "nightjar.conf"
     path.write_text(
         textwrap.dedent(f"""
         [daemon]
         state_dir = {tmp_path}/state
         log_dir = {tmp_path}/logs
-        notes_dir = {tmp_path}/contacts
-
-        [contact:principal]
-        addresses = me@example.com
-        display_name = Operator
-        is_principal = true
-        daily_limit = unlimited
-
-        [contact:composer]
-        addresses = composer@example.com
-        display_name = Composer
-        daily_limit = 3
+        notes_dir = {tmp_path}/notes
+        contacts_dir = {tmp_path}/contacts
 
         [inbox:nightjar]
         enabled = true
@@ -220,7 +230,6 @@ def write_baseline_conf(tmp_path: Path) -> Path:
         imap_user = bot@example.com
         imap_password = secret
         trusted_authserv = mx.google.com
-        allowed_contacts = principal, composer
         """).lstrip(),
         encoding="utf-8",
     )
@@ -301,7 +310,7 @@ def test_add_derives_unique_contact_id(tmp_path: Path) -> None:
     assert "composer-2" in cfg.contacts
 
 
-# ---- tier-4: remove -------------------------------------------------------
+# ---- tier-2: remove -------------------------------------------------------
 
 
 def test_remove_deletes_contact(tmp_path: Path) -> None:

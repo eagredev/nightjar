@@ -113,13 +113,13 @@ VERB_REGISTRY: tuple[VerbSpec, ...] = (
         pattern=r"^forget\s+(?P<contact>\S+)\s*$",
         handler="forget",
     ),
-    # Tier 4 verbs: queued, double-confirm. The principal must reply
-    # "YES IRREVERSIBLE" (uppercase, exact phrase) with the matching
-    # token. add and remove rewrite nightjar.conf, which is an
-    # authentication-surface change, so they sit at tier 4 by code.
+    # add and remove are tier 2 (single approval): each touches one
+    # contact's TOML file in contacts_dir, not the global nightjar.conf.
+    # The blast radius is one contact — same shape as block/unblock —
+    # so the double-confirm friction of tier 4 is no longer warranted.
     VerbSpec(
         name="add",
-        tier=4,
+        tier=2,
         # Email is the args. We accept anything with an @ and a dot to
         # let the executor do the strict parse, since RFC 5322 is wide.
         pattern=r"^add\s+(?P<email>\S+@\S+\.\S+)\s*$",
@@ -127,7 +127,7 @@ VERB_REGISTRY: tuple[VerbSpec, ...] = (
     ),
     VerbSpec(
         name="remove",
-        tier=4,
+        tier=2,
         pattern=r"^remove\s+(?P<contact>\S+)\s*$",
         handler="remove",
     ),

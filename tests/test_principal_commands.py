@@ -152,13 +152,16 @@ def test_parse_recognises_tier2_verbs(subject: str, verb: str, expected_args: di
 
 
 @pytest.mark.parametrize("subject,verb,expected_args", [
+    # add and remove dropped from tier 4 → tier 2 in Step 6c, when
+    # contacts moved out of nightjar.conf into per-file TOML. The
+    # blast radius is one contact file, not a global config rewrite.
     ("add new@example.com", "add", {"email": "new@example.com"}),
     ("remove composer", "remove", {"contact": "composer"}),
 ])
-def test_parse_recognises_tier4_verbs(subject: str, verb: str, expected_args: dict) -> None:
+def test_parse_recognises_add_remove_as_tier2(subject: str, verb: str, expected_args: dict) -> None:
     cmd = parse_principal_command(subject)
     assert cmd.verb == verb
-    assert cmd.tier == 4
+    assert cmd.tier == 2
     assert cmd.args == expected_args
 
 

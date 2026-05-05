@@ -20,10 +20,40 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import Config, ConfigError, load as load_config
+from .config import Config, ConfigError, DEFAULT_CONFIG_PATH, load as load_config
 from .inbox_watcher import InboxWatcher
 from .log import JSONLLogger
 from .state import State
+
+
+def _peek_contacts_dir(config_path: Path) -> Path:
+    """Read just enough of nightjar.conf to find contacts_dir.
+
+    Used by the migrator before config.load() runs, since the loader
+    refuses to parse a file with legacy [contact:*] blocks. Falls
+    back to the default if the [daemon] section is missing or the
+    field is unset.
+    """
+    import configparser
+    parser = configparser.ConfigParser(interpolation=None)
+    if config_path.exists():
+        parser.read(config_path, encoding="utf-8")
+    daemon_section = parser["daemon"] if "daemon" in parser else {}
+    raw = daemon_section.get("contacts_dir", "~/.config/nightjar/contacts")
+    import os as _os
+    return Path(_os.path.expanduser(raw))
+
+
+def _peek_state_dir(config_path: Path) -> Path:
+    """Read just enough of nightjar.conf to find state_dir."""
+    import configparser
+    parser = configparser.ConfigParser(interpolation=None)
+    if config_path.exists():
+        parser.read(config_path, encoding="utf-8")
+    daemon_section = parser["daemon"] if "daemon" in parser else {}
+    raw = daemon_section.get("state_dir", "~/.local/share/nightjar")
+    import os as _os
+    return Path(_os.path.expanduser(raw))
 
 
 def _panic_file_path(config: Config) -> Path:
@@ -219,6 +249,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Run the contacts/secrets migrator BEFORE config.load(). It is
+    # idempotent and a no-op once migration has run; on first start
+    # after the Step 6c upgrade it moves [contact:*] blocks and
+    # plaintext secrets out of nightjar.conf into per-file layouts.
+    config_path_for_load = args.config or DEFAULT_CONFIG_PATH
+    if not args.setup_auth:
+        from . import contacts_migrator
+        from .config import DEFAULT_SECRETS_PATH
+        # contacts_dir defaults are baked into DaemonConfig; we need a
+        # quick read of the [daemon] section to find any override
+        # without doing a full load (which would crash on legacy state).
+        try:
+            contacts_dir = _peek_contacts_dir(config_path_for_load)
+            report = contacts_migrator.migrate_if_needed(
+                config_path_for_load, contacts_dir,
+                secrets_path=DEFAULT_SECRETS_PATH,
+            )
+            if report.did_migrate:
+                # Stamp the machine-id fingerprint into state.db so
+                # subsequent starts can detect machine-id drift.
+                if report.machine_id_fp is not None:
+                    from .config import DaemonConfig
+                    # We need state_dir to open the DB. Re-peek for it.
+                    state_dir = _peek_state_dir(config_path_for_load)
+                    state = State(db_path=state_dir / "state.db")
+                    state.set_machine_id_fp(report.machine_id_fp)
+                # JSONL log line on stderr so the operator sees it on
+                # first start; the log infrastructure isn't up yet.
+                print(
+                    f"nightjar: migrated "
+                    f"{report.contacts_migrated} contact(s) and "
+                    f"{report.secrets_migrated} secret(s); backup at "
+                    f"{report.backup_path}",
+                    file=sys.stderr,
+                )
+        except contacts_migrator.MigrationError as e:
+            print(f"nightjar: migration error: {e}", file=sys.stderr)
+            return 2
+
     try:
         config = load_config(args.config) if args.config else load_config()
     except ConfigError as e:
@@ -230,6 +299,40 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         print(f"nightjar: {e}", file=sys.stderr)
         return 2
+
+    # Machine-id check: if we have a stored fingerprint and a
+    # secrets.toml file is in use, verify the machine-id hasn't
+    # changed since secrets were obfuscated.
+    if config is not None and not args.setup_auth:
+        from .config import DEFAULT_SECRETS_PATH
+        if DEFAULT_SECRETS_PATH.exists():
+            from . import secret_box
+            try:
+                current_fp = secret_box.machine_id_fingerprint()
+            except secret_box.SecretBoxError as e:
+                print(
+                    f"nightjar: cannot read /etc/machine-id: {e}",
+                    file=sys.stderr,
+                )
+                return 2
+            state_for_check = State(db_path=config.daemon.state_dir / "state.db")
+            stored_fp = state_for_check.get_machine_id_fp()
+            if stored_fp is None:
+                # First start with secrets.toml but no fingerprint
+                # stored — happens for installs that already ran the
+                # migrator before the fingerprint check shipped, or
+                # if state.db was wiped. Stamp now.
+                state_for_check.set_machine_id_fp(current_fp)
+            elif stored_fp != current_fp:
+                print(
+                    "nightjar: /etc/machine-id has changed since secrets "
+                    "were obfuscated. The secrets file is no longer "
+                    "decodable on this machine. Restore "
+                    f"{config_path_for_load}.pre-migration.bak (if you "
+                    "have it) or re-run setup. Refusing to start.",
+                    file=sys.stderr,
+                )
+                return 2
 
     if args.setup_auth:
         from . import setup_auth

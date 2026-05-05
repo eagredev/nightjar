@@ -378,6 +378,52 @@ document, not a contract carved in stone.
 
 ---
 
+## Secrets at rest
+
+Nightjar stores its sensitive credentials — SMTP password, IMAP
+password, TOTP/HOTP secret, Anthropic API key — in a separate file
+at `~/.config/nightjar/secrets.toml`, chmod 600. The file is
+**obfuscated, not encrypted**. The keystream is derived from
+`/etc/machine-id` via HMAC-SHA256, with a fresh 16-byte salt per
+write, so:
+
+- A copy of the file is **useless on another machine**. Backup
+  drives, dotfile sync to a public repo, screenshots — all of these
+  surface bytes that don't decode without the original install's
+  machine-id.
+- The file looks like noise to casual inspection. No recognisable
+  prefix, no structure that suggests "this is an API key."
+- An attacker who already has root on this machine can decode the
+  file by reading `/etc/machine-id` and applying the open-source
+  algorithm. Encryption against that adversary requires a passphrase
+  prompt at every daemon start (which would break unattended
+  restart) or a system keyring (which requires non-stdlib
+  dependencies). Neither fits Nightjar's operational model in v1.
+
+The threat model this defends against is **accidental exposure**:
+backups that include `~/.config/`, sharing a config snippet for
+debugging, syncing dotfiles to a public repo, leaving the Steam
+Deck unattended at a coffee shop. It does not defend against an
+attacker with full local access. The README and module docstrings
+spell this out so the protection isn't mistaken for something
+stronger than it is.
+
+The file binds to this machine via a **fingerprint** (HMAC of the
+machine-id) stored in `state.db`. If `/etc/machine-id` ever changes
+(reinstall, manual reset, copy to a different machine), the daemon
+detects the drift on startup and refuses to run rather than emit
+garbage decoded plaintext into SMTP / IMAP / API calls. Recovery
+in that case is to restore `nightjar.conf.pre-migration.bak` (the
+plaintext backup the migrator created on first run) and re-migrate.
+
+**The pre-migration backup is plaintext.** It contains the
+unobfuscated copies of every secret. The migrator leaves it
+forever — it's the operator's job to delete it once they've
+confirmed the migration worked. Do not back up `~/.config/nightjar/`
+to anything you don't fully control until that file is gone.
+
+---
+
 ## Running it yourself
 
 This isn't packaged as a product, but the code is open and the
@@ -386,8 +432,12 @@ provider, or tool surface should be tractable for someone
 comfortable with Python. The pieces most likely to need rework if
 it's forked:
 
-- **SMTP and IMAP credentials, inbox addresses, TOTP setup**:
-  entirely in `~/.config/nightjar/nightjar.conf`.
+- **Secrets** (SMTP password, IMAP password, TOTP secret, Anthropic
+  API key): in `~/.config/nightjar/secrets.toml`, obfuscated. See
+  the "Secrets at rest" section above.
+- **Non-secret config** (SMTP host, IMAP host, daemon paths, Claude
+  model, security thresholds): in `~/.config/nightjar/nightjar.conf`.
+- **Contacts**: one TOML file each in `~/.config/nightjar/contacts/`.
 - **The tool surface** in `tools/`: Nightjar's tools are scoped per
   inbox via named bundles. The example tools in this repo are
   specific to the operator's projects; a fork would write its own.
