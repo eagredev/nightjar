@@ -241,6 +241,10 @@ def _render_contact_toml(req: AddContactRequest) -> str:
         "is_principal = false",
         f"inboxes = [{inboxes_inline}]",
         "auto_approve_notes = false",
+        # Step 7b: scopes default empty = unrestricted. Operators add
+        # tags to gate topical access; until they do, behaviour matches
+        # pre-Step-7b (no scope classification, all notes visible).
+        "scopes = []",
     ]
     return "\n".join(lines) + "\n"
 

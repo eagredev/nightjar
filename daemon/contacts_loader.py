@@ -57,6 +57,11 @@ from .config import Contact, ConfigError
 # INI section name validation; keep them aligned.
 _CONTACT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# Scope name format. Mirror of the registry-side regex in config.py;
+# kept duplicated to avoid importing config from the loader (load order
+# is loader-then-config; the cross-validation happens in config.load).
+_SCOPE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
 
 @dataclass(frozen=True)
 class LoadResult:
@@ -206,6 +211,32 @@ def _load_one(path: Path) -> Contact:
         raise ConfigError(f"{path}: inboxes list is empty")
     inboxes = tuple(s.strip() for s in inboxes_raw if s.strip())
 
+    # Step 7b: scopes list. Default empty (= unrestricted). The names
+    # are syntactically validated here; cross-validation against the
+    # [scopes] registry happens in config.load().
+    scopes_raw = data.get("scopes", [])
+    if not isinstance(scopes_raw, list) or not all(
+        isinstance(s, str) for s in scopes_raw
+    ):
+        raise ConfigError(f"{path}: scopes must be a list of strings")
+    scopes: list[str] = []
+    seen_scopes: set[str] = set()
+    for raw_scope in scopes_raw:
+        scope = raw_scope.strip()
+        if not scope:
+            continue
+        if not _SCOPE_NAME_RE.match(scope):
+            raise ConfigError(
+                f"{path}: scope name {scope!r} is invalid; must match "
+                f"{_SCOPE_NAME_RE.pattern}"
+            )
+        if scope in seen_scopes:
+            raise ConfigError(
+                f"{path}: duplicate scope {scope!r}"
+            )
+        seen_scopes.add(scope)
+        scopes.append(scope)
+
     return Contact(
         contact_id=contact_id,
         addresses=tuple(addresses),
@@ -215,6 +246,7 @@ def _load_one(path: Path) -> Contact:
         is_principal=is_principal,
         inboxes=inboxes,
         auto_approve_notes=auto_approve_notes,
+        scopes=tuple(scopes),
     )
 
 
