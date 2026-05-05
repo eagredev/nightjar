@@ -231,6 +231,37 @@ CREATE TABLE IF NOT EXISTS inbox_state (
 );
 """
 
+# V11 adds note_proposals: triage's queue of proposed additions to a
+# contact's rapport-notes file. Step 7a ships the table and accessors;
+# the triage emission and approval flow that fill it land in 7b/7d.
+# Status lifecycle: pending -> approved -> applied (terminal) | rejected
+# (terminal) | expired (terminal). Applied means the .md file has been
+# updated; rejected means the principal said no; expired means the TTL
+# elapsed without a decision.
+SCHEMA_V11 = """
+CREATE TABLE IF NOT EXISTS note_proposals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id       TEXT NOT NULL,
+    proposed_at      INTEGER NOT NULL,
+    scope            TEXT,
+    section_heading  TEXT NOT NULL,
+    body             TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    expires_at       INTEGER NOT NULL,
+    approved_at      INTEGER,
+    applied_at       INTEGER,
+    rejected_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_note_proposals_contact ON note_proposals(contact_id);
+CREATE INDEX IF NOT EXISTS idx_note_proposals_status ON note_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_note_proposals_expires ON note_proposals(expires_at);
+"""
+
+# Default TTL for a pending note proposal. Long enough to ride out a
+# few days of operator absence; short enough that an old "principal
+# never approved or rejected" doesn't pile up indefinitely.
+DEFAULT_NOTE_PROPOSAL_TTL_SECONDS = 14 * 24 * 60 * 60
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -272,12 +303,14 @@ class State:
                 conn.execute(SCHEMA_V9_ALTER_MACHINE_ID_FP)
             # V10: inbox_state table for catchup watermark.
             conn.executescript(SCHEMA_V10)
+            # V11: note_proposals table (Step 7a — rapport notes).
+            conn.executescript(SCHEMA_V11)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (10)")
-            elif row["version"] < 10:
-                conn.execute("UPDATE schema_version SET version = 10")
+                conn.execute("INSERT INTO schema_version (version) VALUES (11)")
+            elif row["version"] < 11:
+                conn.execute("UPDATE schema_version SET version = 11")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1037,3 +1070,193 @@ class State:
             if row is None or row["last_ts"] is None:
                 return None
             return int(row["last_ts"])
+
+    # ---- Step 7a: note proposals ----------------------------------------
+
+    def enqueue_note_proposal(
+        self,
+        *,
+        contact_id: str,
+        section_heading: str,
+        body: str,
+        scope: str | None,
+        proposed_at: int,
+        ttl_seconds: int = DEFAULT_NOTE_PROPOSAL_TTL_SECONDS,
+    ) -> int:
+        """Insert a pending note proposal. Returns the assigned id.
+
+        TTL bounds how long the proposal can wait before expire_old_note_proposals
+        sweeps it out. Default 14 days, overridable for tests."""
+        expires_at = proposed_at + ttl_seconds
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO note_proposals
+                    (contact_id, proposed_at, scope, section_heading,
+                     body, status, expires_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    contact_id,
+                    proposed_at,
+                    scope,
+                    section_heading,
+                    body,
+                    expires_at,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_note_proposal(self, proposal_id: int) -> dict | None:
+        """Fetch a single proposal by id; None if absent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM note_proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_pending_note_proposals(
+        self,
+        *,
+        now: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Pending proposals whose TTL has not yet elapsed, oldest first.
+
+        Pass `now` to filter against the current time without relying
+        on system clock; expired-but-still-pending rows are excluded
+        (they should be swept by expire_old_note_proposals separately,
+        but the read path also filters defensively)."""
+        now = now if now is not None else int(time.time())
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM note_proposals
+                WHERE status = 'pending' AND expires_at > ?
+                ORDER BY proposed_at ASC
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_note_proposals_for_contact(
+        self,
+        contact_id: str,
+        *,
+        statuses: tuple[str, ...] = ("pending", "approved", "applied"),
+        limit: int = 100,
+    ) -> list[dict]:
+        """All proposals for a contact in the given statuses, newest
+        first. Default omits rejected/expired so the principal sees
+        the live picture."""
+        if not statuses:
+            return []
+        placeholders = ",".join("?" * len(statuses))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM note_proposals
+                WHERE contact_id = ? AND status IN ({placeholders})
+                ORDER BY proposed_at DESC
+                LIMIT ?
+                """,
+                (contact_id, *statuses, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_note_proposal_approved(
+        self,
+        proposal_id: int,
+        *,
+        now: int,
+    ) -> bool:
+        """Move pending -> approved. Returns True if the row transitioned;
+        False if no such pending row (already resolved or absent)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE note_proposals
+                SET status = 'approved', approved_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, proposal_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_note_proposal_applied(
+        self,
+        proposal_id: int,
+        *,
+        now: int,
+    ) -> bool:
+        """Move approved -> applied (terminal). Records that the
+        notes_store.append_note write actually succeeded; the principal
+        now sees the proposal as done.
+
+        Also transitions directly from pending if the contact has
+        auto_approve_notes=true (the daemon skipped the approval step)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE note_proposals
+                SET status = 'applied', applied_at = ?
+                WHERE id = ? AND status IN ('approved', 'pending')
+                """,
+                (now, proposal_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_note_proposal_rejected(
+        self,
+        proposal_id: int,
+        *,
+        now: int,
+    ) -> bool:
+        """Move pending -> rejected (terminal). Approved-but-not-yet-applied
+        proposals can also be rejected if something blocks the apply
+        (e.g. write failure that the operator decides to forget)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE note_proposals
+                SET status = 'rejected', rejected_at = ?
+                WHERE id = ? AND status IN ('pending', 'approved')
+                """,
+                (now, proposal_id),
+            )
+            return cur.rowcount > 0
+
+    def expire_old_note_proposals(self, *, now: int) -> int:
+        """Move any pending proposals past their TTL to status=expired.
+        Returns the count moved. Caller is the periodic sweep in
+        inbox_watcher (or a test)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE note_proposals
+                SET status = 'expired'
+                WHERE status = 'pending' AND expires_at <= ?
+                """,
+                (now,),
+            )
+            return cur.rowcount
+
+    def count_pending_note_proposals(
+        self,
+        *,
+        now: int | None = None,
+    ) -> int:
+        """How many proposals are currently waiting on the principal.
+        Used by the status report's health block."""
+        now = now if now is not None else int(time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM note_proposals
+                WHERE status = 'pending' AND expires_at > ?
+                """,
+                (now,),
+            ).fetchone()
+            return int(row["n"]) if row else 0

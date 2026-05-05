@@ -413,9 +413,14 @@ def test_parse_bare_no_is_free_form() -> None:
 
 
 def make_config(tmp_path: Path) -> Config:
-    daemon = DaemonConfig(state_dir=tmp_path / "state", log_dir=tmp_path / "logs")
+    daemon = DaemonConfig(
+        state_dir=tmp_path / "state",
+        log_dir=tmp_path / "logs",
+        notes_dir=tmp_path / "notes",
+    )
     daemon.state_dir.mkdir(parents=True)
     daemon.log_dir.mkdir(parents=True)
+    daemon.notes_dir.mkdir(parents=True)
     contacts = {
         "principal": Contact(
             contact_id="principal",
@@ -591,12 +596,59 @@ def test_show_contact_rejects_unknown_contact(tmp_path: Path) -> None:
     assert "No contact 'ghost'" in body
 
 
-def test_show_notes_placeholder_reports_step_7(tmp_path: Path) -> None:
+def test_show_notes_no_arg_returns_usage(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    cmd = parse_principal_command("show notes")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "Usage:" in body
+    assert "composer" in body  # known contact listed
+
+
+def test_show_notes_unknown_contact(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    cmd = parse_principal_command("show notes ghost")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "No contact 'ghost'" in body
+
+
+def test_show_notes_no_file_yet(tmp_path: Path) -> None:
+    """Known contact, no notes file → friendly empty message."""
     cfg = make_config(tmp_path)
     s = make_state(tmp_path)
     cmd = parse_principal_command("show notes composer")
     _, body = dispatch(command=cmd, config=cfg, state=s)
-    assert "Step 7" in body or "rapport notes" in body.lower()
+    assert "No rapport notes for composer yet" in body
+
+
+def test_show_notes_reads_existing_file(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    notes_path = cfg.daemon.notes_dir / "composer.md"
+    notes_path.write_text(
+        "---\ncontact_id: composer\n---\n\n"
+        "## Aurora project [scopes: aurora]\n\n"
+        "- Working on track 3.\n",
+        encoding="utf-8",
+    )
+    cmd = parse_principal_command("show notes composer")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "## Aurora project" in body
+    assert "Working on track 3" in body
+    # Frontmatter omitted from the rendered view.
+    assert "contact_id: composer" not in body
+
+
+def test_show_notes_malformed_file_reports_error(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    s = make_state(tmp_path)
+    notes_path = cfg.daemon.notes_dir / "composer.md"
+    notes_path.write_text("---\nthis is not valid frontmatter\n", encoding="utf-8")
+    cmd = parse_principal_command("show notes composer")
+    _, body = dispatch(command=cmd, config=cfg, state=s)
+    assert "malformed" in body.lower()
+    assert str(notes_path) in body
 
 
 def test_dispatch_returns_none_for_non_handler_command(tmp_path: Path) -> None:
