@@ -1,9 +1,57 @@
 # Nightjar Design Document
 
-> **Status:** v0 design, not yet implemented.
-> **Date:** 2026-05-04 (revised from earlier triage-only framing)
+> **Status:** v0 engineering contract. Originally drafted 2026-05-04
+> as a forward-looking design; now serves as the historical record of
+> what the project was built *toward*. The core security perimeter
+> and Steps 1-7 (waves 1, 2, and 3a) have shipped on `main` — see
+> README.md for the live status table. **Where this document and the
+> code disagree, the code is right and this document is stale.** Most
+> sections still describe the design accurately; a handful have been
+> overtaken by shipped reality and are flagged inline below. The
+> sections most likely to mislead a cold reader are:
+>
+> - **Authentication** — describes TOTP throughout. Reality: HOTP is
+>   the default (RFC 4226, counter-based), TOTP still supported as a
+>   configurable mode. The threat-model treatment generalises cleanly;
+>   substitute "HOTP/TOTP" wherever the prose says "TOTP."
+> - **Directory layout / Config file shape / Contact directory** —
+>   describe `[contact:*]` blocks living in `nightjar.conf` and
+>   secrets living in the same file. Reality: Step 6c moved contacts
+>   to per-file TOMLs at `~/.config/nightjar/contacts/<id>.toml` and
+>   secrets to `~/.config/nightjar/secrets.toml` (machine-id-bound
+>   obfuscation via `secret_box.py`). Legacy `[contact:*]` blocks are
+>   rejected at load time; the per-inbox allowlist is now derived
+>   from each contact's `inboxes = [...]` list. See `example.conf`
+>   for the current shape.
+> - **State persistence (SQLite)** — sketch is from the original
+>   schema. Reality: schema is at V10 with idempotent migrations.
+>   Canonical schema lives in `daemon/state.py`; current tables
+>   include `approvals` (token PK / verb / args_json / tier / state),
+>   `claude_invocations` (V7 — every API call recorded with token
+>   counts and ok/error_reason, never prompt content), `outbound_log`
+>   (V8 — every email Nightjar sends, body verbatim), `inbox_state`
+>   (V10 — per-inbox catchup watermark), `note_proposals` (Step 7d),
+>   and `contact_first_seen` (designed for Step 7c).
+> - **First-contact ceremony** — designed; not yet shipped (Step 7c
+>   pending). Today, unknown senders are dropped and surfaced via
+>   the status report.
+> - **Rapport notes** — describes the bare per-contact Markdown
+>   sidecar. Reality (Step 7 waves 1-3a): notes are scope-tagged
+>   sections with per-bullet provenance metadata
+>   `[meta: src=<message-id>; attr=observed|asserted|self]`, the
+>   `audit_text()` show-notes view marks unverified bullets with ⚠,
+>   and a deterministic verb-side gate downgrades any draft reply
+>   that enumerates an unverified bullet to `flag_for_review`. The
+>   approval queue for individual note proposals (originally
+>   designed for Step 7d) was reframed and dropped — note writes are
+>   now autonomous, per the Step 8 memory architecture.
+>
+> Build sequence at the bottom of this file is the original plan;
+> README.md tracks what's actually shipped.
+>
 > **Substrate:** `anthropic` Python SDK (Messages API, AsyncAnthropic),
-> Haiku 4.5 default, runs on Steam Deck.
+> Haiku 4.5 default for triage and the scope classifier, runs on
+> Steam Deck.
 >
 > **SDK choice rationale.** An earlier draft of this document named the
 > `claude-agent-sdk` PyPI package. That package is the substrate for the
@@ -100,16 +148,20 @@ audiences; this file is the engineering contract.
 
 11. **Per-email authentication for the principal.** Every email
     Nightjar receives from the principal's address must include a
-    valid TOTP code or it is treated as hostile. See "Principal
-    authentication."
-12. **Authentication is enforced before any LLM call.** The TOTP
+    valid HOTP or TOTP code or it is treated as hostile. HOTP
+    (RFC 4226, counter-based) is the default — email's async
+    delivery latency would routinely outlive a TOTP code's 90-second
+    validity window. TOTP (RFC 6238) is configurable via
+    `[security].auth_mode` for operators who prefer it. See
+    "Principal authentication."
+12. **Authentication is enforced before any LLM call.** The HOTP/TOTP
     check is pure Python, runs in the daemon, and gates all
     principal-command processing. The LLM has no role in
     authentication and no access to the secret.
-13. **Authentication secrets never enter LLM context.** The TOTP
-    seed, the dead-man's-switch state, and the contents of the
-    `[security]` config section are not part of any prompt, system
-    or otherwise. The LLM cannot disclose what it has never been
+13. **Authentication secrets never enter LLM context.** The shared
+    HOTP/TOTP secret, the dead-man's-switch state, and the contents
+    of the `[security]` config section are not part of any prompt,
+    system or otherwise. The LLM cannot disclose what it has never been
     shown.
 14. **The email body is data, not instructions.** This applies to
     every LLM call without exception, including triage, digest,
@@ -288,8 +340,22 @@ authentication repeatedly to halt the daemon.
 ## Principal authentication
 
 Every email arriving from the principal's address must carry a
-valid TOTP code, or it is rejected and the dead-man's-switch
+valid HOTP/TOTP code, or it is rejected and the dead-man's-switch
 counter increments.
+
+> **As shipped:** HOTP (RFC 4226, counter-based) is the default.
+> TOTP (RFC 6238, time-based, described below) is still supported via
+> `[security].auth_mode = totp`. The shared base32 secret is reused
+> either way; only the verification primitive changes. HOTP was
+> adopted because TOTP's 30-second window plus typical clock-skew
+> grace routinely lapses before an email round-trip completes (Gmail
+> can sit a message in queue for several minutes during incidents).
+> HOTP has no time pressure: each code is consumed at most once and
+> the 20-counter lookahead (RFC 4226 §7.4) absorbs the operator
+> tapping past a few codes on the authenticator. The rest of this
+> section describes the original TOTP design; everything translates
+> to HOTP by replacing "current time window" with "next unconsumed
+> counter value."
 
 ### TOTP scheme
 
@@ -816,17 +882,47 @@ emails from auth.
 
 The contact directory is the *single mechanism* that handles
 allowlisting, rate limiting, and blocking. Every entity Nightjar
-will interact with has a `[contact:<name>]` block in
-`nightjar.conf`. Anyone not in the directory is treated as
-`daily_limit = 0`: their mail is logged and surfaced in the morning
-digest, never triaged.
+will interact with has a contact entry. Anyone not in the directory
+is treated as `daily_limit = 0`: their mail is logged and surfaced
+via the status report, never triaged.
 
-The principal's own block has `is_principal = true` and
-`daily_limit = unlimited`. The principal is the only contact for
-which TOTP authentication applies; all other contacts are subject
-to triage as data, not authentication as commands.
+The principal's own entry has `is_principal = true` and
+`daily_limit = "unlimited"`. The principal is the only contact for
+which HOTP/TOTP authentication applies; all other contacts are
+subject to triage as data, not authentication as commands.
 
 ### Per-contact config
+
+> **As shipped (Step 6c):** contacts live one-per-file at
+> `~/.config/nightjar/contacts/<contact_id>.toml`, NOT as
+> `[contact:*]` blocks in `nightjar.conf`. Legacy `[contact:*]`
+> blocks are rejected at load time; the contacts migrator runs them
+> out automatically on first start. The Step 6c rationale: tier-2
+> verbs (`add`, `remove`) mutate one file each instead of editing
+> the authentication-bearing config file, so blast radius drops from
+> tier 4 to tier 2. Symmetric layout: spec in `.toml`, rapport-notes
+> memory in `.md`. The current schema (Step 7b additions noted):
+>
+> ```toml
+> contact_id   = "composer"
+> addresses    = ["composer@example.com", "alt@othermail.com"]
+> display_name = "Composer"
+> relationship = "Composer collaborator on the Aurora project"
+> daily_limit  = 3                         # int >= 0 or "unlimited"
+> is_principal = false
+> inboxes      = ["nightjar"]              # which inboxes accept this contact
+> scopes       = ["aurora", "music-tech"]  # Step 7b; default [] (= unrestricted)
+> ```
+>
+> The per-inbox allowlist is now derived from each contact's
+> `inboxes` list — there is no longer an `allowed_contacts =` line
+> on `[inbox:*]` (it is rejected if present). Every scope referenced
+> here must exist in the `[scopes]` registry in `nightjar.conf`. The
+> credit-ledger override system below is the original design;
+> shipped today is the simpler `daily_limit` plus tier-2
+> `block`/`unblock` verbs.
+
+The original ini-block design, preserved for historical context:
 
 ```ini
 [contact:composer]
@@ -842,8 +938,8 @@ auto_approve          =
 ```
 
 Fields, semantics, and the credit-ledger-based override system are
-unchanged from the earlier triage-only design. See "Credit ledger"
-and "Reviving dropped mail" sections (preserved below).
+described in "Credit ledger" and "Reviving dropped mail" sections
+below as the design intent.
 
 ### Credit ledger (Model B, per-day delta windows)
 
@@ -1115,6 +1211,18 @@ Configurable via `[daemon] digest_time` and `digest_timezone`.
 
 Single file, `~/.local/share/nightjar/state.db`.
 
+> **As shipped:** the schema is at V10 with idempotent migrations,
+> and the canonical definition lives in `daemon/state.py`. The
+> sketch below was the Day-1 plan; the shipped schema diverges
+> in several ways: `principal_commands` and `auth_failures` were
+> folded into `messages` + `daemon_state`; new tables added include
+> `approvals` (token PK / verb / args_json / tier / state),
+> `claude_invocations` (V7), `outbound_log` (V8 — body verbatim,
+> the audit log), `inbox_state` (V10 — per-inbox catchup
+> watermark), `note_proposals` (Step 7d), and `contact_first_seen`
+> (designed for Step 7c). Treat the block below as the design
+> intent; consult `daemon/state.py` for what actually exists.
+
 ```sql
 -- Per-message state machine (contact mail)
 CREATE TABLE messages (
@@ -1257,6 +1365,14 @@ The watcher is one asyncio task per enabled inbox. Each task:
 schedule are the project's.
 
 ## Config file shape
+
+> **As shipped:** the canonical, parser-accurate template lives in
+> `example.conf` at the repo root. The block below is the original
+> Day-1 design and is wrong in several places (it shows
+> `[contact:*]` in-config, an inline `totp_seed`, an `allowed_contacts`
+> line on `[inbox:*]`, and a `[caps]` section that became
+> `[claude].per_hour_max_invocations` etc.). Read `example.conf`
+> first; treat the rest of this section as historical sketch.
 
 `~/.config/nightjar/nightjar.conf` (chmod 600):
 
@@ -1522,6 +1638,15 @@ No runtime dependency on any other project on the machine.
 - Running on anything other than the Steam Deck.
 
 ## Build sequence
+
+> **As shipped:** Steps 1-7 (waves 1, 2, and 3a) have landed on
+> `main` and the actual landing order diverged from the plan below
+> in a few places (the principal command surface came in alongside
+> the perimeter as Steps 4a-d, contact-mail triage shipped as Steps
+> 5-6 plus several follow-ups, rapport notes shipped as Step 7).
+> See README.md for the live status table; what follows is the
+> original Day-1 plan, kept as historical record of the order-of-
+> operations reasoning.
 
 Each step produces a working system that can be left running.
 Steps 1-3 establish the security perimeter; steps 4-7 establish
