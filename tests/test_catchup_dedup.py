@@ -19,6 +19,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+import calendar
 import time
 from pathlib import Path
 from typing import Iterable
@@ -209,11 +210,19 @@ def test_first_run_uses_30_day_window(tmp_path: Path) -> None:
     assert len(stub.searches) == 1
     # The search should reach back ~30 days regardless of the configured
     # 7-day window. Easy proxy: the SINCE date should be older than
-    # (now - 8 days) and within (now - 31 days).
+    # the configured 7-day window but no older than 31 days.
+    #
+    # Both the watcher's _imap_since_date and our parse here use UTC
+    # (calendar.timegm). Mixing time.mktime (local time) with
+    # time.gmtime caused intermittent failures across DST boundaries.
     since = stub.searches[0].removeprefix("SINCE ").strip()
-    parsed_ts = time.mktime(time.strptime(since, "%d-%b-%Y"))
+    parsed_ts = calendar.timegm(time.strptime(since, "%d-%b-%Y"))
     now = time.time()
-    assert (now - 31 * 86400) <= parsed_ts <= (now - 8 * 86400)
+    # IMAP SINCE is day-granular and the watcher rounds DOWN to
+    # midnight UTC, so parsed_ts can land up to ~24h earlier than
+    # `now - window_days * 86400`. The 31-day upper bound on the
+    # "how old" axis absorbs that.
+    assert (now - 31 * 86400) <= parsed_ts <= (now - 7 * 86400)
 
 
 def test_steady_state_uses_configured_window(tmp_path: Path) -> None:
@@ -228,10 +237,15 @@ def test_steady_state_uses_configured_window(tmp_path: Path) -> None:
     )
     asyncio.run(watcher._catch_up(stub))
     since = stub.searches[0].removeprefix("SINCE ").strip()
-    parsed_ts = time.mktime(time.strptime(since, "%d-%b-%Y"))
+    # Parse symmetrically with the watcher's UTC formatting.
+    parsed_ts = calendar.timegm(time.strptime(since, "%d-%b-%Y"))
     now = time.time()
-    # window = 7 days, so SINCE should land in the (now - 8d, now - 6d) range.
-    assert (now - 8 * 86400) <= parsed_ts <= (now - 6 * 86400)
+    # window = 7 days; the watcher's _imap_since_date rounds DOWN to
+    # midnight UTC, so parsed_ts lands somewhere in [now - 8d, now - 7d]
+    # depending on what time of day the test runs. Allow a small slop
+    # on each side for runtime drift between the watcher's `now` and
+    # the test's.
+    assert (now - 8 * 86400 - 60) <= parsed_ts <= (now - 7 * 86400 + 60)
 
 
 def test_dedup_skips_known_messages(tmp_path: Path) -> None:
