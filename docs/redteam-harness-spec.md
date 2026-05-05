@@ -1,4 +1,4 @@
-# Red-team harness — interface spec
+# Closed-circuit testing harness — interface spec
 
 A Python library that lets a Claude Code orchestrator session
 exercise the Nightjar triage pipeline end-to-end, with no SMTP, no
@@ -6,8 +6,18 @@ running daemon, and no Anthropic API calls. LLM inference is routed
 through Claude Code sub-agents so the cost is zero marginal API
 tokens.
 
-This is the spec for `tools/redteam_harness.py`. Build to this; the
-red-team loop prompt consumes the resulting interface.
+This is the spec for `tools/sim_harness.py` (`SimHarness`). The
+spec text was originally written for a `RedteamHarness` name; the
+shipped tool dropped the red-team-specific branding because the
+harness is generic — its first consumer is the red-team loop
+(`docs/redteam-loop-brief.md`), but it can be driven by any test or
+investigation that wants to exercise classifier+triage end-to-end.
+
+The class names in the rest of this document still read "Redteam..."
+in places; treat them as historical. The shipped names are
+`SimHarness`, `PendingSubagentDispatch`, `TriageOutcome`,
+`NoteWriteRecord`, `NoteWriteError`, `ClassifierFailure`,
+`TriageFailure`. Public method signatures match the spec.
 
 ## Goals
 
