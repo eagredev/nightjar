@@ -243,12 +243,32 @@ def handle_show_notes(*, config: Config, state: State, args: dict[str, str]) -> 
 # ---- dispatch --------------------------------------------------------------
 
 
+def handle_pickup(*, config: Config, state: State, args: dict[str, str]) -> tuple[str, str]:
+    """Stub handler for the `pickup` verb.
+
+    The real pickup logic lives in the watcher's _dispatch_pickup
+    method because it needs IMAP I/O and must run async. This stub
+    exists so that the registry-vs-handlers contract test passes and
+    so a misconfigured caller (someone bypassing the watcher's
+    special-case) gets a clear error instead of a silent miss.
+    """
+    return (
+        "Nightjar: pickup",
+        "The pickup verb runs through the watcher's IMAP path, not\n"
+        "the synchronous handler dispatch. If you're seeing this\n"
+        "message, the watcher's pickup special-case did not fire.\n"
+        "This is a code bug, not a config problem — check the\n"
+        "_dispatch_pickup branch in inbox_watcher.py.\n"
+    )
+
+
 HANDLERS = {
     "status": handle_status,
     "list_pending": handle_list_pending,
     "tail_log": handle_tail_log,
     "show_contact": handle_show_contact,
     "show_notes": handle_show_notes,
+    "pickup": handle_pickup,
 }
 
 

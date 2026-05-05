@@ -97,6 +97,16 @@ VERB_REGISTRY: tuple[VerbSpec, ...] = (
         pattern=r"^status\s*$",
         handler="status",
     ),
+    VerbSpec(
+        name="pickup",
+        tier=1,
+        # `pickup <message-id>`. The message-id pattern is non-greedy
+        # to accept any RFC 5322 message-id shape (angle brackets are
+        # part of the syntax). The handler does additional validation;
+        # this just splits the verb from its arg.
+        pattern=r"^pickup\s+(?P<message_id>\S.+?)\s*$",
+        handler="pickup",
+    ),
     # Tier 2 verbs: queued, single-approval. The handler runs after the
     # principal replies "yes" / "approve" / "go" with the matching token.
     VerbSpec(

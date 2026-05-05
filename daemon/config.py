@@ -80,6 +80,14 @@ class InboxConfig:
     # catchup. 7 days is plenty of headroom for a daemon that's down
     # for a long weekend; bump it if the daemon may be offline longer.
     catchup_window_days: int = 7
+    # `status_walk_count` is the number of recent IMAP messages the
+    # status report fetches headers for to cross-reference against the
+    # state-db. 200 is a good balance between coverage and cost (~2-4s,
+    # ~500KB network on a typical Gmail connection). Bump up if you
+    # have a busy inbox where 200 covers <a few weeks. The full-inbox
+    # variant is what the 'audit' power-tool will provide once it
+    # lands; this knob is the per-status-report cap.
+    status_walk_count: int = 200
 
 
 @dataclass(frozen=True)
@@ -388,6 +396,19 @@ def load(
                 f"{section_name}.catchup_window_days must be >= 1, "
                 f"got {catchup_window_days}"
             )
+        status_walk_raw = section.get("status_walk_count", "200").strip()
+        try:
+            status_walk_count = int(status_walk_raw)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{section_name}.status_walk_count must be an integer, "
+                f"got {status_walk_raw!r}"
+            ) from exc
+        if status_walk_count < 10:
+            raise ConfigError(
+                f"{section_name}.status_walk_count must be >= 10, "
+                f"got {status_walk_count}"
+            )
         inbox = InboxConfig(
             name=inbox_name,
             enabled=enabled,
@@ -398,6 +419,7 @@ def load(
             allowed_contacts=allowed,
             trusted_authserv=trusted_authserv,
             catchup_window_days=catchup_window_days,
+            status_walk_count=status_walk_count,
         )
         inboxes[inbox_name] = inbox
 

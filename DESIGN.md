@@ -708,11 +708,12 @@ a fixed vocabulary. Tier 1 verbs auto-execute via
 
 | Verb | Tier | Behaviour |
 |------|------|-----------|
-| `status` | 1 | Reply with current state |
+| `status` | 1 | Reply with full status report (health, awaiting action, expiring tickets, in-flight, out-of-band IMAP walk, recently sent) |
 | `list pending` | 1 | Reply with pending approvals |
 | `show contact <name>` | 1 | Reply with contact summary |
 | `show notes <contact>` | 1 | Reply with notes file content |
 | `tail log [date]` | 1 | Reply with last 100 log lines |
+| `pickup <message-id>` | 1 | Force-triage a message by Message-ID (re-runs triage as if just received). Cost-cap rules apply since triage spends Claude tokens. |
 | `yes` / `approve` / `go` | varies | Approve a pending action |
 | `no` / `deny` / `stop` | varies | Deny a pending action |
 | `YES IRREVERSIBLE` | varies | Confirm a tier-4 pending action |

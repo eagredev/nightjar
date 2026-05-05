@@ -138,6 +138,37 @@ def test_describe_grammar_lists_known_verbs() -> None:
         assert spec.name in text
 
 
+# ---- pickup verb (Step 6g part 2) -----------------------------------------
+
+
+def test_parse_pickup_with_angle_brackets() -> None:
+    cmd = parse_principal_command("pickup <abc123@example.com>")
+    assert cmd.verb == "pickup"
+    assert cmd.tier == 1
+    assert cmd.args == {"message_id": "<abc123@example.com>"}
+
+
+def test_parse_pickup_without_angle_brackets() -> None:
+    """The parser is tolerant of bare email-address-shaped IDs; the
+    handler normalises them to angle-bracket form before lookup."""
+    cmd = parse_principal_command("pickup abc123@example.com")
+    assert cmd.verb == "pickup"
+    assert cmd.args == {"message_id": "abc123@example.com"}
+
+
+def test_parse_pickup_no_arg_falls_through_to_free_form() -> None:
+    """Bare `pickup` with no message-id is not a valid invocation."""
+    cmd = parse_principal_command("pickup")
+    assert cmd.verb is None
+    assert cmd.is_free_form is True
+
+
+def test_parse_pickup_with_leading_code() -> None:
+    cmd = parse_principal_command("[123456] pickup <a@b>")
+    assert cmd.verb == "pickup"
+    assert cmd.args == {"message_id": "<a@b>"}
+
+
 # ---- Tier 2/4 verb parsing (Build Step 4b) --------------------------------
 
 

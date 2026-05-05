@@ -39,6 +39,7 @@ from . import (
     principal_commands,
     principal_handlers,
     principal_interpret,
+    status_report,
     triage,
 )
 from .config import InboxConfig, Config
@@ -787,7 +788,7 @@ class InboxWatcher:
             return
 
         if cmd.tier == 1:
-            self._send_tier1_reply(
+            await self._send_tier1_reply(
                 message_id=message_id, command=cmd, from_addr=from_addr
             )
             return
@@ -803,10 +804,29 @@ class InboxWatcher:
             message_id=message_id, command=cmd, from_addr=from_addr
         )
 
-    def _send_tier1_reply(
+    async def _send_tier1_reply(
         self, *, message_id: str, command, from_addr: str
     ) -> None:
-        """Run a tier-1 handler and email the reply to the principal."""
+        """Run a tier-1 handler and email the reply to the principal.
+
+        The `status` verb (Step 6g) is special-cased here because its
+        report includes an IMAP walk per inbox. The walk requires a
+        fresh IMAP connection (the running IDLE client is busy in
+        IDLE state and cannot fetch). All other tier-1 verbs go
+        through the synchronous principal_handlers.dispatch path
+        unchanged.
+        """
+        if command.verb == "status":
+            await self._dispatch_status(
+                message_id=message_id, from_addr=from_addr,
+            )
+            return
+        if command.verb == "pickup":
+            await self._dispatch_pickup(
+                message_id=message_id, from_addr=from_addr,
+                args=command.args,
+            )
+            return
         result = principal_handlers.dispatch(
             command=command, config=self.config, state=self.state
         )
@@ -829,6 +849,281 @@ class InboxWatcher:
             event_name="principal_tier1_dispatched",
             detail=f"verb={command.verb}",
         )
+
+    async def _dispatch_status(
+        self, *, message_id: str, from_addr: str,
+    ) -> None:
+        """Build and email the structured status report.
+
+        Builds the StatusReport from state-db queries plus per-inbox
+        IMAP walks (one transient connection per enabled inbox). The
+        walks run sequentially; for one inbox this is the common case,
+        for many it could be parallelised later.
+        """
+        async def _walker(inbox_name: str, walk_count: int):
+            inbox_cfg = self.config.inboxes.get(inbox_name)
+            if inbox_cfg is None:
+                return status_report.InboxWalkResult(
+                    inbox=inbox_name, walked_count=0,
+                    headers=(), error="no such inbox",
+                )
+            return await walk_inbox_for_status(
+                inbox_cfg=inbox_cfg, walk_count=walk_count,
+            )
+
+        try:
+            report = await status_report.build_status_report(
+                state=self.state, config=self.config,
+                walker=_walker,
+            )
+        except Exception as e:
+            self.logger.event(
+                "status_report_build_failed",
+                level="error",
+                inbox=self.inbox.name,
+                error=type(e).__name__, message=str(e),
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: status report failed",
+                body=(
+                    f"Status report build raised {type(e).__name__}: {e}\n"
+                    "The daemon is still running; this is just the report\n"
+                    "builder erroring. Re-issue or check the daemon log.\n"
+                ),
+                next_state="EXECUTION_FAILED",
+                event_name="principal_status_failed",
+                detail=type(e).__name__,
+            )
+            return
+
+        body = status_report.render_status_report(report)
+        self.logger.event(
+            "principal_status_dispatched",
+            inbox=self.inbox.name, message_id=message_id,
+            awaiting=len(report.awaiting),
+            expiring=len(report.expiring),
+            in_flight=len(report.in_flight),
+            out_of_band_total=sum(len(v) for v in report.out_of_band.values()),
+        )
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject="Nightjar: status",
+            body=body,
+            next_state="RESPONDED",
+            event_name="principal_status_replied",
+            detail=f"oob={sum(len(v) for v in report.out_of_band.values())}",
+        )
+
+    async def _dispatch_pickup(
+        self, *, message_id: str, from_addr: str, args: dict,
+    ) -> None:
+        """Re-triage a single message named by Message-ID.
+
+        `pickup` opens a fresh IMAP connection, finds the message by
+        Message-ID via `UID SEARCH HEADER Message-ID "<id>"`, fetches
+        its body, removes any prior state-db row (so triage starts
+        clean), and routes through the same triage-and-queue path the
+        IDLE-driven flow uses.
+
+        Tier 1 (auto-execute on principal authentication). The triage
+        call itself spends Claude tokens, so the cost-cap rules from
+        Step 6f apply via the principal-interpret cost backstop infra.
+        Failures email the principal explaining why pickup couldn't
+        complete; they don't crash the watcher or alter state-db.
+        """
+        target_message_id = args.get("message_id", "").strip()
+        # Strip optional surrounding angle brackets — operators copy
+        # Message-IDs both ways and we're tolerant of either form.
+        if target_message_id.startswith("<") and target_message_id.endswith(">"):
+            normalised = target_message_id
+        elif target_message_id:
+            normalised = f"<{target_message_id}>"
+        else:
+            normalised = ""
+        if not normalised or "@" not in normalised:
+            self._send_deterministic_reply(
+                message_id=message_id, from_addr=from_addr,
+                subject="Nightjar: pickup needs a Message-ID",
+                body=(
+                    "The pickup verb needs a Message-ID argument that\n"
+                    "looks like an email address in angle brackets:\n"
+                    "    [<code>] pickup <abc123@mail.example>\n"
+                    "\n"
+                    "(Got: " + (target_message_id or "(empty)") + ")\n"
+                ),
+                next_state="EXECUTION_FAILED",
+                event_name="principal_pickup_bad_arg",
+                detail=target_message_id[:80],
+            )
+            return
+
+        # Walk all enabled inboxes looking for the target. Common case
+        # is one inbox; for multi-inbox setups we stop at the first hit.
+        located: tuple[str, str] | None = None  # (inbox_name, uid)
+        errors: list[str] = []
+        for inbox_name, inbox_cfg in self.config.inboxes.items():
+            if not inbox_cfg.enabled:
+                continue
+            uid_or_err = await _imap_find_by_message_id(
+                inbox_cfg=inbox_cfg, target_message_id=normalised,
+            )
+            if isinstance(uid_or_err, str) and uid_or_err.startswith("err:"):
+                errors.append(f"{inbox_name}: {uid_or_err[4:]}")
+                continue
+            if uid_or_err is not None:
+                located = (inbox_name, uid_or_err)
+                break
+
+        if located is None:
+            self.logger.event(
+                "principal_pickup_not_found",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                target_message_id=normalised,
+                errors=errors,
+            )
+            self._send_deterministic_reply(
+                message_id=message_id, from_addr=from_addr,
+                subject="Nightjar: pickup target not found",
+                body=(
+                    f"Could not locate a message with Message-ID:\n"
+                    f"  {normalised}\n"
+                    f"\n"
+                    f"Inboxes searched: "
+                    f"{', '.join(self.config.inboxes.keys()) or '(none)'}\n"
+                    + (
+                        f"\nIMAP errors: {'; '.join(errors)}\n"
+                        if errors else ""
+                    ) +
+                    f"\nIf the message is in Spam, the next step is\n"
+                    f"the audit command (when it lands) — pickup only\n"
+                    f"walks INBOX.\n"
+                ),
+                next_state="EXECUTION_FAILED",
+                event_name="principal_pickup_not_found_replied",
+                detail=normalised[:80],
+            )
+            return
+
+        target_inbox_name, target_uid = located
+        # Discard any prior state-db row so triage runs from scratch.
+        # The state-db has no native delete-row API; we just expose the
+        # message_id to triage and let the existing record-or-skip
+        # logic re-record it on the path through. To force a clean
+        # re-pickup we drop the existing row first.
+        if self.state.message_exists(normalised):
+            with self.state._connect() as conn:
+                conn.execute(
+                    "DELETE FROM messages WHERE id = ?", (normalised,)
+                )
+                conn.execute(
+                    "DELETE FROM transitions WHERE message_id = ?",
+                    (normalised,)
+                )
+            self.logger.event(
+                "principal_pickup_cleared_prior_row",
+                inbox=self.inbox.name, message_id=message_id,
+                target_message_id=normalised,
+            )
+
+        # Confirmation reply — pickup queued. Triage runs synchronously
+        # below; we email the result separately if it produces a plan,
+        # the same way the IDLE flow does.
+        self.logger.event(
+            "principal_pickup_dispatched",
+            inbox=self.inbox.name, message_id=message_id,
+            target_message_id=normalised,
+            target_inbox=target_inbox_name, target_uid=target_uid,
+        )
+        self._send_deterministic_reply(
+            message_id=message_id, from_addr=from_addr,
+            subject="Nightjar: pickup queued",
+            body=(
+                f"Picking up {normalised} from inbox '{target_inbox_name}'\n"
+                f"(IMAP UID {target_uid}). Triage will run now; you'll\n"
+                f"receive an approval ping or a 'no action needed' reply\n"
+                f"once it completes.\n"
+            ),
+            next_state="RESPONDED",
+            event_name="principal_pickup_queued",
+            detail=normalised[:80],
+        )
+
+        # Now run triage by opening another fresh IMAP, fetching the
+        # full message body via UID, and feeding it through the
+        # existing _handle_contact_triage pipeline. This re-uses all
+        # the existing routing including the principal-not-self-triage
+        # guard, so even if the caller sneaks the principal's own
+        # Message-ID, the triage path will skip it.
+        await self._run_pickup_triage(
+            target_message_id=normalised,
+            target_inbox_name=target_inbox_name,
+            target_uid=target_uid,
+        )
+
+    async def _run_pickup_triage(
+        self, *, target_message_id: str,
+        target_inbox_name: str, target_uid: str,
+    ) -> None:
+        """Open a fresh IMAP connection to the target inbox, fetch the
+        full message, and route it through the same record-and-triage
+        path the IDLE flow uses."""
+        target_cfg = self.config.inboxes[target_inbox_name]
+        client = aioimaplib.IMAP4_SSL(
+            host=target_cfg.imap_host, port=target_cfg.imap_port,
+        )
+        try:
+            await client.wait_hello_from_server()
+            login_response = await client.login(
+                target_cfg.imap_user, target_cfg.imap_password,
+            )
+            if login_response.result != "OK":
+                self.logger.event(
+                    "principal_pickup_login_failed",
+                    level="warn",
+                    inbox=self.inbox.name,
+                    target_inbox=target_inbox_name,
+                    target_message_id=target_message_id,
+                )
+                return
+            select_response = await client.select("INBOX")
+            if select_response.result != "OK":
+                self.logger.event(
+                    "principal_pickup_select_failed",
+                    level="warn",
+                    inbox=self.inbox.name,
+                    target_inbox=target_inbox_name,
+                    target_message_id=target_message_id,
+                )
+                return
+            # Reuse _fetch_and_record on a temporary watcher view of
+            # the target inbox. The current InboxWatcher instance may
+            # be running for a DIFFERENT inbox than the target; we
+            # need the routing to reflect target_inbox_name. To avoid
+            # constructing a whole new InboxWatcher with all its
+            # state, we monkey-patch self.inbox temporarily for the
+            # duration of the call and revert afterwards.
+            original_inbox = self.inbox
+            try:
+                self.inbox = target_cfg
+                await self._fetch_and_record(client, target_uid)
+            finally:
+                self.inbox = original_inbox
+        except Exception as e:
+            self.logger.event(
+                "principal_pickup_triage_failed",
+                level="error",
+                inbox=self.inbox.name,
+                target_inbox=target_inbox_name,
+                target_message_id=target_message_id,
+                error=type(e).__name__, message=str(e),
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.logout()
 
     def _queue_tier2_plus(
         self, *, message_id: str, command, from_addr: str
@@ -1320,7 +1615,7 @@ class InboxWatcher:
                 input_tokens=outcome.raw_input_tokens,
                 output_tokens=outcome.raw_output_tokens,
             )
-            self._dispatch_interpreted_tier1(
+            await self._dispatch_interpreted_tier1(
                 message_id=message_id, from_addr=from_addr,
                 outcome=outcome,
                 cost_verdict=cost_verdict if is_overage else None,
@@ -1388,7 +1683,7 @@ class InboxWatcher:
             tier2_3_names=tuple(tier23),
         )
 
-    def _dispatch_interpreted_tier1(
+    async def _dispatch_interpreted_tier1(
         self, *, message_id: str, from_addr: str,
         outcome: DeterministicDispatch,
         cost_verdict: "cost_guard.CostVerdict | None" = None,
@@ -1397,7 +1692,19 @@ class InboxWatcher:
         result, transition to RESPONDED. The synthetic ParsedCommand
         carries the LLM-chosen verb and args; principal_handlers.dispatch
         runs the same handler the user typing the verb directly would
-        hit."""
+        hit. The `status` verb routes through the async status-report
+        path because it needs a fresh IMAP walk per inbox."""
+        if outcome.verb == "status":
+            await self._dispatch_status(
+                message_id=message_id, from_addr=from_addr,
+            )
+            return
+        if outcome.verb == "pickup":
+            await self._dispatch_pickup(
+                message_id=message_id, from_addr=from_addr,
+                args=dict(outcome.args),
+            )
+            return
         spec = next(
             (s for s in principal_commands.VERB_REGISTRY if s.name == outcome.verb),
             None,
@@ -2536,3 +2843,162 @@ class InboxWatcher:
             truncated = True
 
         return text, truncated
+
+
+# ---- Status-report walker (Step 6g) ---------------------------------------
+#
+# Free function that opens a transient IMAP connection, fetches headers
+# for the last N UIDs, and returns the parsed metadata. Decoupled from
+# the InboxWatcher class so the status report doesn't have to coordinate
+# with the running IDLE loop — the IDLE-active client is busy waiting
+# for pushes and can't fetch without breaking IDLE. A fresh connection
+# adds ~200ms of setup, well below the 2-4s walk cost itself.
+
+async def walk_inbox_for_status(
+    *, inbox_cfg: InboxConfig, walk_count: int,
+) -> "status_report.InboxWalkResult":
+    """Open a fresh IMAP connection to the inbox, fetch headers for
+    the last `walk_count` UIDs, parse Message-ID/From/Subject/Date.
+
+    Returns a status_report.InboxWalkResult. On any IMAP error the
+    `error` field is set and `headers` is empty; the status-report
+    builder treats that as "no out-of-band data for this inbox" and
+    moves on rather than failing the whole report.
+    """
+    import datetime as _dt
+
+    client = aioimaplib.IMAP4_SSL(host=inbox_cfg.imap_host, port=inbox_cfg.imap_port)
+    headers: list[dict[str, Any]] = []
+    walked = 0
+    err: str | None = None
+    try:
+        await client.wait_hello_from_server()
+        login_response = await client.login(inbox_cfg.imap_user, inbox_cfg.imap_password)
+        if login_response.result != "OK":
+            return status_report.InboxWalkResult(
+                inbox=inbox_cfg.name, walked_count=0,
+                headers=(), error=f"login: {login_response.result}",
+            )
+        select_response = await client.select("INBOX")
+        if select_response.result != "OK":
+            return status_report.InboxWalkResult(
+                inbox=inbox_cfg.name, walked_count=0,
+                headers=(), error=f"select: {select_response.result}",
+            )
+
+        result, data = await client.uid_search("ALL")
+        if result != "OK" or not data or not data[0]:
+            return status_report.InboxWalkResult(
+                inbox=inbox_cfg.name, walked_count=0,
+                headers=(), error=None,
+            )
+        uids = data[0].split()
+        if not uids:
+            return status_report.InboxWalkResult(
+                inbox=inbox_cfg.name, walked_count=0,
+                headers=(), error=None,
+            )
+        uids_to_walk = uids[-int(walk_count):]
+        for uid_bytes in uids_to_walk:
+            uid = uid_bytes.decode("ascii")
+            walked += 1
+            try:
+                fr, fdata = await client.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+            except Exception as e:
+                # Per-UID fetch failure should not abort the whole walk.
+                continue
+            if fr != "OK" or not fdata:
+                continue
+            blob = InboxWatcher._extract_literal(fdata)
+            if blob is None:
+                continue
+            msg = email.message_from_bytes(blob)
+            message_id = (msg.get("Message-ID") or "").strip()
+            if not message_id:
+                # Mirror the watcher's synthetic-id convention so dedup
+                # against state-db works for messages that have already
+                # been recorded with a synthetic id.
+                message_id = f"<no-msgid-{inbox_cfg.name}-uid{uid}>"
+            from_header = msg.get("From", "")
+            _, from_addr = email.utils.parseaddr(from_header)
+            subject = InboxWatcher._decode_header(msg.get("Subject"))
+            date_header = msg.get("Date") or ""
+            try:
+                received_at = int(
+                    email.utils.parsedate_to_datetime(date_header).timestamp()
+                )
+            except (TypeError, ValueError, OverflowError):
+                received_at = 0
+            headers.append({
+                "uid": uid,
+                "message_id": message_id,
+                "from_addr": from_addr or "",
+                "subject": subject or "",
+                "received_at": received_at,
+            })
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    finally:
+        with contextlib.suppress(Exception):
+            await client.logout()
+
+    return status_report.InboxWalkResult(
+        inbox=inbox_cfg.name,
+        walked_count=walked,
+        headers=tuple(headers),
+        error=err,
+    )
+
+
+# ---- Pickup helper (Step 6g part 2) ---------------------------------------
+
+
+async def _imap_find_by_message_id(
+    *, inbox_cfg: InboxConfig, target_message_id: str,
+) -> str | None:
+    """Look up the IMAP UID of the message with `target_message_id`
+    in the named inbox. Returns the UID as a string, or None if no
+    match. On IMAP error returns "err:<reason>" so the caller can log
+    it without confusing 'not found' with 'lookup failed'.
+
+    Uses `UID SEARCH HEADER Message-ID "<id>"`. Gmail supports this
+    even though it's not in core IMAP4rev1 — it's an X-EXTENSION
+    accepted by all major IMAP servers.
+    """
+    client = aioimaplib.IMAP4_SSL(
+        host=inbox_cfg.imap_host, port=inbox_cfg.imap_port,
+    )
+    try:
+        await client.wait_hello_from_server()
+        login_response = await client.login(
+            inbox_cfg.imap_user, inbox_cfg.imap_password,
+        )
+        if login_response.result != "OK":
+            return f"err:login {login_response.result}"
+        select_response = await client.select("INBOX")
+        if select_response.result != "OK":
+            return f"err:select {select_response.result}"
+        # IMAP search syntax: HEADER Message-ID "<value>". The value
+        # is a string literal so we don't need the angle brackets to
+        # be inside extra quotes — but we DO need to escape any
+        # internal quotes. Message-IDs don't normally contain quotes;
+        # we strip defensively.
+        safe = target_message_id.replace('"', '')
+        result, data = await client.uid_search(
+            f'HEADER Message-ID "{safe}"'
+        )
+        if result != "OK":
+            return f"err:search {result}"
+        if not data or not data[0]:
+            return None
+        uids = data[0].split()
+        if not uids:
+            return None
+        # If multiple match (rare — Message-ID should be unique), take
+        # the most recent UID.
+        return uids[-1].decode("ascii")
+    except Exception as e:
+        return f"err:{type(e).__name__}:{e}"
+    finally:
+        with contextlib.suppress(Exception):
+            await client.logout()

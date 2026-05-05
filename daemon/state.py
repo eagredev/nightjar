@@ -912,3 +912,128 @@ class State:
                 (int(since_ts),),
             ).fetchone()
             return int(row["n"]) if row is not None else 0
+
+    # --- Status-report accessors (Step 6g) ---------------------------------
+
+    def in_flight_messages(
+        self,
+        *,
+        states: tuple[str, ...] = (
+            "RECEIVED", "TRIAGE_FAILED", "TRIAGED",
+            "INTERPRET_FAILED", "INTERPRET_SKIPPED",
+        ),
+        older_than_seconds: int | None = None,
+        now: int | None = None,
+    ) -> list[dict]:
+        """Return mid-pipeline messages: ones the daemon has acknowledged
+        but that haven't reached approval / responded / executed yet.
+
+        Steady state should be empty. Non-empty means triage stalled,
+        the daemon hit an error, or something is wedged. The status
+        report uses this to surface stuck mail.
+
+        `older_than_seconds` filters to messages whose `updated_at`
+        is at least that old. Used to avoid flagging brand-new mail
+        that's just mid-flight normally; passing 600 (10 min) is the
+        usual call from the status report.
+        """
+        now = now if now is not None else int(time.time())
+        placeholders = ",".join("?" for _ in states)
+        params: list = list(states)
+        sql = (
+            f"SELECT id, inbox, contact_id, from_addr, subject, "
+            f"       received_at, state, updated_at "
+            f"FROM messages "
+            f"WHERE state IN ({placeholders})"
+        )
+        if older_than_seconds is not None:
+            sql += " AND updated_at <= ?"
+            params.append(now - int(older_than_seconds))
+        sql += " ORDER BY updated_at ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def expiring_approvals(
+        self,
+        *,
+        within_seconds: int,
+        now: int | None = None,
+    ) -> list[dict]:
+        """Pending approvals whose expires_at falls inside the next
+        `within_seconds` window. The status report calls this with
+        24 * 3600 to surface tickets about to vanish.
+
+        Already-expired rows are excluded (those flip to EXPIRED via
+        expire_approvals). Sort: soonest-expiring first."""
+        now = now if now is not None else int(time.time())
+        upper_bound = now + int(within_seconds)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT token, message_id, verb, args_json, tier, "
+                "       created_at, expires_at "
+                "FROM approvals "
+                "WHERE state = 'PENDING' "
+                "  AND expires_at > ? AND expires_at <= ? "
+                "ORDER BY expires_at ASC",
+                (now, upper_bound),
+            ).fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                d["args"] = json.loads(d["args_json"])
+                out.append(d)
+            return out
+
+    def list_message_ids_in_db(
+        self, *, inbox: str | None = None,
+    ) -> set[str]:
+        """Return all Message-IDs the daemon has on file. Used by the
+        status report's IMAP walk to find out-of-band mail (in IMAP
+        but not in messages table). `inbox` filters to one inbox if
+        the caller wants per-inbox dedup."""
+        with self._connect() as conn:
+            if inbox is not None:
+                rows = conn.execute(
+                    "SELECT id FROM messages WHERE inbox = ?",
+                    (inbox,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT id FROM messages").fetchall()
+            return {row["id"] for row in rows}
+
+    def first_message_received_at(self) -> int | None:
+        """Earliest received_at across the messages table, or None if
+        empty. Used to identify 'beyond daemon's lifetime' messages
+        in the out-of-band section."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(received_at) AS first_ts FROM messages"
+            ).fetchone()
+            if row is None or row["first_ts"] is None:
+                return None
+            return int(row["first_ts"])
+
+    def last_successful_claude_invocation_at(self) -> int | None:
+        """Most recent ok=1 row in claude_invocations. None if no
+        successful call ever. Used in the daemon-health block."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts) AS last_ts FROM claude_invocations "
+                "WHERE ok = 1"
+            ).fetchone()
+            if row is None or row["last_ts"] is None:
+                return None
+            return int(row["last_ts"])
+
+    def last_outbound_sent_at(self) -> int | None:
+        """Most recent ok=1 row in outbound_log. None if nothing sent
+        yet. Health-block input."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts) AS last_ts FROM outbound_log "
+                "WHERE ok = 1"
+            ).fetchone()
+            if row is None or row["last_ts"] is None:
+                return None
+            return int(row["last_ts"])
