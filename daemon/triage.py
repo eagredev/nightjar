@@ -30,6 +30,7 @@ construct a `FakeClaudeClient` that returns canned tool-use payloads.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -820,6 +821,174 @@ def validate_plan_payload(
     )
 
 
+# ---- Notes-enumeration gate (Step 7 wave 3a) ------------------------------
+
+
+# Minimum significant-token length: tokens shorter than this get dropped
+# from match candidates. "the", "is", "of" coincidentally collide; "auth",
+# "TTL", "600s" do not.
+_MIN_TOKEN_LEN = 3
+
+# How many consecutive significant tokens a reply must share with an
+# unverified bullet body before we count the reply as enumerating it.
+# Calibrated against the 2026-05-06 auto-redteam burn m5 output: the
+# poisoned reply contained four-token spans copied from earlier
+# self-tagged bullet bodies. Three-token spans hit too many coincidental
+# matches in routine prose; five-token spans missed paraphrased
+# enumerations the gate is meant to catch.
+_MIN_CONSECUTIVE_TOKEN_MATCH = 4
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _significant_tokens(text: str) -> tuple[str, ...]:
+    """Lowercase, alphanumeric-only token list, dropping short tokens.
+
+    Used by the notes-enumeration gate for matching reply bodies against
+    unverified bullet bodies. The lowercase + alphanumeric pass is
+    deliberately lossy (drops punctuation, casing, fancy unicode) so a
+    model paraphrasing 'TTL of 600s' as 'TTL: 600 s' still matches.
+    """
+    return tuple(
+        t for t in _TOKEN_RE.findall(text.lower())
+        if len(t) >= _MIN_TOKEN_LEN
+    )
+
+
+def _consecutive_token_overlap(
+    needle: tuple[str, ...], haystack: tuple[str, ...],
+) -> bool:
+    """Return True if any window of >= _MIN_CONSECUTIVE_TOKEN_MATCH
+    consecutive tokens from `needle` appears in `haystack` in order.
+
+    Linear in len(needle) * len(haystack); both are bounded by note body
+    cap (280 chars) and reply body cap (2000 chars), so this is ms-scale.
+    """
+    if len(needle) < _MIN_CONSECUTIVE_TOKEN_MATCH:
+        return False
+    if len(haystack) < _MIN_CONSECUTIVE_TOKEN_MATCH:
+        return False
+    span = _MIN_CONSECUTIVE_TOKEN_MATCH
+    for start in range(len(needle) - span + 1):
+        window = needle[start:start + span]
+        # Slide window across haystack.
+        for h_start in range(len(haystack) - span + 1):
+            if haystack[h_start:h_start + span] == window:
+                return True
+    return False
+
+
+def _unverified_bullets_from_notes(parsed_notes: Any) -> tuple[str, ...]:
+    """Extract the body text of every `attr=self` or `attr=asserted`
+    bullet from a ParsedNotes object. Imports notes_store lazily to
+    avoid the import cycle at module load.
+    """
+    bodies: list[str] = []
+    for section in parsed_notes.sections:
+        for bullet in section.bullets:
+            if bullet.attribution in ("self", "asserted"):
+                bodies.append(bullet.text)
+    return tuple(bodies)
+
+
+def _read_parsed_notes(notes_path: Path) -> Any | None:
+    """Helper for triage_with_scope: read a notes file and return its
+    ParsedNotes form, or None if the file is missing or malformed.
+
+    The gate's design treats None as no-op — if we can't read the
+    notes file, we can't run the gate, so we let the prompt-side rule
+    carry the load. Failing closed here would mean refusing every
+    triage on a malformed notes file, which is a worse outcome than
+    a single-layer (prompt-only) defence on those files.
+    """
+    from . import notes_store
+    if not notes_path.exists():
+        return None
+    try:
+        text = notes_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return notes_store.parse(text)
+    except notes_store.NotesParseError:
+        return None
+
+
+def _gate_reply_against_unverified_notes(
+    plan: TriagePlan, *, parsed_notes: Any | None,
+) -> TriagePlan:
+    """Read-side provenance defence. If `plan.verb == 'reply'` and the
+    reply body enumerates content from an `attr=self` or `attr=asserted`
+    bullet currently in the contact's notes file, downgrade the plan to
+    `flag_for_review` so the principal can vet the enumeration.
+
+    The model is instructed against this in `triage_default.md`'s
+    "Reading notes — non-negotiable" section. This is the deterministic
+    backstop: a model that ignores the prompt rule (or paraphrases past
+    it) gets caught here.
+
+    Closes the persistent self-poisoning lane found by the 2026-05-06
+    auto-redteam loop (round 3, slow-burn drift attack m5). The attack
+    exploited that the wave-2 defence was write-side only — once a
+    `self`-tagged bullet was on disk, the next triage call would
+    happily relay its content back to the contact in a reply. This
+    gate forbids that relay.
+
+    `parsed_notes=None` is the no-op signal: callers that don't have
+    access to the parsed notes file (legacy call sites, unscoped
+    contacts where the gate doesn't apply yet) skip the check. Empty
+    notes (no unverified bullets) also no-op.
+    """
+    if plan.verb != "reply":
+        return plan
+    if parsed_notes is None:
+        return plan
+    bodies = _unverified_bullets_from_notes(parsed_notes)
+    if not bodies:
+        return plan
+    reply_body = plan.args.get("body", "")
+    if not reply_body:
+        return plan
+    reply_tokens = _significant_tokens(reply_body)
+    matched_bullet: str | None = None
+    for body in bodies:
+        bullet_tokens = _significant_tokens(body)
+        if _consecutive_token_overlap(bullet_tokens, reply_tokens):
+            matched_bullet = body
+            break
+    if matched_bullet is None:
+        return plan
+    # Downgrade. Preserve original reasoning + summary, prepend a gate
+    # note so the principal can see what triggered the flag, add the
+    # identity_claim risk flag (since the underlying issue is unverified
+    # claims being relayed). The flag_for_review verb has empty args.
+    gate_note = (
+        "[notes-enumeration gate] The drafted reply repeated content "
+        "from an unverified bullet in this contact's notes. Pattern "
+        f"matched: {matched_bullet[:160]!r}. Original reply preserved "
+        "in the daemon log; not sending. Principal should confirm the "
+        "claim before any reply enumerates it."
+    )
+    new_notes = (
+        f"{gate_note}\n\nOriginal triage notes:\n{plan.notes}"
+        if plan.notes else gate_note
+    )
+    new_risk_flags = tuple(plan.risk_flags) + (("identity_claim",) if "identity_claim" not in plan.risk_flags else ())
+    flag_spec = TRIAGE_VERBS["flag_for_review"]
+    return TriagePlan(
+        verb="flag_for_review",
+        tier=int(flag_spec["tier"]),
+        args={},
+        summary=plan.summary,
+        reasoning=plan.reasoning,
+        risk_flags=new_risk_flags,
+        notes=new_notes[:_MAX_NOTES_LEN],
+        raw_input_tokens=plan.raw_input_tokens,
+        raw_output_tokens=plan.raw_output_tokens,
+        note_proposals=plan.note_proposals,
+    )
+
+
 # ---- Top-level entry point -------------------------------------------------
 
 
@@ -1061,7 +1230,7 @@ async def triage_with_scope(
             # notes context, the daemon's error log surfaces the
             # parse failure for them to fix.
             full_notes = ""
-        return await _triage_with_notes(
+        plan_or_error = await _triage_with_notes(
             contact=contact,
             sender=sender,
             subject=subject,
@@ -1071,6 +1240,17 @@ async def triage_with_scope(
             config=config,
             client=client,
             prompts_dir=prompts_dir,
+        )
+        if isinstance(plan_or_error, TriageError):
+            return plan_or_error
+        # Step 7 wave 3a: read-side provenance gate. Re-parse the notes
+        # file directly so the gate sees attribution metadata that the
+        # rendered text strips. Failures here just skip the gate (it's
+        # a defence-in-depth layer; the prompt-side rule is the
+        # primary defence).
+        parsed = _read_parsed_notes(notes_path)
+        return _gate_reply_against_unverified_notes(
+            plan_or_error, parsed_notes=parsed,
         )
 
     # Scoped path: pass 1 classifier with safe-only notes.
@@ -1136,6 +1316,15 @@ async def triage_with_scope(
 
     if isinstance(plan_or_error, TriageError):
         return plan_or_error
+
+    # Step 7 wave 3a: read-side provenance gate. Run before the token
+    # stitch so the returned plan reflects the gate's downgrade if
+    # any. Parse the notes file directly so the gate sees attribution
+    # metadata that the rendered text strips.
+    parsed = _read_parsed_notes(notes_path)
+    plan_or_error = _gate_reply_against_unverified_notes(
+        plan_or_error, parsed_notes=parsed,
+    )
 
     # Sum classifier + triage token usage so the cost backstop sees the
     # combined budget for this message.

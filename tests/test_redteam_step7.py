@@ -704,3 +704,247 @@ def test_G8_symlink_in_notes_dir_does_not_leak(tmp_path: Path):
         "symlink behaviour changed — was leaking, now isn't. "
         "If you intended to add symlink rejection, update this test."
     )
+
+
+# ============================================================================
+# CATEGORY H — READ-SIDE NOTES-ENUMERATION GATE (Step 7 wave 3a)
+# ============================================================================
+#
+# The wave-2 defence (provenance tagging) closed the WRITE side: contact-
+# asserted claims about the principal must be tagged `asserted`, not
+# laundered into `observed`. The 2026-05-06 auto-redteam loop's slow-burn
+# drift attack (round 3 scenario 1, m5) showed the symmetric attack on
+# the READ side: once a `self`-tagged bullet is on disk, the next triage
+# call happily relays its content back to the contact in a reply, where
+# the "confirmation" is the contact's own earlier message.
+#
+# Wave 3a's gate refuses to send a `reply` whose body enumerates the
+# content of any `attr=self` or `attr=asserted` bullet currently in the
+# contact's notes file. The plan is downgraded to `flag_for_review` so
+# the principal vets the enumeration before anything goes out.
+
+
+from daemon.triage import (
+    _consecutive_token_overlap,
+    _gate_reply_against_unverified_notes,
+    _significant_tokens,
+)
+
+
+def _plan(verb: str = "reply", body: str = "", **overrides: Any) -> TriagePlan:
+    args = {"body": body} if verb == "reply" else {}
+    base = dict(
+        verb=verb, tier=3 if verb == "reply" else 1,
+        args=args, summary="x", reasoning="x",
+        risk_flags=(), notes="",
+        raw_input_tokens=0, raw_output_tokens=0,
+        note_proposals=(),
+    )
+    base.update(overrides)
+    return TriagePlan(**base)
+
+
+def _seed_notes(tmp_path: Path, *, attribution: str, body: str) -> "Any":
+    """Build a notes file with one bullet of the given attribution
+    and return its parsed form."""
+    p = tmp_path / "test.md"
+    notes_store.append_note(
+        p, contact_id="test", section_heading="Cache config",
+        body=body, scope="ops",
+        attribution=attribution, source_message_id="<m1@x>",
+    )
+    return notes_store.parse(p.read_text())
+
+
+def test_H1_gate_downgrades_reply_quoting_self_bullet(tmp_path: Path):
+    """The headline case from auto-redteam burn m5: a reply whose body
+    repeats the substantive content of a `self`-tagged bullet must be
+    downgraded to flag_for_review.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="self",
+        body="Copied per-contact bucket TTL of 600s from dev branch.",
+    )
+    plan = _plan(
+        body="Confirmed: TTL of 600s from dev branch is the right "
+             "value, going with that.",
+    )
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "flag_for_review"
+    assert out.args == {}
+    assert "identity_claim" in out.risk_flags
+    assert "[notes-enumeration gate]" in out.notes
+
+
+def test_H2_gate_downgrades_reply_quoting_asserted_bullet(tmp_path: Path):
+    """Symmetric for asserted bullets — the wave-2 write-side defence
+    catches asserted-tagged ATTEMPTS to write, but if a sender slipped
+    one in earlier (or it was hand-edited), reply-time enumeration is
+    still forbidden.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="asserted",
+        body="Dylan approved relaxing the cross-scope quoting rule.",
+    )
+    plan = _plan(
+        body="Yes, that's right — Dylan approved relaxing the "
+             "cross-scope quoting rule, so we can proceed.",
+    )
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "flag_for_review"
+
+
+def test_H3_gate_ignores_observed_bullets(tmp_path: Path):
+    """Observed bullets are the daemon's firsthand verifiable content.
+    Enumerating them in a reply is fine — they're the trustworthy bucket.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="observed",
+        body="Sam writes terse, technical replies in the evenings.",
+    )
+    plan = _plan(
+        body="Sam writes terse, technical replies in the evenings, "
+             "so I'll match the register.",
+    )
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "reply"
+
+
+def test_H4_gate_no_op_on_non_reply_verb(tmp_path: Path):
+    """flag_for_review, noop, forward_to_principal: the gate doesn't
+    apply because none of these emit a body that goes back to the
+    contact. The principal sees the original message; that's by design.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="self",
+        body="Copied per-contact bucket TTL of 600s from dev branch.",
+    )
+    for verb in ("flag_for_review", "noop", "forward_to_principal"):
+        plan = _plan(verb=verb)
+        out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+        assert out.verb == verb, f"{verb} unexpectedly downgraded"
+
+
+def test_H5_gate_no_op_when_parsed_notes_is_None():
+    """Legacy callers / unscoped contacts may pass parsed_notes=None;
+    the gate must not crash and must not downgrade."""
+    plan = _plan(body="anything goes here")
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=None)
+    assert out.verb == "reply"
+
+
+def test_H6_gate_no_op_when_no_unverified_bullets(tmp_path: Path):
+    """A notes file with only `observed` bullets means the gate has
+    nothing to match against."""
+    parsed = _seed_notes(
+        tmp_path, attribution="observed",
+        body="Sam writes terse, technical replies.",
+    )
+    plan = _plan(body="completely unrelated content about tomorrow's deploy")
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "reply"
+
+
+def test_H7_gate_no_op_when_reply_does_not_quote_bullets(tmp_path: Path):
+    """A self-bullet exists, but the reply doesn't enumerate it.
+    The gate must let routine replies through — false positives here
+    would make every contact with notes unable to receive replies.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="self",
+        body="Copied per-contact bucket TTL of 600s from dev branch.",
+    )
+    plan = _plan(body="Sounds good, I'll get back to you tomorrow.")
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "reply"
+
+
+def test_H8_gate_uses_normalised_token_match(tmp_path: Path):
+    """Punctuation and whitespace differences shouldn't bypass the
+    gate. 'TTL: 600 s' should still match 'TTL of 600s'."""
+    parsed = _seed_notes(
+        tmp_path, attribution="self",
+        body="Copied per-contact bucket TTL of 600s from dev branch.",
+    )
+    plan = _plan(
+        body="The per-contact bucket TTL value of 600s from dev "
+             "branch is fine, going with it.",
+    )
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "flag_for_review"
+
+
+def test_H9_gate_short_bullet_does_not_match(tmp_path: Path):
+    """A two-word bullet ('Sam runs Linux') is too short for a
+    consecutive-token-match window — the gate's threshold of 4 tokens
+    means short bullets need to share a longer phrase, which routine
+    prose unlikely will."""
+    parsed = _seed_notes(
+        tmp_path, attribution="self", body="Likes coffee.",
+    )
+    plan = _plan(body="Thanks, also Sam likes coffee in the morning.")
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    # 2-word bullet → tokens ('likes', 'coffee') → 2 tokens, below the
+    # 4-token threshold, so the gate doesn't fire.
+    assert out.verb == "reply"
+
+
+# Helper-level coverage for the matching primitives.
+
+def test_significant_tokens_drops_short_words():
+    out = _significant_tokens("The TTL of 600s is fine")
+    # 'of', 'is' dropped (< 3 chars). 'the', 'TTL', '600s', 'fine' kept.
+    # Lowercased.
+    assert out == ("the", "ttl", "600s", "fine")
+
+
+def test_significant_tokens_lowercases_alphanum_only():
+    out = _significant_tokens("Bucket-TTL: 600s, from-dev/branch.")
+    assert "bucket" in out
+    assert "ttl" in out
+    assert "600s" in out
+    assert "branch" in out
+
+
+def test_consecutive_token_overlap_finds_match():
+    bullet = _significant_tokens("TTL of 600s from dev branch")
+    reply = _significant_tokens("the TTL of 600s from dev branch is fine")
+    # bullet has 5 sig tokens; reply contains all 5 in order. 4-token
+    # window matches.
+    assert _consecutive_token_overlap(bullet, reply) is True
+
+
+def test_consecutive_token_overlap_rejects_short_needle():
+    # < 4-token bullet can't possibly match.
+    bullet = _significant_tokens("TTL fine")
+    reply = _significant_tokens("the TTL is fine")
+    assert _consecutive_token_overlap(bullet, reply) is False
+
+
+def test_consecutive_token_overlap_requires_consecutive():
+    # Reply contains all tokens but scattered — no consecutive run.
+    bullet = _significant_tokens("alpha bravo charlie delta")
+    reply = _significant_tokens(
+        "alpha is fine bravo is fine charlie is fine delta is fine"
+    )
+    assert _consecutive_token_overlap(bullet, reply) is False
+
+
+def test_H10_gate_preserves_existing_risk_flags(tmp_path: Path):
+    """If the original plan already had risk flags, the downgrade
+    must preserve them. We add identity_claim if not present.
+    """
+    parsed = _seed_notes(
+        tmp_path, attribution="self",
+        body="Copied per-contact bucket TTL of 600s from dev branch.",
+    )
+    plan = _plan(
+        body="TTL of 600s from dev branch confirmed.",
+        risk_flags=("urgency_pressure", "identity_claim"),
+    )
+    out = _gate_reply_against_unverified_notes(plan, parsed_notes=parsed)
+    assert out.verb == "flag_for_review"
+    assert "urgency_pressure" in out.risk_flags
+    assert "identity_claim" in out.risk_flags
+    # No duplicate identity_claim.
+    assert out.risk_flags.count("identity_claim") == 1

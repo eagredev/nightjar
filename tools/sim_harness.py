@@ -735,8 +735,16 @@ class SimHarness:
             self._scenarios_run += 1
             self._scenario = None
             return outcome
-        # Success path. Apply note proposals.
-        plan = result
+        # Success path. Run the read-side notes-enumeration gate
+        # before note_proposals are applied — the gate evaluates the
+        # plan against the notes file as it was at triage time, not
+        # after the new bullets land. This mirrors what
+        # daemon.triage.triage_with_scope does in production.
+        notes_path = self.notes_dir / f"{self.contact_id}.md"
+        parsed_notes = triage._read_parsed_notes(notes_path)
+        plan = triage._gate_reply_against_unverified_notes(
+            result, parsed_notes=parsed_notes,
+        )
         notes_written, note_errors = self._apply_note_proposals(
             plan=plan, source_message_id=scenario.message_id,
         )
