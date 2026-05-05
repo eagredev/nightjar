@@ -305,9 +305,15 @@ def parse_principal_command(
     if not payload:
         return ParsedCommand(raw_subject=raw, is_free_form=True, payload="")
 
-    lowered = payload.lower()
+    # Match against the original-cased payload with re.IGNORECASE for
+    # verb-word matching. Pre-2026-05-06 we matched against
+    # payload.lower() which preserved verbs but silently lowercased
+    # captured args — fine for contact IDs and email local-parts in
+    # practice, but Message-IDs (per RFC 5322) can be case-sensitive,
+    # and `pickup` would lowercase a real Message-ID and fail the
+    # state-db lookup.
     for spec in VERB_REGISTRY:
-        m = re.match(spec.pattern, lowered, re.IGNORECASE)
+        m = re.match(spec.pattern, payload, re.IGNORECASE)
         if m:
             args = {k: v for k, v in m.groupdict().items() if v is not None}
             return ParsedCommand(

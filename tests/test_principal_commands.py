@@ -169,6 +169,18 @@ def test_parse_pickup_with_leading_code() -> None:
     assert cmd.args == {"message_id": "<a@b>"}
 
 
+def test_parse_pickup_preserves_message_id_case() -> None:
+    """RFC 5322 says Message-ID local-parts can be case-sensitive.
+    The parser used to match against payload.lower() which silently
+    lowercased captured args; the pickup handler then failed the
+    state-db lookup against the real (mixed-case) Message-ID.
+    Regression guard: cased Message-IDs survive parsing intact."""
+    cased = "<CAEnuMumtsksLcQcNT2oXwPWHxi@mail.gmail.com>"
+    cmd = parse_principal_command(f"pickup {cased}")
+    assert cmd.verb == "pickup"
+    assert cmd.args == {"message_id": cased}
+
+
 # ---- Tier 2/4 verb parsing (Build Step 4b) --------------------------------
 
 

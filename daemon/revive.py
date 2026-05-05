@@ -113,21 +113,50 @@ def run(config: Config | None) -> int:
         print(line)
     print()
 
+    # Pick the verification mode the daemon is configured for. The
+    # secret is shared between TOTP and HOTP — only the verification
+    # primitive changes — so HOTP-configured operators don't need a
+    # separate authenticator entry to revive. (Pre-fix, revive always
+    # called verify_totp regardless of auth_mode, which silently locked
+    # out HOTP setups: their authenticator emitted counter-based codes
+    # but revive required time-based ones.)
+    auth_mode = config.security.auth_mode
+    code_label = auth_mode.upper()
+
     # Three attempts, then give up. getpass hides the typed code, so the
     # six digits are not echoed and don't end up in scrollback.
+    matched_hotp_counter: int | None = None
     for attempt in range(1, 4):
         try:
-            code = getpass.getpass(f"Type TOTP code to revive ({attempt}/3): ").strip()
+            code = getpass.getpass(
+                f"Type {code_label} code to revive ({attempt}/3): "
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             print("nightjar: aborted, panic state unchanged.", file=sys.stderr)
             return 1
-        if auth.verify_totp(secret=config.security.totp_secret, code=code):
-            break
+        if auth_mode == "totp":
+            if auth.verify_totp(secret=config.security.totp_secret, code=code):
+                break
+        else:  # hotp
+            matched = auth.verify_hotp(
+                secret=config.security.totp_secret,
+                code=code,
+                last_counter=state.get_hotp_counter(),
+            )
+            if matched is not None:
+                matched_hotp_counter = matched
+                break
         print("  invalid code.")
     else:
         print("nightjar: too many failed attempts, panic state unchanged.", file=sys.stderr)
         return 6
+
+    # HOTP advances the counter on a successful verification so the
+    # accepted code can't be replayed. TOTP has no equivalent (time
+    # implicitly advances), so this branch only runs in HOTP mode.
+    if matched_hotp_counter is not None:
+        state.set_hotp_counter(matched_hotp_counter)
 
     state.clear_panic()
 
