@@ -1800,9 +1800,18 @@ class InboxWatcher:
         """Walk a parsed email and produce a structural fingerprint.
 
         Counts what the LLM cannot see (HTML alternative parts,
-        attachments, inline images) and the size of the raw message.
-        Used as input to triage.build_user_message so the LLM can
-        ground hidden-content suspicion in facts.
+        attachments, inline images) and the byte sizes of the
+        text/plain and text/html parts (separately, so the LLM can
+        compare them). Used as input to triage.build_user_message
+        so the LLM can ground hidden-content suspicion in facts.
+
+        We deliberately do NOT report the size of the entire raw
+        RFC822 envelope (the caller's `raw_size` parameter): MTAs
+        inject 5+ KB of headers (ARC-Seal, ARC-Message-Signature,
+        DKIM, Received chains) which have nothing to do with the
+        sender's content and would consistently make small
+        plain-text emails look "huge" and trip the hidden-content
+        sweep falsely.
 
         Classification rules:
           - HTML alternative: any `text/html` part exists, regardless
@@ -1819,12 +1828,18 @@ class InboxWatcher:
             shape). For simplicity we count all image/* parts that
             are not explicitly attachments.
         """
+        # raw_size is intentionally unused — see docstring. Kept as a
+        # parameter so the caller's contract doesn't change.
+        del raw_size
+
         from .triage import MessageStructure
 
         has_html_alternative = False
         attachment_count = 0
         attachment_names: list[str] = []
         inline_image_count = 0
+        plain_size_bytes = 0
+        html_size_bytes = 0
 
         for part in msg.walk():
             if part.is_multipart():
@@ -1835,9 +1850,22 @@ class InboxWatcher:
 
             if ctype == "text/html":
                 has_html_alternative = True
+                # get_payload(decode=True) returns the decoded bytes
+                # (after Content-Transfer-Encoding); len() of that is
+                # what the principal would see if their client
+                # rendered the HTML. None on decode failure -> 0.
+                payload = part.get_payload(decode=True)
+                html_size_bytes += len(payload) if payload else 0
                 continue
 
-            # Inline images first: an image/* part is inline unless
+            if ctype == "text/plain":
+                payload = part.get_payload(decode=True)
+                plain_size_bytes += len(payload) if payload else 0
+                # Fall through: text/plain isn't an attachment or an
+                # image, so the rest of the loop won't claim it.
+                continue
+
+            # Inline images: an image/* part is inline unless
             # explicitly marked attachment. This catches the common
             # multipart/related case where the image has a filename and
             # a Content-ID but is rendered inline rather than offered
@@ -1864,7 +1892,8 @@ class InboxWatcher:
             attachment_count=attachment_count,
             attachment_names=tuple(attachment_names),
             inline_image_count=inline_image_count,
-            total_size_bytes=raw_size,
+            plain_size_bytes=plain_size_bytes,
+            html_size_bytes=html_size_bytes,
             body_truncated_in_prompt=body_truncated,
         )
 

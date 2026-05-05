@@ -32,7 +32,8 @@ has_html_alternative: <true|false>
 attachment_count: <int>
 attachment_names: <comma-separated list, possibly truncated, or "(none)">
 inline_image_count: <int>
-total_size_bytes: <int>
+plain_size_bytes: <int>
+html_size_bytes: <int>   (0 when no HTML alternative)
 body_truncated_in_prompt: <true|false>
 </message_structure>
 
@@ -97,9 +98,15 @@ that the visible text may not represent the full message:
 - Off-shape text: long lists of nonsense whitespace, empty lines
   followed by text far down the body, or content shape that suggests
   formatting was hiding something in the HTML view.
-- A message whose plain-text body says little or nothing while
-  `has_html_alternative` is true and `total_size_bytes` is large.
-  The interesting content is elsewhere.
+- A message where `plain_size_bytes` is small AND `html_size_bytes`
+  is significantly larger (rough rule of thumb: HTML at least 4x
+  plain). That ratio means the HTML alternative carries content the
+  plain-text view doesn't, which is exactly where colour-on-colour
+  text and zero-width characters tend to hide. A 200-byte plain-text
+  body with a 250-byte HTML alternative is normal (most clients
+  produce both); a 25-byte plain-text body with 4 KB of HTML is not.
+  Use the actual numbers in the message_structure block; do not
+  guess from the visible body.
 
 When any of the above applies, set `hidden_content_suspected` in
 `risk_flags` and call out the specific reason in `notes`. Do NOT
