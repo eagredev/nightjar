@@ -27,10 +27,10 @@ from pathlib import Path
 from typing import Callable
 
 from . import config as config_module
-from . import config_writer
+from . import contacts_writer
 from . import notifier
 from .config import Config
-from .config_writer import AddRequest, ConfigWriteError
+from .contacts_writer import AddContactRequest, ContactsWriteError
 from .log import JSONLLogger
 from .state import State
 
@@ -302,23 +302,25 @@ def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path
             ),
         )
     contact_id = _derive_contact_id(email, config.contacts)
-    request = AddRequest(
+    request = AddContactRequest(
         contact_id=contact_id,
         address=email,
         display_name=contact_id.capitalize(),
         relationship="added via principal verb",
         daily_limit=3,
-        inbox_name=inbox_name,
+        inboxes=(inbox_name,),
     )
     try:
-        config_writer.add_contact(request=request, config=config, config_path=config_path)
-    except ConfigWriteError as e:
+        contact_path = contacts_writer.write_contact(
+            request=request, contacts_dir=config.daemon.contacts_dir, config=config,
+        )
+    except ContactsWriteError as e:
         return ExecutionResult(
             ok=False,
             summary=f"add: write failed",
             body=f"Could not add contact: {e}\n",
         )
-    config_writer.apply_add(request=request, config=config)
+    contacts_writer.apply_add(request=request, config=config)
     return ExecutionResult(
         ok=True,
         summary=f"added '{contact_id}' ({email})",
@@ -327,11 +329,12 @@ def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path
             f"  display_name: {request.display_name}\n"
             f"  daily_limit:  {request.daily_limit}\n"
             f"  inbox:        {inbox_name}\n"
+            f"  file:         {contact_path}\n"
             "\n"
-            "The new contact is live: nightjar.conf has been rewritten\n"
-            "atomically and the daemon's in-memory config updated. No\n"
-            "restart needed. Edit ~/.config/nightjar/nightjar.conf to\n"
-            "tweak the display_name, relationship, or daily_limit.\n"
+            "The new contact is live: a new TOML file has been written\n"
+            "and the daemon's in-memory config updated. No restart needed.\n"
+            f"Edit {contact_path} to tweak display_name, relationship,\n"
+            "daily_limit, or auto_approve_notes.\n"
         ),
     )
 
@@ -370,14 +373,18 @@ def _exec_remove(*, args: dict, config: Config, state: State, now: int, config_p
         )
     addresses = config.contacts[contact_id].addresses
     try:
-        config_writer.remove_contact(contact_id=contact_id, config=config, config_path=config_path)
-    except ConfigWriteError as e:
+        contacts_writer.delete_contact(
+            contact_id=contact_id,
+            contacts_dir=config.daemon.contacts_dir,
+            config=config,
+        )
+    except ContactsWriteError as e:
         return ExecutionResult(
             ok=False,
             summary="remove: write failed",
             body=f"Could not remove contact: {e}\n",
         )
-    config_writer.apply_remove(contact_id=contact_id, config=config)
+    contacts_writer.apply_remove(contact_id=contact_id, config=config)
     return ExecutionResult(
         ok=True,
         summary=f"removed '{contact_id}'",
@@ -385,7 +392,7 @@ def _exec_remove(*, args: dict, config: Config, state: State, now: int, config_p
             f"Removed contact_id '{contact_id}' (addresses: "
             f"{', '.join(addresses)}).\n"
             "\n"
-            "nightjar.conf has been rewritten atomically and the daemon's\n"
+            "The contact's TOML file has been deleted and the daemon's\n"
             "in-memory config updated. Subsequent mail from this address\n"
             "will be DROPPED as a stranger. To also wipe rapport notes,\n"
             "the 'forget' verb must be issued before 'remove' (notes are\n"

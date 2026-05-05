@@ -85,6 +85,15 @@ SCHEMA_V3_ALTER_HOTP_COUNTER = (
     "ALTER TABLE daemon_state ADD COLUMN hotp_counter INTEGER NOT NULL DEFAULT 0"
 )
 
+# V9 adds the machine-id fingerprint on daemon_state. Stamped on first
+# start after secrets migration; checked on every subsequent start.
+# A mismatch means /etc/machine-id has changed since secrets were
+# obfuscated and the secrets file is no longer decodable on this
+# machine. NULL until migration runs.
+SCHEMA_V9_ALTER_MACHINE_ID_FP = (
+    "ALTER TABLE daemon_state ADD COLUMN machine_id_fp TEXT"
+)
+
 # V4 adds pending_audits, the queue of audit copies that need a retry. The
 # daemon writes to this table when an audit-copy SMTP send fails after the
 # primary already succeeded; a separate retry loop drains it. Fields are
@@ -244,12 +253,16 @@ class State:
             conn.executescript(SCHEMA_V7)
             # V8: outbound_log table. Same pattern.
             conn.executescript(SCHEMA_V8)
+            # V9: machine_id_fp on daemon_state. Idempotent ALTER.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_state)")}
+            if "machine_id_fp" not in cols:
+                conn.execute(SCHEMA_V9_ALTER_MACHINE_ID_FP)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (8)")
-            elif row["version"] < 8:
-                conn.execute("UPDATE schema_version SET version = 8")
+                conn.execute("INSERT INTO schema_version (version) VALUES (9)")
+            elif row["version"] < 9:
+                conn.execute("UPDATE schema_version SET version = 9")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -396,6 +409,36 @@ class State:
             conn.execute(
                 "UPDATE daemon_state SET hotp_counter = ? WHERE id = 1",
                 (counter,),
+            )
+
+    def get_machine_id_fp(self) -> str | None:
+        """Return the stored machine-id fingerprint, or None if never set.
+
+        Set on first daemon start after secrets migration; checked on
+        every subsequent start. None means migration hasn't run yet
+        (the daemon is on a pre-Step-6c install) or has just been
+        wiped by a state.db reset.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT machine_id_fp FROM daemon_state WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            val = row["machine_id_fp"]
+            return val if val else None
+
+    def set_machine_id_fp(self, fp: str) -> None:
+        """Stamp the machine-id fingerprint. Called by the migrator on
+        first run after writing secrets.toml. Subsequent calls overwrite
+        (e.g. operator re-runs migration after a deliberate machine-id
+        change)."""
+        if not fp:
+            raise ValueError("machine_id_fp must be a non-empty string")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_state SET machine_id_fp = ? WHERE id = 1",
+                (fp,),
             )
 
     def totp_code_was_used(self, code: str) -> bool:

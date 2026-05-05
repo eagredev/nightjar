@@ -24,6 +24,7 @@ from . import auth
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/nightjar/nightjar.conf").expanduser()
+DEFAULT_SECRETS_PATH = Path("~/.config/nightjar/secrets.toml").expanduser()
 
 
 class ConfigError(Exception):
@@ -35,6 +36,7 @@ class DaemonConfig:
     state_dir: Path
     log_dir: Path
     notes_dir: Path = field(default_factory=lambda: Path("~/nightjar/contacts").expanduser())
+    contacts_dir: Path = field(default_factory=lambda: Path("~/.config/nightjar/contacts").expanduser())
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,14 @@ class Contact:
     relationship: str
     daily_limit: int  # -1 means unlimited; 0 means blocked
     is_principal: bool
+    # Inboxes this contact is allowed on. Per-file TOML stores this on
+    # the contact; the loader inverts it into inbox.allowed_contacts.
+    # Empty tuple is a misconfigured contact (parser rejects it).
+    inboxes: tuple[str, ...] = ()
+    # Step 7 forward-compat: when true, the daemon may append rapport
+    # notes proposed by triage without a separate per-note approval.
+    # Default false — every note proposal goes to the principal first.
+    auto_approve_notes: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,16 +191,23 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(s.strip() for s in raw.split(",") if s.strip())
 
 
-def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
-    """Parse the INI file at `path`, return a validated Config.
+def load(
+    path: Path = DEFAULT_CONFIG_PATH,
+    *,
+    secrets_path: Path = DEFAULT_SECRETS_PATH,
+) -> Config:
+    """Parse the INI file at `path`, splice in secrets from
+    `secrets_path` if it exists, return a validated Config.
 
     Validation rules enforced here:
       - Exactly one contact may have is_principal=true.
       - Every contact has at least one address.
       - Every address resolves to exactly one contact (no duplicates).
       - Every inbox's allowed_contacts list references known contact IDs.
-      - File must be chmod 600 if it contains sensitive sections (we
-        don't read those yet, but we still warn).
+      - secrets.toml (if present) must be chmod 600.
+      - A secret found in BOTH the INI and secrets.toml is a misconfig:
+        the migrator should have stripped the INI copy. We refuse to
+        start in that case.
     """
     if not path.exists():
         raise ConfigError(f"config not found at {path}")
@@ -209,49 +226,57 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     if "daemon" not in parser:
         raise ConfigError("[daemon] section is required")
 
+    # Load secrets.toml if present. Plaintext from this file overrides
+    # the INI for the four secret fields (smtp.password,
+    # security.totp_secret, claude.api_key, imap.<inbox>.password).
+    # If a secret appears in BOTH, that's a misconfigured state — the
+    # migrator should have stripped the INI copy. Refuse to start.
+    secrets: dict[str, dict[str, str]] = {}
+    if secrets_path.exists():
+        from . import secret_box
+        try:
+            secrets = secret_box.read_secrets_file(secrets_path)
+        except secret_box.SecretBoxError as e:
+            raise ConfigError(
+                f"could not load {secrets_path}: {e}. Either the file is "
+                "corrupted, /etc/machine-id has changed since secrets "
+                f"were obfuscated, or the file is not chmod 600. The "
+                f"pre-migration backup at {path}.pre-migration.bak "
+                "(if you still have it) contains plaintext secrets."
+            ) from e
+
+    def _secret(section: str, key: str) -> str | None:
+        return secrets.get(section, {}).get(key)
+
     daemon_section = parser["daemon"]
     daemon = DaemonConfig(
         state_dir=Path(os.path.expanduser(daemon_section.get("state_dir", "~/.local/share/nightjar"))),
         log_dir=Path(os.path.expanduser(daemon_section.get("log_dir", "~/nightjar/logs"))),
         notes_dir=Path(os.path.expanduser(daemon_section.get("notes_dir", "~/nightjar/contacts"))),
+        contacts_dir=Path(os.path.expanduser(daemon_section.get("contacts_dir", "~/.config/nightjar/contacts"))),
     )
 
-    contacts: dict[str, Contact] = {}
-    address_index: dict[str, str] = {}
-    principal_id: str | None = None
-
-    for section_name in parser.sections():
-        if not section_name.startswith("contact:"):
-            continue
-        contact_id = section_name.split(":", 1)[1].strip()
-        if not contact_id:
-            raise ConfigError(f"contact section has empty id: {section_name!r}")
-        section = parser[section_name]
-        addresses = _parse_csv(section.get("addresses", ""))
-        if not addresses:
-            raise ConfigError(f"contact {contact_id!r} has no addresses")
-        is_principal = _parse_bool(section.get("is_principal", "false"), field_name=f"{section_name}.is_principal")
-        if is_principal:
-            if principal_id is not None:
-                raise ConfigError(
-                    f"is_principal=true on multiple contacts: {principal_id!r} and {contact_id!r}"
-                )
-            principal_id = contact_id
-        contact = Contact(
-            contact_id=contact_id,
-            addresses=tuple(a.lower() for a in addresses),
-            display_name=section.get("display_name", contact_id).strip(),
-            relationship=section.get("relationship", "").strip(),
-            daily_limit=_parse_daily_limit(section.get("daily_limit", "3")),
-            is_principal=is_principal,
+    # Contacts now live in their own directory, one TOML file each.
+    # The migrator (daemon/contacts_migrator.py) moves any legacy
+    # [contact:*] blocks out of nightjar.conf before this load runs;
+    # we defensive-check here to surface a misconfigured state.
+    legacy_contact_sections = [
+        s for s in parser.sections() if s.startswith("contact:")
+    ]
+    if legacy_contact_sections:
+        raise ConfigError(
+            f"{path}: legacy [contact:*] sections found "
+            f"({', '.join(legacy_contact_sections)}); the contacts "
+            "migrator should have moved these to per-file TOML in "
+            f"{daemon.contacts_dir}. If the migration backup file "
+            f"{path}.pre-migration.bak exists, the migration ran "
+            "but did not strip the originals — investigate manually."
         )
-        contacts[contact_id] = contact
-        for addr in contact.addresses:
-            if addr in address_index:
-                raise ConfigError(
-                    f"address {addr!r} is claimed by both {address_index[addr]!r} and {contact_id!r}"
-                )
-            address_index[addr] = contact_id
+
+    from . import contacts_loader
+    contact_load = contacts_loader.load_all(daemon.contacts_dir)
+    contacts: dict[str, Contact] = dict(contact_load.contacts)
+    address_index: dict[str, str] = dict(contact_load.address_index)
 
     inboxes: dict[str, InboxConfig] = {}
     for section_name in parser.sections():
@@ -268,12 +293,21 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             imap_port = int(section.get("imap_port", "993"))
         except ValueError as e:
             raise ConfigError(f"{section_name}.imap_port must be int") from e
-        allowed = _parse_csv(section.get("allowed_contacts", ""))
-        for ref in allowed:
-            if ref not in contacts:
-                raise ConfigError(
-                    f"{section_name}.allowed_contacts references unknown contact: {ref!r}"
-                )
+        # Allowed-contacts is now derived from per-contact `inboxes` lists.
+        # If the operator left an `allowed_contacts =` line in the INI,
+        # that is a misconfigured state from before migration; surface it.
+        if "allowed_contacts" in section:
+            raise ConfigError(
+                f"{section_name}.allowed_contacts is no longer accepted; "
+                "the per-inbox allowlist is now derived from each "
+                f"contact's `inboxes = [...]` list in {daemon.contacts_dir}. "
+                "Remove the line from nightjar.conf and add the inbox "
+                "name to the appropriate contact files."
+            )
+        # Invert per-contact inboxes lists into this inbox's allowed_contacts.
+        allowed = tuple(
+            cid for cid, c in contacts.items() if inbox_name in c.inboxes
+        )
         trusted_authserv = section.get("trusted_authserv", "").strip()
         if not trusted_authserv:
             raise ConfigError(
@@ -284,13 +318,27 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
                 "cannot otherwise tell real DMARC verdicts from attacker-"
                 "injected ones."
             )
+        # IMAP password: prefer secrets.toml; refuse if both present.
+        imap_password_secret = _secret(f"imap.{inbox_name}", "password")
+        imap_password_ini = section.get("imap_password", "")
+        if imap_password_secret is not None and imap_password_ini:
+            raise ConfigError(
+                f"{section_name}.imap_password is in both nightjar.conf "
+                f"and secrets.toml; remove it from {path}."
+            )
+        imap_password = imap_password_secret or imap_password_ini
+        if not imap_password:
+            raise ConfigError(
+                f"{section_name}.imap_password is required (set it in "
+                f"{secrets_path} or nightjar.conf)"
+            )
         inbox = InboxConfig(
             name=inbox_name,
             enabled=enabled,
             imap_host=section["imap_host"].strip(),
             imap_port=imap_port,
             imap_user=section["imap_user"].strip(),
-            imap_password=section["imap_password"],
+            imap_password=imap_password,
             allowed_contacts=allowed,
             trusted_authserv=trusted_authserv,
         )
@@ -299,12 +347,35 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     if not inboxes:
         raise ConfigError("no enabled [inbox:*] sections found")
 
+    # Cross-check: every contact's `inboxes` list must reference an
+    # enabled inbox. (We do this AFTER inbox parsing because the
+    # loader doesn't know inbox names yet.)
+    for contact in contacts.values():
+        for inbox_name in contact.inboxes:
+            if inbox_name not in inboxes:
+                raise ConfigError(
+                    f"contact {contact.contact_id!r} lists inbox "
+                    f"{inbox_name!r} but no such enabled inbox exists. "
+                    f"Either add the inbox to {path} or remove it from "
+                    f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
+                )
+
     security: SecurityConfig | None = None
     if "security" in parser:
         sec_section = parser["security"]
-        totp_secret = sec_section.get("totp_secret", "").strip()
+        totp_secret_secret = _secret("security", "totp_secret")
+        totp_secret_ini = sec_section.get("totp_secret", "").strip()
+        if totp_secret_secret is not None and totp_secret_ini:
+            raise ConfigError(
+                "[security].totp_secret is in both nightjar.conf and "
+                f"secrets.toml; remove it from {path}."
+            )
+        totp_secret = totp_secret_secret or totp_secret_ini
         if not totp_secret:
-            raise ConfigError("[security].totp_secret is required if [security] is present")
+            raise ConfigError(
+                "[security].totp_secret is required (set it in "
+                f"{secrets_path} or nightjar.conf)"
+            )
         if not auth.is_valid_secret(totp_secret):
             raise ConfigError(
                 "[security].totp_secret is not a valid base32 secret "
@@ -340,7 +411,14 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             raise ConfigError(f"[smtp].port must be int: {e}") from e
         host = smtp_section.get("host", "").strip()
         user = smtp_section.get("user", "").strip()
-        password = smtp_section.get("password", "")
+        password_secret = _secret("smtp", "password")
+        password_ini = smtp_section.get("password", "")
+        if password_secret is not None and password_ini:
+            raise ConfigError(
+                "[smtp].password is in both nightjar.conf and "
+                f"secrets.toml; remove it from {path}."
+            )
+        password = password_secret or password_ini
         from_addr = smtp_section.get("from_addr", user).strip()
         from_name = smtp_section.get("from_name", "Nightjar").strip()
         if not host:
@@ -348,7 +426,10 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         if not user:
             raise ConfigError("[smtp].user is required")
         if not password:
-            raise ConfigError("[smtp].password is required")
+            raise ConfigError(
+                "[smtp].password is required (set it in "
+                f"{secrets_path} or nightjar.conf)"
+            )
         if "@" not in from_addr:
             raise ConfigError(f"[smtp].from_addr does not look like an email: {from_addr!r}")
         smtp = SmtpConfig(
@@ -363,9 +444,19 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     claude: ClaudeConfig | None = None
     if "claude" in parser:
         claude_section = parser["claude"]
-        api_key = claude_section.get("api_key", "").strip()
+        api_key_secret = _secret("claude", "api_key")
+        api_key_ini = claude_section.get("api_key", "").strip()
+        if api_key_secret is not None and api_key_ini:
+            raise ConfigError(
+                "[claude].api_key is in both nightjar.conf and "
+                f"secrets.toml; remove it from {path}."
+            )
+        api_key = api_key_secret or api_key_ini
         if not api_key:
-            raise ConfigError("[claude].api_key is required if [claude] is present")
+            raise ConfigError(
+                "[claude].api_key is required (set it in "
+                f"{secrets_path} or nightjar.conf)"
+            )
         if not (api_key.startswith("sk-ant-") and len(api_key) > 50):
             raise ConfigError(
                 "[claude].api_key does not look like an Anthropic API key "
