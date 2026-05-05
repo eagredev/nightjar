@@ -171,30 +171,86 @@ class InboxWatcher:
                 await client.logout()
 
     async def _catch_up(self, client: aioimaplib.IMAP4_SSL) -> None:
-        """Process any UNSEEN messages that arrived while we were off."""
-        result, data = await client.uid_search("UNSEEN")
+        """Reconcile recent IMAP mail against the state-db.
+
+        Step 6e (receipt reliability) replaced the prior `UNSEEN`-based
+        catchup with a date-windowed `SINCE` search plus state-db dedup.
+        Reasoning: \\Seen is not a reliable "have I processed this?"
+        signal — anything that touches the mailbox (Gmail web preview,
+        a phone client, a daemon crash mid-flight) can flip it and
+        cause silent drops. Message-ID lookup against the messages
+        table is the authoritative dedup.
+
+        Window:
+            lower_bound = max(now - catchup_window_days, watermark - 1d)
+        The 1-day overlap absorbs clock skew and crashes between fetch
+        and record. First run (watermark NULL) uses a wider 30-day
+        sweep to surface any mail that was silently dropped under the
+        old UNSEEN-based logic.
+        """
+        now = int(time.time())
+        watermark = self.state.get_last_catchup_at(self.inbox.name)
+        first_run = watermark is None
+
+        # Window in days. First-run reconciliation gets a wider window
+        # so we can find mail that the old UNSEEN logic may have
+        # silently skipped. Steady-state catchup uses the configured
+        # window with the standard 1-day overlap on top of the
+        # watermark.
+        if first_run:
+            window_days = max(30, self.inbox.catchup_window_days)
+            lower_ts = now - window_days * 86400
+        else:
+            window_lower = now - self.inbox.catchup_window_days * 86400
+            watermark_lower = watermark - 86400  # 1-day overlap
+            lower_ts = min(window_lower, watermark_lower)
+
+        since_date = self._imap_since_date(lower_ts)
+        result, data = await client.uid_search(f"SINCE {since_date}")
         if result != "OK":
             self.logger.event(
                 "catchup_search_failed",
                 inbox=self.inbox.name,
                 level="warn",
                 result=result,
+                since=since_date,
             )
             return
         if not data or not data[0]:
+            # No mail in window. Still advance watermark so we don't
+            # re-search the same empty range forever.
+            self.state.set_last_catchup_at(self.inbox.name, now)
             return
         uids = data[0].split()
         if not uids:
+            self.state.set_last_catchup_at(self.inbox.name, now)
             return
+
         self.logger.event(
             "catchup_start",
             inbox=self.inbox.name,
-            unseen_count=len(uids),
+            candidate_count=len(uids),
+            since=since_date,
+            first_run=first_run,
         )
+
+        processed = 0
+        skipped = 0
+        errors = 0
         for uid in uids:
             try:
-                await self._fetch_and_record(client, uid.decode("ascii"))
+                outcome = await self._fetch_and_record(client, uid.decode("ascii"))
+                if outcome == "processed":
+                    processed += 1
+                elif outcome == "skipped":
+                    skipped += 1
+                else:
+                    # Fetch surfaced a non-fatal failure (logged
+                    # inside _fetch_and_record). Count as error so
+                    # the catchup_complete totals add up.
+                    errors += 1
             except Exception as e:
+                errors += 1
                 self.logger.event(
                     "catchup_fetch_error",
                     inbox=self.inbox.name,
@@ -203,7 +259,49 @@ class InboxWatcher:
                     error=type(e).__name__,
                     message=str(e),
                 )
-        self.logger.event("catchup_complete", inbox=self.inbox.name, processed=len(uids))
+
+        # Watermark advances on every successful pass, even if every
+        # candidate dedup-skipped — we still verified the window is
+        # clear up to `now`. We use the wall-clock `now` from the top
+        # of the function rather than re-reading: the IMAP search ran
+        # on what was visible at `now`, so that's the high-water mark
+        # we can confidently claim.
+        self.state.set_last_catchup_at(self.inbox.name, now)
+
+        self.logger.event(
+            "catchup_complete",
+            inbox=self.inbox.name,
+            candidates=len(uids),
+            processed=processed,
+            skipped=skipped,
+            errors=errors,
+        )
+
+        # First-run reconciliation summary. This pass walked a wider
+        # 30-day window to catch up any mail that the old UNSEEN-based
+        # logic may have silently skipped. If we found anything new,
+        # tell the principal so they can audit and decide whether
+        # anything needs follow-up. Skip the ping if nothing new
+        # turned up — first-run on a clean install is the common
+        # case and a "found 0 messages" ping is just noise.
+        if first_run and processed > 0:
+            self._send_first_run_recon_summary(
+                processed=processed, skipped=skipped, errors=errors,
+                window_days=window_days, since=since_date,
+            )
+
+    @staticmethod
+    def _imap_since_date(ts: int) -> str:
+        """Format a unix timestamp as IMAP SINCE date (DD-Mon-YYYY).
+
+        IMAP search dates are day-granular and use a fixed English
+        month abbreviation regardless of locale. We use UTC because
+        the watermark is stored as a UTC unix timestamp.
+        """
+        t = time.gmtime(ts)
+        months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+        return f"{t.tm_mday:02d}-{months[t.tm_mon - 1]}-{t.tm_year:04d}"
 
     async def _idle_once(self, client: aioimaplib.IMAP4_SSL) -> None:
         """Issue one IDLE, wait for activity or refresh timeout, then DONE.
@@ -271,8 +369,15 @@ class InboxWatcher:
                 continue
             return  # any non-empty push counts as activity
 
-    async def _fetch_and_record(self, client: aioimaplib.IMAP4_SSL, uid: str) -> None:
-        """Fetch headers for one UID, look up sender, persist a message row."""
+    async def _fetch_and_record(self, client: aioimaplib.IMAP4_SSL, uid: str) -> str | None:
+        """Fetch headers for one UID, look up sender, persist a message row.
+
+        Returns:
+            "processed" — message was new and a row was inserted (or
+                          a downstream handler ran).
+            "skipped"   — Message-ID already in state-db (dedup hit).
+            None        — fetch failed; the failure is already logged.
+        """
         result, data = await client.uid("fetch", uid, "(BODY.PEEK[HEADER])")
         if result != "OK" or not data:
             self.logger.event(
@@ -282,7 +387,7 @@ class InboxWatcher:
                 uid=uid,
                 result=result,
             )
-            return
+            return None
 
         header_blob = self._extract_literal(data)
         if header_blob is None:
@@ -293,7 +398,7 @@ class InboxWatcher:
                 level="warn",
                 response_shape=[type(c).__name__ for c in data],
             )
-            return
+            return None
 
         msg = email.message_from_bytes(header_blob)
         message_id = (msg.get("Message-ID") or "").strip()
@@ -304,7 +409,18 @@ class InboxWatcher:
             message_id = f"<no-msgid-{self.inbox.name}-uid{uid}>"
 
         if self.state.message_exists(message_id):
-            return  # already seen on a previous catch-up
+            # Step 6e: log dedup hits at debug level so a catchup that
+            # silently skips everything is diagnosable. The old UNSEEN
+            # logic conflated "no work" with "all-skipped" and produced
+            # phantom catchup_complete events with no trail.
+            self.logger.event(
+                "catchup_skipped_existing",
+                inbox=self.inbox.name,
+                level="debug",
+                uid=uid,
+                message_id=message_id,
+            )
+            return "skipped"
 
         from_header = msg.get("From", "")
         _, from_addr = email.utils.parseaddr(from_header)
@@ -395,6 +511,20 @@ class InboxWatcher:
             contact_id=contact_id,
             state=state,
         )
+        if not inserted:
+            # Race: between the message_exists() check above and the
+            # record_message() call here, another path recorded this
+            # ID. Treat as a dedup hit. Rare but possible if two
+            # catchups overlap on a slow link.
+            self.logger.event(
+                "catchup_skipped_existing",
+                inbox=self.inbox.name,
+                level="debug",
+                uid=uid,
+                message_id=message_id,
+                detail="race",
+            )
+            return "skipped"
         if inserted:
             self.logger.event(
                 "mail_received",
@@ -470,6 +600,8 @@ class InboxWatcher:
 
         if panic_trip_reason is not None:
             self._trip_dead_mans_switch(panic_trip_reason)
+
+        return "processed"
 
     def _authenticate_principal(
         self, *, subject: str | None, from_addr: str
@@ -1676,6 +1808,54 @@ class InboxWatcher:
             if c.is_principal and c.addresses:
                 return c.addresses[0]
         raise RuntimeError("no principal configured (config validation should have caught this)")
+
+    def _send_first_run_recon_summary(
+        self, *, processed: int, skipped: int, errors: int,
+        window_days: int, since: str,
+    ) -> None:
+        """Notify the principal that the receipt-reliability fix has run
+        a wider first-pass reconciliation and found previously-untracked
+        mail.
+
+        Sent at most once per inbox (the watermark prevents re-fire).
+        Best-effort: SMTP failure is logged but does not block catchup.
+        """
+        if self.config.smtp is None:
+            return
+        body = (
+            f"Nightjar's catchup logic was upgraded (Step 6e: receipt\n"
+            f"reliability) and ran a one-shot {window_days}-day reconciliation\n"
+            f"on inbox '{self.inbox.name}' against IMAP messages SINCE {since}.\n"
+            f"\n"
+            f"Newly tracked: {processed} message(s).\n"
+            f"Already known: {skipped} message(s).\n"
+        )
+        if errors:
+            body += f"Fetch errors:  {errors} (see daemon logs).\n"
+        body += (
+            f"\n"
+            f"The 'newly tracked' messages have already been processed by\n"
+            f"triage and any that needed approval have generated their own\n"
+            f"separate pings. This summary is one-shot — you will not see it\n"
+            f"again on subsequent restarts.\n"
+        )
+        try:
+            notifier.notify_principal(
+                smtp=self.config.smtp,
+                principal_addr=self._principal_addr(),
+                subject=f"[Nightjar] receipt-reliability reconciliation on {self.inbox.name}",
+                body=body,
+                jlogger=self.logger,
+                state=self.state,
+            )
+        except Exception as e:
+            self.logger.event(
+                "first_run_recon_summary_failed",
+                inbox=self.inbox.name,
+                level="warn",
+                error=type(e).__name__,
+                message=str(e),
+            )
 
     @staticmethod
     def _format_original_email_block(

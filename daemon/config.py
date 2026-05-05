@@ -73,6 +73,13 @@ class InboxConfig:
     # Gmail-stamped headers from attacker-injected ones, so this is
     # required for any inbox that processes contact mail.
     trusted_authserv: str = ""
+    # `catchup_window_days` is the lookback window the IMAP watcher
+    # uses for its SINCE search on each catchup. Step 6e moved dedup
+    # off the IMAP \Seen flag onto state-db Message-ID lookup, so the
+    # window doesn't have to be tight — it just bounds the work per
+    # catchup. 7 days is plenty of headroom for a daemon that's down
+    # for a long weekend; bump it if the daemon may be offline longer.
+    catchup_window_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -340,6 +347,19 @@ def load(
                 f"{section_name}.imap_password is required (set it in "
                 f"{secrets_path} or nightjar.conf)"
             )
+        catchup_window_raw = section.get("catchup_window_days", "7").strip()
+        try:
+            catchup_window_days = int(catchup_window_raw)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{section_name}.catchup_window_days must be an integer, "
+                f"got {catchup_window_raw!r}"
+            ) from exc
+        if catchup_window_days < 1:
+            raise ConfigError(
+                f"{section_name}.catchup_window_days must be >= 1, "
+                f"got {catchup_window_days}"
+            )
         inbox = InboxConfig(
             name=inbox_name,
             enabled=enabled,
@@ -349,6 +369,7 @@ def load(
             imap_password=imap_password,
             allowed_contacts=allowed,
             trusted_authserv=trusted_authserv,
+            catchup_window_days=catchup_window_days,
         )
         inboxes[inbox_name] = inbox
 

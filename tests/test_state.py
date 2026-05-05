@@ -606,3 +606,51 @@ def test_outbound_log_body_is_searchable(tmp_path: Path) -> None:
     )
     row = s.list_recent_outbound()[0]
     assert row["body"] == full_body
+
+
+# --- Step 6e: catchup watermark (inbox_state) ------------------------------
+
+
+def test_get_last_catchup_at_returns_none_when_unset(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.get_last_catchup_at("nightjar") is None
+
+
+def test_set_then_get_last_catchup_at_round_trips(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.set_last_catchup_at("nightjar", 1_700_000_000)
+    assert s.get_last_catchup_at("nightjar") == 1_700_000_000
+
+
+def test_set_last_catchup_at_overwrites(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.set_last_catchup_at("nightjar", 1_700_000_000)
+    s.set_last_catchup_at("nightjar", 1_700_001_000)
+    assert s.get_last_catchup_at("nightjar") == 1_700_001_000
+
+
+def test_last_catchup_at_is_per_inbox(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.set_last_catchup_at("nightjar", 1_700_000_000)
+    s.set_last_catchup_at("notes", 1_700_500_000)
+    assert s.get_last_catchup_at("nightjar") == 1_700_000_000
+    assert s.get_last_catchup_at("notes") == 1_700_500_000
+
+
+def test_set_last_catchup_at_rejects_negative(tmp_path: Path) -> None:
+    import pytest
+    s = make_state(tmp_path)
+    with pytest.raises(ValueError):
+        s.set_last_catchup_at("nightjar", -1)
+
+
+def test_schema_version_is_10(tmp_path: Path) -> None:
+    """Step 6e bumped schema to V10."""
+    import sqlite3
+    s = make_state(tmp_path)
+    conn = sqlite3.connect(s.db_path)
+    try:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        assert row[0] == 10
+    finally:
+        conn.close()

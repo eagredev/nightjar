@@ -653,3 +653,77 @@ def test_claude_api_key_is_not_in_repr(tmp_path: Path) -> None:
     assert cfg.claude is not None
     assert cfg.claude.api_key == _FAKE_CLAUDE_KEY
     assert _FAKE_CLAUDE_KEY in repr(cfg.claude)
+
+
+# ---- Step 6e: catchup_window_days -----------------------------------------
+
+
+def test_catchup_window_defaults_to_seven(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        trusted_authserv = mx.google.com
+    """)
+    cfg = load_config(path)
+    assert cfg.inboxes["nightjar"].catchup_window_days == 7
+
+
+def test_catchup_window_can_be_overridden(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        trusted_authserv = mx.google.com
+        catchup_window_days = 14
+    """)
+    cfg = load_config(path)
+    assert cfg.inboxes["nightjar"].catchup_window_days == 14
+
+
+def test_catchup_window_rejects_zero(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        trusted_authserv = mx.google.com
+        catchup_window_days = 0
+    """)
+    with pytest.raises(ConfigError, match="catchup_window_days"):
+        load_config(path)
+
+
+def test_catchup_window_rejects_non_integer(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, f"""
+        [daemon]
+        state_dir = {tmp_path}/state
+        log_dir = {tmp_path}/logs
+
+        [inbox:nightjar]
+        imap_host = imap.example.com
+        imap_user = me@example.com
+        imap_password = x
+        trusted_authserv = mx.google.com
+        catchup_window_days = soon
+    """)
+    with pytest.raises(ConfigError, match="catchup_window_days"):
+        load_config(path)
