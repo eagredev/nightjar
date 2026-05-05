@@ -218,6 +218,19 @@ CREATE INDEX IF NOT EXISTS idx_outbound_log_channel ON outbound_log(channel);
 CREATE INDEX IF NOT EXISTS idx_outbound_log_related ON outbound_log(related_message_id);
 """
 
+# V10 adds the per-inbox catchup watermark. Step 6e (receipt reliability)
+# stops trusting IMAP \Seen as the "have I processed this?" signal and
+# uses Message-ID dedup against the messages table instead. The watermark
+# bounds the IMAP search window so we don't re-walk the whole mailbox on
+# every catchup. NULL last_catchup_at means "never run" — the watcher
+# uses a wider first-run window and emits a reconciliation summary.
+SCHEMA_V10 = """
+CREATE TABLE IF NOT EXISTS inbox_state (
+    name             TEXT PRIMARY KEY,
+    last_catchup_at  INTEGER
+);
+"""
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -257,12 +270,14 @@ class State:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_state)")}
             if "machine_id_fp" not in cols:
                 conn.execute(SCHEMA_V9_ALTER_MACHINE_ID_FP)
+            # V10: inbox_state table for catchup watermark.
+            conn.executescript(SCHEMA_V10)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (9)")
-            elif row["version"] < 9:
-                conn.execute("UPDATE schema_version SET version = 9")
+                conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+            elif row["version"] < 10:
+                conn.execute("UPDATE schema_version SET version = 10")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -439,6 +454,41 @@ class State:
             conn.execute(
                 "UPDATE daemon_state SET machine_id_fp = ? WHERE id = 1",
                 (fp,),
+            )
+
+    def get_last_catchup_at(self, inbox: str) -> int | None:
+        """Return the watermark timestamp for `inbox`, or None if never set.
+
+        None means the catchup loop has never completed for this inbox
+        on this database — the watcher treats this as a first-run
+        condition and uses a wider initial search window plus a one-shot
+        reconciliation summary to the principal.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_catchup_at FROM inbox_state WHERE name = ?",
+                (inbox,),
+            ).fetchone()
+            if row is None:
+                return None
+            val = row["last_catchup_at"]
+            return int(val) if val is not None else None
+
+    def set_last_catchup_at(self, inbox: str, ts: int) -> None:
+        """Advance the watermark for `inbox` to `ts`.
+
+        Called after every successful catchup pass. The watcher uses
+        `max(now - catchup_window_days, watermark - 1d)` as the lower
+        bound of the IMAP search; the 1-day overlap absorbs clock skew
+        and mid-flight crashes.
+        """
+        if ts < 0:
+            raise ValueError("last_catchup_at must be >= 0")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO inbox_state (name, last_catchup_at) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET last_catchup_at = excluded.last_catchup_at",
+                (inbox, ts),
             )
 
     def totp_code_was_used(self, code: str) -> bool:
