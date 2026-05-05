@@ -311,7 +311,7 @@ def _render_contact_toml(
         f"daily_limit = {daily_limit_field}",
         f"is_principal = {'true' if is_principal else 'false'}",
         f"inboxes = [{inboxes_inline}]",
-        "auto_approve_notes = false",
+        "scopes = []",
     ]
     return "\n".join(lines) + "\n"
 

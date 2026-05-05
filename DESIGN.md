@@ -839,7 +839,6 @@ default_tone          = warm, low-formality
 daily_limit           = 3
 notes_file            = contacts/composer.md
 auto_approve          =
-auto_approve_notes    = false
 ```
 
 Fields, semantics, and the credit-ledger-based override system are
@@ -1008,13 +1007,17 @@ Every proposed note must pass *all three* of:
 ### Constraints
 
 - Append-only by agent, freely editable by principal.
-- Read in triage, not at execution.
-- Never sent to anyone except via `show my notes`.
-- Adding a note is a logged tool call (`note_added`).
+- Read in triage (scope-filtered for scoped contacts), not at
+  execution.
+- Never sent to anyone except via `show notes`.
+- Adding a note is a logged JSONL event (`note_written`).
 - Cap on note volume (~50 per contact, oldest auto-pruned).
 - Notes have timestamps and source-message-IDs for traceability.
-- Principal approval required by default; per-contact
-  `auto_approve_notes` flag opt-in.
+- Writes are autonomous — the agent appends notes without per-note
+  approval. Notes are working memory, not a privileged-action
+  surface; the principal reviews via `show notes` and removes
+  anything they don't want via `forget`. See Step 8 memory
+  architecture for the broader framing.
 
 ### Safeguarding pathway (layers)
 
@@ -1312,7 +1315,6 @@ default_tone        = warm, low-formality
 daily_limit         = 3
 notes_file          = contacts/composer.md
 auto_approve        =
-auto_approve_notes  = false
 
 [inbox:nightjar]
 enabled         = true

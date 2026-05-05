@@ -26,8 +26,8 @@ TOML schema (one file per contact):
     relationship        = "Composer for the project"
     daily_limit         = 3                  # int >= 0, or "unlimited"
     is_principal        = false              # default false
-    auto_approve_notes  = false              # default false (Step 7)
     inboxes             = ["nightjar"]       # which inboxes accept this contact
+    scopes              = []                 # default empty (= unrestricted)
 
 Cross-file invariants (validated at load time):
 
@@ -192,9 +192,14 @@ def _load_one(path: Path) -> Contact:
     relationship = _optional_str(data, "relationship", "", path)
     daily_limit = _parse_daily_limit(data.get("daily_limit", 3), path)
     is_principal = _parse_bool(data.get("is_principal", False), "is_principal", path)
-    auto_approve_notes = _parse_bool(
-        data.get("auto_approve_notes", False), "auto_approve_notes", path
-    )
+    # Step 7d (per Step 8 memory architecture): the daemon now writes
+    # rapport notes autonomously without per-note approval, so the
+    # legacy `auto_approve_notes` field is ignored. Existing contact
+    # files may still have it set; we read silently to keep
+    # forward-compat with files written by the pre-Step-8 contact
+    # writer / migrator. Operators removing the line is purely
+    # cosmetic — daemon behaviour is unchanged.
+    _ = data.get("auto_approve_notes", None)
 
     inboxes_raw = data.get("inboxes")
     if inboxes_raw is None:
@@ -245,7 +250,6 @@ def _load_one(path: Path) -> Contact:
         daily_limit=daily_limit,
         is_principal=is_principal,
         inboxes=inboxes,
-        auto_approve_notes=auto_approve_notes,
         scopes=tuple(scopes),
     )
 

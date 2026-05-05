@@ -141,6 +141,30 @@ class MessageStructure:
 
 
 @dataclass(frozen=True)
+class NoteProposal:
+    """One proposed addition to a contact's rapport-notes file.
+
+    Triage emits these in the `note_proposals` array on its plan when
+    it judges something worth recording about the contact. The watcher
+    applies them directly to the contact's notes file via
+    notes_store.append_note() — no approval queue, no per-contact
+    auto-approve flag. The principal reviews via `show notes` and
+    deletes via `forget`. See project-nightjar-step-8.md for the
+    memory architecture rationale (rapport notes are working memory,
+    not a privileged-action surface).
+
+    `scope` is None when the proposal is unscoped (visible everywhere)
+    or one of the contact's allowed scopes. When the contact has
+    no scopes, scope MUST be None — proposing a scope on an
+    unrestricted contact would create a tag that nothing can filter
+    against.
+    """
+    scope: str | None
+    section_heading: str
+    body: str
+
+
+@dataclass(frozen=True)
 class TriagePlan:
     """A validated plan ready for the approval-queue path.
 
@@ -157,6 +181,12 @@ class TriagePlan:
     notes: str
     raw_input_tokens: int
     raw_output_tokens: int
+    # Step 7d: zero or more proposed additions to the contact's
+    # rapport-notes file. Default empty tuple — many plans propose no
+    # notes (routine messages, attempts that failed, low-content
+    # interactions). The watcher iterates these and enqueues each one
+    # into note_proposals after the plan transitions to TRIAGED.
+    note_proposals: tuple[NoteProposal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -306,6 +336,49 @@ DRAFT_PLAN_TOOL: dict[str, Any] = {
                 "type": "string",
                 "description": "Optional extra context for the principal, <= 400 chars.",
             },
+            "note_proposals": {
+                "type": "array",
+                "description": (
+                    "Optional. Zero or more proposed additions to "
+                    "the contact's rapport-notes file. Propose only "
+                    "concrete observations worth remembering "
+                    "long-term — never propose for routine messages "
+                    "or just to fill the field. Default to empty."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Scope tag for the proposal. Use one of "
+                                "the contact's allowed scopes when the "
+                                "contact has scopes; null when "
+                                "unscoped, or for a wildcard-style "
+                                "observation visible everywhere."
+                            ),
+                        },
+                        "section_heading": {
+                            "type": "string",
+                            "description": (
+                                "Section heading the bullet belongs "
+                                "under (an existing heading or a new "
+                                "one). Short topic label."
+                            ),
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "The bullet text. Concise prose, one "
+                                "observation, no leading hyphen — "
+                                "the daemon adds bullet formatting."
+                            ),
+                        },
+                    },
+                    "required": ["scope", "section_heading", "body"],
+                    "additionalProperties": False,
+                },
+            },
         },
         "required": ["summary", "verb", "args", "reasoning", "risk_flags"],
     },
@@ -431,8 +504,22 @@ def build_user_message(
 _MAX_NOTES_LEN = 400
 _MAX_REPLY_BODY_LEN = 2000
 
+# Step 7d: caps on note_proposals fields. Heading is a section title
+# so it should be short. Body is one bullet — concise prose, not a
+# paragraph. The cap also bounds the cost of a runaway model that
+# tries to dump message body into a proposal body.
+_MAX_NOTE_HEADING_LEN = 80
+_MAX_NOTE_BODY_LEN = 280
+# Cap on how many proposals per plan. The model should propose
+# sparingly; many proposals for one email is a smell.
+_MAX_NOTE_PROPOSALS_PER_PLAN = 5
 
-def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
+
+def validate_plan_payload(
+    payload: dict[str, Any],
+    *,
+    contact: Contact | None = None,
+) -> TriagePlan | TriageError:
     """Turn the raw `draft_plan` tool input into a typed TriagePlan, or
     a TriageError if any rule is broken.
 
@@ -444,6 +531,13 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         future TRIAGE_VERBS edit slips a tier-4 verb in, the cap blocks).
       - reply.args.body is non-empty and length-capped.
       - notes <= MAX_NOTES_LEN.
+      - note_proposals: array if present; each item has scope (str or
+        null) + section_heading + body, length-capped, count-capped.
+        When `contact` is provided, scopes are checked against
+        contact.scopes (None always allowed; non-None must be in
+        contact.scopes). Bad proposals are dropped silently from the
+        plan rather than failing the whole plan — losing one note is
+        recoverable; losing the reply isn't.
       - All required string fields are strings; risk_flags is a list.
 
     Raw-input fields are NOT enforced here for length (sender, subject,
@@ -521,6 +615,44 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         if isinstance(f, str) and f in KNOWN_RISK_FLAGS
     )
 
+    # Step 7d: validate note_proposals leniently. Bad proposals are
+    # dropped from the returned plan; we don't fail the whole plan
+    # because the reply is the main payload. Caps apply per-item
+    # and across-the-list.
+    raw_proposals = payload.get("note_proposals", [])
+    note_proposals: list[NoteProposal] = []
+    if isinstance(raw_proposals, list):
+        for raw in raw_proposals[:_MAX_NOTE_PROPOSALS_PER_PLAN]:
+            if not isinstance(raw, dict):
+                continue
+            scope = raw.get("scope")
+            if scope is not None and not isinstance(scope, str):
+                continue
+            heading = raw.get("section_heading")
+            body_text = raw.get("body")
+            if not isinstance(heading, str) or not heading.strip():
+                continue
+            if not isinstance(body_text, str) or not body_text.strip():
+                continue
+            heading_clean = heading.strip()[:_MAX_NOTE_HEADING_LEN]
+            body_clean = body_text.strip()[:_MAX_NOTE_BODY_LEN]
+            # Scope must match contact.scopes when contact provided.
+            # None is always accepted (unscoped/wildcard intent).
+            if contact is not None and scope is not None:
+                if not contact.scopes:
+                    # Contact is unrestricted; a scoped proposal is a
+                    # model error — drop it.
+                    continue
+                if scope not in contact.scopes:
+                    # Model picked a scope outside the allowed set —
+                    # drop, don't fail the plan.
+                    continue
+            note_proposals.append(NoteProposal(
+                scope=scope,
+                section_heading=heading_clean,
+                body=body_clean,
+            ))
+
     return TriagePlan(
         verb=verb,
         tier=tier,
@@ -531,6 +663,7 @@ def validate_plan_payload(payload: dict[str, Any]) -> TriagePlan | TriageError:
         notes=notes,
         raw_input_tokens=0,   # filled in by caller from ClaudeResponse
         raw_output_tokens=0,
+        note_proposals=tuple(note_proposals),
     )
 
 
@@ -599,7 +732,7 @@ async def triage_contact_mail(
             detail=str(tool_use.get("name")),
         )
 
-    result = validate_plan_payload(tool_use.get("input", {}))
+    result = validate_plan_payload(tool_use.get("input", {}), contact=contact)
     if isinstance(result, TriageError):
         return result
 
@@ -614,6 +747,7 @@ async def triage_contact_mail(
         notes=result.notes,
         raw_input_tokens=response.input_tokens,
         raw_output_tokens=response.output_tokens,
+        note_proposals=result.note_proposals,
     )
 
 
@@ -868,6 +1002,7 @@ async def triage_with_scope(
             plan_or_error.raw_output_tokens
             + classification.raw_output_tokens
         ),
+        note_proposals=plan_or_error.note_proposals,
     )
 
 
@@ -926,7 +1061,7 @@ async def _triage_with_notes(
             detail=str(tool_use.get("name")),
         )
 
-    result = validate_plan_payload(tool_use.get("input", {}))
+    result = validate_plan_payload(tool_use.get("input", {}), contact=contact)
     if isinstance(result, TriageError):
         return result
 
@@ -940,4 +1075,5 @@ async def _triage_with_notes(
         notes=result.notes,
         raw_input_tokens=response.input_tokens,
         raw_output_tokens=response.output_tokens,
+        note_proposals=result.note_proposals,
     )

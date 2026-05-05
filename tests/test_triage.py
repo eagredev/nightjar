@@ -20,6 +20,7 @@ from daemon.config import ClaudeConfig, Contact
 from daemon.triage import (
     ClaudeClient,
     ClaudeResponse,
+    NoteProposal,
     TriageError,
     TriagePlan,
     MessageStructure,
@@ -481,6 +482,166 @@ def test_max_tier_constant_is_outbound() -> None:
     changes, the change should be deliberate, with a doc update to
     DESIGN.md and the system prompt."""
     assert TRIAGE_MAX_TIER == 3
+
+
+# ---- Step 7d: note_proposals validation -----------------------------------
+
+
+def _payload_with_proposals(*proposals: dict[str, Any]) -> dict[str, Any]:
+    return _good_payload(note_proposals=list(proposals))
+
+
+def test_validate_accepts_empty_note_proposals() -> None:
+    plan = validate_plan_payload(_good_payload())
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_accepts_single_unscoped_proposal() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "General",
+         "body": "Replies fastest in evenings."},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert len(plan.note_proposals) == 1
+    p = plan.note_proposals[0]
+    assert isinstance(p, NoteProposal)
+    assert p.scope is None
+    assert p.section_heading == "General"
+    assert p.body == "Replies fastest in evenings."
+
+
+def test_validate_accepts_scoped_proposal_when_contact_has_scope() -> None:
+    contact = _contact()
+    contact = Contact(
+        contact_id=contact.contact_id,
+        addresses=contact.addresses,
+        display_name=contact.display_name,
+        relationship=contact.relationship,
+        daily_limit=contact.daily_limit,
+        is_principal=contact.is_principal,
+        inboxes=contact.inboxes,
+        scopes=("aurora",),
+    )
+    plan = validate_plan_payload(
+        _payload_with_proposals({
+            "scope": "aurora", "section_heading": "Aurora",
+            "body": "Track 3 deadline 2026-05-15.",
+        }),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals[0].scope == "aurora"
+
+
+def test_validate_drops_proposal_with_unknown_scope() -> None:
+    """Lenient handling: bad proposals are silently dropped, plan
+    survives. Losing one note is recoverable; losing the reply isn't."""
+    contact = _contact()
+    contact = Contact(
+        contact_id=contact.contact_id, addresses=contact.addresses,
+        display_name=contact.display_name, relationship=contact.relationship,
+        daily_limit=contact.daily_limit, is_principal=contact.is_principal,
+        inboxes=contact.inboxes, scopes=("aurora",),
+    )
+    plan = validate_plan_payload(
+        _payload_with_proposals(
+            {"scope": "aurora", "section_heading": "OK", "body": "Good."},
+            {"scope": "personal", "section_heading": "Bad", "body": "Bad."},
+        ),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    # Only the in-scope one survives.
+    assert len(plan.note_proposals) == 1
+    assert plan.note_proposals[0].scope == "aurora"
+
+
+def test_validate_drops_scoped_proposal_for_unscoped_contact() -> None:
+    """Contact has no scopes → any non-null scope is a model error."""
+    contact = _contact()  # default scopes=()
+    plan = validate_plan_payload(
+        _payload_with_proposals(
+            {"scope": "aurora", "section_heading": "Bad", "body": "Bad."},
+            {"scope": None, "section_heading": "Good", "body": "Good."},
+        ),
+        contact=contact,
+    )
+    assert isinstance(plan, TriagePlan)
+    assert len(plan.note_proposals) == 1
+    assert plan.note_proposals[0].scope is None
+
+
+def test_validate_drops_proposal_with_empty_heading() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "  ", "body": "x"},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_drops_proposal_with_empty_body() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "section_heading": "X", "body": ""},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_drops_proposal_missing_required_fields() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None, "body": "x"},  # no section_heading
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_truncates_long_heading_and_body() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": None,
+         "section_heading": "x" * 200,
+         "body": "y" * 1000},
+    ))
+    assert isinstance(plan, TriagePlan)
+    p = plan.note_proposals[0]
+    assert len(p.section_heading) <= 80
+    assert len(p.body) <= 280
+
+
+def test_validate_caps_proposal_count() -> None:
+    """Beyond the per-plan cap, extras are dropped."""
+    proposals = [
+        {"scope": None, "section_heading": f"H{i}", "body": f"B{i}"}
+        for i in range(10)
+    ]
+    plan = validate_plan_payload(_payload_with_proposals(*proposals))
+    assert isinstance(plan, TriagePlan)
+    # Cap is _MAX_NOTE_PROPOSALS_PER_PLAN (5).
+    assert len(plan.note_proposals) == 5
+
+
+def test_validate_accepts_non_list_proposals_field_as_empty() -> None:
+    """Defensive: if the model emits something other than an array,
+    drop the whole proposals field rather than fail the plan."""
+    plan = validate_plan_payload(_good_payload(note_proposals="not a list"))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_drops_non_dict_proposal_items() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        "not a dict",  # type: ignore[arg-type]
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
+
+
+def test_validate_drops_proposal_with_non_string_scope() -> None:
+    plan = validate_plan_payload(_payload_with_proposals(
+        {"scope": 42, "section_heading": "X", "body": "Y"},
+    ))
+    assert isinstance(plan, TriagePlan)
+    assert plan.note_proposals == ()
 
 
 # ---- triage_contact_mail (top-level) ---------------------------------------

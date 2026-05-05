@@ -48,7 +48,6 @@ def test_load_single_contact(tmp_path: Path) -> None:
     assert p.daily_limit == -1   # 'unlimited' -> -1
     assert p.is_principal is True
     assert p.inboxes == ("nightjar",)
-    assert p.auto_approve_notes is False  # default
     assert r.address_index == {"me@example.com": "principal"}
 
 
@@ -102,10 +101,14 @@ def test_default_values(tmp_path: Path) -> None:
     assert p.daily_limit == 3   # default
     assert p.display_name == "p"  # falls back to contact_id
     assert p.relationship == ""
-    assert p.auto_approve_notes is False
 
 
-def test_auto_approve_notes_when_set_true(tmp_path: Path) -> None:
+def test_legacy_auto_approve_notes_field_is_silently_ignored(tmp_path: Path) -> None:
+    """Step 7d (per Step 8 memory architecture): the daemon now writes
+    rapport notes autonomously, so the legacy auto_approve_notes
+    field is no longer honoured. Existing contact files written by
+    pre-Step-8 code may still have it; the loader must ignore the
+    field rather than rejecting the file."""
     contacts_dir = _write(tmp_path, "p", """
         contact_id = "p"
         addresses = ["p@example.com"]
@@ -113,8 +116,12 @@ def test_auto_approve_notes_when_set_true(tmp_path: Path) -> None:
         inboxes = ["nightjar"]
         auto_approve_notes = true
     """)
+    # No exception raised; contact loads cleanly.
     p = load_all(contacts_dir).contacts["p"]
-    assert p.auto_approve_notes is True
+    assert p.contact_id == "p"
+    # Field doesn't surface as an attribute (Contact dataclass no
+    # longer has it).
+    assert not hasattr(p, "auto_approve_notes")
 
 
 # ---- Empty / missing directory ----------------------------------------

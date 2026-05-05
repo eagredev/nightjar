@@ -334,7 +334,7 @@ def _exec_add(*, args: dict, config: Config, state: State, now: int, config_path
             "The new contact is live: a new TOML file has been written\n"
             "and the daemon's in-memory config updated. No restart needed.\n"
             f"Edit {contact_path} to tweak display_name, relationship,\n"
-            "daily_limit, or auto_approve_notes.\n"
+            "daily_limit, scopes, or inboxes.\n"
         ),
     )
 

@@ -52,10 +52,6 @@ class Contact:
     # the contact; the loader inverts it into inbox.allowed_contacts.
     # Empty tuple is a misconfigured contact (parser rejects it).
     inboxes: tuple[str, ...] = ()
-    # Step 7 forward-compat: when true, the daemon may append rapport
-    # notes proposed by triage without a separate per-note approval.
-    # Default false — every note proposal goes to the principal first.
-    auto_approve_notes: bool = False
     # Step 7b: topical scopes the contact is allowed to discuss. Empty
     # tuple = unrestricted (the historical default; preserves existing
     # behaviour). Non-empty = triage classifies each inbound message

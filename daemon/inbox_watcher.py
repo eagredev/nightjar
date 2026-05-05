@@ -35,6 +35,7 @@ from . import (
     cost_guard,
     dmarc,
     executor,
+    notes_store,
     notifier,
     principal_commands,
     principal_handlers,
@@ -2173,6 +2174,18 @@ class InboxWatcher:
             detail=f"verb={plan.verb}",
         )
 
+        # Step 7d: enqueue any note proposals triage emitted. Pending
+        # proposals show up in the next status report and via the
+        # notes-pending verb; auto-applied proposals are written to the
+        # contact's .md file immediately. Done before the verb branches
+        # so EVERY triage outcome (including noop/flag) can carry note
+        # proposals back — a routine "no action needed" message can
+        # still be worth noting (e.g. the contact mentioned a milestone
+        # in passing while saying "no reply needed").
+        self._handle_note_proposals(
+            contact_id=contact_id, plan=plan, now=now,
+        )
+
         # noop / flag don't queue an executor verb. They still need a
         # human-visible ping so the principal sees the triage output.
         if plan.verb in ("noop", "flag_for_review"):
@@ -2250,6 +2263,65 @@ class InboxWatcher:
             inbox=self.inbox.name, message_id=message_id,
             verb=plan.verb,
         )
+
+    def _handle_note_proposals(
+        self,
+        *,
+        contact_id: str,
+        plan: TriagePlan,
+        now: int,
+    ) -> None:
+        """Apply the plan's note_proposals directly to the contact's
+        notes file.
+
+        Writes are autonomous — no approval queue, no per-contact
+        auto-approve flag. The notes are the agent's working memory,
+        not a privileged-action surface; gating each write would
+        kneecap the value. The principal reviews accumulated notes
+        via `show notes` and removes anything they don't like via
+        `forget`. The contact can request deletion at any time.
+
+        See project-nightjar-step-8.md for the full memory architecture
+        rationale; this is ring 1 (per-contact memory) under the
+        broader content-firewall framing.
+
+        On write error, log warn but continue. Losing one note is
+        recoverable; failing the whole triage path because of a notes
+        write isn't. The JSONL log carries full provenance for any
+        principal who wants to grep history.
+        """
+        if not plan.note_proposals:
+            return
+
+        notes_path = self.config.daemon.notes_dir / f"{contact_id}.md"
+        for proposal in plan.note_proposals:
+            try:
+                notes_store.append_note(
+                    notes_path,
+                    contact_id=contact_id,
+                    section_heading=proposal.section_heading,
+                    body=proposal.body,
+                    scope=proposal.scope,
+                )
+            except (OSError, notes_store.NotesParseError) as e:
+                self.logger.event(
+                    "note_write_failed",
+                    level="warn",
+                    inbox=self.inbox.name,
+                    contact_id=contact_id,
+                    scope=proposal.scope,
+                    section_heading=proposal.section_heading,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                continue
+            self.logger.event(
+                "note_written",
+                inbox=self.inbox.name,
+                contact_id=contact_id,
+                scope=proposal.scope,
+                section_heading=proposal.section_heading,
+                body_preview=proposal.body[:100],
+            )
 
     def _send_triage_summary_to_principal(
         self,

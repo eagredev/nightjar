@@ -57,7 +57,6 @@ def _make_principal() -> Contact:
         daily_limit=-1,
         is_principal=True,
         inboxes=("nightjar",),
-        auto_approve_notes=False,
     )
 
 
