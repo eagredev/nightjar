@@ -661,4 +661,11 @@ _DISPATCH: dict[str, Callable] = {
     "remove": _exec_remove,
     "reply": _exec_reply,
     "forward_to_principal": _exec_forward,
+    # Step 7b: the synthetic out-of-scope decline. Executes via the
+    # same path as `reply` because the post-approval action is
+    # identical (send a body to the contact, audit-copy the principal).
+    # The verb name is preserved through the audit trail so the
+    # principal can distinguish a routine reply from a scope-driven
+    # decline in the outbound_log.
+    "out_of_scope_decline": _exec_reply,
 }

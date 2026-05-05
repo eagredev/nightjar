@@ -310,6 +310,69 @@ def filtered_text(parsed: ParsedNotes, active_scope: str | None) -> str:
     return "\n".join(out)
 
 
+def safe_text(parsed: ParsedNotes) -> str:
+    """Render only the truly-safe subset of the notes: content visible
+    to every scope. This is what the pass-1 scope classifier sees, so
+    that scope-tagged content cannot leak into a classification round.
+
+    A bullet survives iff its *effective* scope (own scopes if set,
+    otherwise inherited from the section) is wildcard or empty. A
+    section heading without a scope tag inherits the wildcard for
+    bullet inheritance — but in practice we render section headings
+    only when at least one bullet survives.
+
+    Concretely: a bullet from a `## Personal [scopes: personal]`
+    section will NEVER appear in safe_text, even if the bullet itself
+    has no scope tag (it inherits `personal`). A `[scopes: *]` bullet
+    appears regardless of section. An entirely-unscoped section's
+    bullets all appear (they inherit the wildcard).
+    """
+    out: list[str] = []
+    for section in parsed.sections:
+        # If the section heading has a non-wildcard scope, every bullet
+        # under it inherits that scope (unless the bullet overrides),
+        # so a non-overriding bullet is unsafe by inheritance.
+        section_is_wildcard = (
+            not section.scopes
+            or _WILDCARD_SCOPE in section.scopes
+        )
+
+        kept_bullets: list[str] = []
+        for bullet in section.bullets:
+            if bullet.scopes:
+                # Bullet overrides — safe iff wildcard.
+                if _WILDCARD_SCOPE in bullet.scopes:
+                    kept_bullets.append(f"- {bullet.text}")
+            else:
+                # Bullet inherits section. Safe iff section is wildcard.
+                if section_is_wildcard:
+                    kept_bullets.append(f"- {bullet.text}")
+
+        if not kept_bullets:
+            continue
+
+        out.append(f"## {section.heading}")
+        out.append("")
+        out.extend(kept_bullets)
+        out.append("")
+
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def read_safe_notes(path: Path) -> str:
+    """Read and safe-filter a contact's notes file (classifier-friendly).
+    Returns "" when the file doesn't exist. Raises NotesParseError on
+    malformed content; callers fail closed (no notes block in the
+    classifier prompt) rather than guessing."""
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    parsed = parse(text)
+    return safe_text(parsed)
+
+
 # ---- Public reads ---------------------------------------------------------
 
 

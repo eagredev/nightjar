@@ -2084,9 +2084,15 @@ class InboxWatcher:
             return
         body_text, body_truncated, structure, raw_rfc822 = body_result
 
-        # 4. The triage call itself.
+        # 4. The triage call itself. Step 7b: routes through
+        # triage_with_scope, which handles the empty-scopes pass-through
+        # (behaves like the old triage_contact_mail) AND the two-pass
+        # scoped path. The orchestrator owns: classifier-then-triage,
+        # scope-filtered notes injection, fail-closed out-of-scope
+        # decline. Existing contacts (with scopes=[]) take the old
+        # path unchanged; opted-in contacts get scope gating.
         contact = self.config.contacts[contact_id]
-        plan_or_err = await triage.triage_contact_mail(
+        plan_or_err = await triage.triage_with_scope(
             contact=contact,
             sender=from_addr,
             subject=subject or "",
@@ -2095,6 +2101,8 @@ class InboxWatcher:
             config=claude_cfg,
             client=self._claude_client,
             prompts_dir=PROMPTS_DIR,
+            notes_dir=self.config.daemon.notes_dir,
+            scopes_registry=self.config.scopes,
         )
 
         # 5. Ledger row regardless of outcome (audit trail, rate counter).
@@ -2181,7 +2189,14 @@ class InboxWatcher:
         # tier-3 _exec_reply needs (contact_id, body, subject,
         # in_reply_to). Subject is built from the inbound subject so
         # the reply threads correctly.
-        if plan.verb == "reply":
+        #
+        # Step 7b: `out_of_scope_decline` is structurally identical to
+        # `reply` — the orchestrator constructs a templated decline
+        # body and the dispatch routes through the same executor. The
+        # verb name is preserved through the approval, audit log, and
+        # outbound_log so the principal can distinguish a routine
+        # reply from a scope-driven decline at any point.
+        if plan.verb in ("reply", "out_of_scope_decline"):
             reply_subject = self._build_reply_subject(subject)
             args = {
                 "contact_id": contact_id,
@@ -2193,7 +2208,7 @@ class InboxWatcher:
                 message_id=message_id, contact_id=contact_id,
                 from_addr=from_addr, from_header=from_header,
                 subject=subject, date_header=date_header,
-                plan=plan, verb="reply",
+                plan=plan, verb=plan.verb,
                 args=args, body_text=body_text,
                 body_truncated=body_truncated,
             )

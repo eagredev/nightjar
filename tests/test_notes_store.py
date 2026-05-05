@@ -12,6 +12,8 @@ from daemon.notes_store import (
     filtered_text,
     parse,
     read_notes,
+    read_safe_notes,
+    safe_text,
 )
 
 
@@ -251,6 +253,138 @@ def test_filtered_text_omits_frontmatter() -> None:
     out = filtered_text(parsed, None)
     assert "contact_id:" not in out
     assert "created_at:" not in out
+
+
+# ---- safe_text (classifier-only filter) -----------------------------------
+
+
+def test_safe_text_keeps_unscoped_section_bullets() -> None:
+    """A section without a scope tag is wildcard by default; its
+    bullets without their own override are safe."""
+    text = """---
+contact_id: alice
+---
+
+## General
+
+- Replies fastest in the evenings.
+- Uses British English.
+"""
+    parsed = parse(text)
+    out = safe_text(parsed)
+    assert "Replies fastest" in out
+    assert "British English" in out
+
+
+def test_safe_text_drops_scoped_section_unscoped_bullet() -> None:
+    """A bullet under a `[scopes: aurora]` section without its own
+    override inherits aurora — NOT safe for the classifier."""
+    text = """---
+contact_id: fraser
+---
+
+## Aurora project [scopes: aurora]
+
+- Working on track 3.
+"""
+    parsed = parse(text)
+    out = safe_text(parsed)
+    assert "Working on track 3" not in out
+    assert "## Aurora project" not in out
+
+
+def test_safe_text_keeps_wildcard_bullet_in_scoped_section() -> None:
+    """A `[scopes: *]` bullet inside an otherwise-scoped section
+    appears regardless of section scope."""
+    text = """---
+contact_id: fraser
+---
+
+## Aurora project [scopes: aurora]
+
+- Specific aurora detail.
+- General communication style. [scopes: *]
+"""
+    parsed = parse(text)
+    out = safe_text(parsed)
+    assert "Specific aurora detail" not in out
+    assert "General communication style" in out
+    # Section heading appears because at least one bullet survived.
+    assert "## Aurora project" in out
+
+
+def test_safe_text_drops_aurora_only_bullet_in_unscoped_section() -> None:
+    """A bullet with its own [scopes: aurora] override in an unscoped
+    section is aurora-only — NOT safe."""
+    text = """---
+contact_id: x
+---
+
+## General
+
+- Uses British English. [scopes: *]
+- Aurora deadline 2026-05-15. [scopes: aurora]
+"""
+    parsed = parse(text)
+    out = safe_text(parsed)
+    assert "Uses British English" in out
+    assert "Aurora deadline" not in out
+
+
+def test_safe_text_drops_entirely_scoped_files() -> None:
+    """A file with only scoped content has empty safe_text."""
+    text = """---
+contact_id: x
+---
+
+## Aurora [scopes: aurora]
+
+- Detail.
+
+## Personal [scopes: personal]
+
+- Detail.
+"""
+    parsed = parse(text)
+    assert safe_text(parsed) == ""
+
+
+def test_safe_text_excludes_scope_tag_from_render() -> None:
+    text = """---
+contact_id: x
+---
+
+## General
+
+- Bullet one. [scopes: *]
+"""
+    parsed = parse(text)
+    out = safe_text(parsed)
+    assert "[scopes:" not in out
+
+
+def test_read_safe_notes_missing_file_returns_empty(tmp_path: Path) -> None:
+    assert read_safe_notes(tmp_path / "nope.md") == ""
+
+
+def test_read_safe_notes_filters_real_file(tmp_path: Path) -> None:
+    p = tmp_path / "fraser.md"
+    p.write_text(CANONICAL_SAMPLE, encoding="utf-8")
+    out = read_safe_notes(p)
+    # Aurora-section content (incl. dual-scope bullet that contains aurora)
+    # is NOT safe — aurora scope leaks would defeat the purpose.
+    assert "Working on track 3" not in out
+    assert "Prefers concrete examples" not in out
+    # General section's wildcards survive.
+    assert "Replies fastest" in out
+    assert "British English" in out
+
+
+def test_read_safe_notes_propagates_parse_errors(tmp_path: Path) -> None:
+    p = tmp_path / "broken.md"
+    p.write_text("---\nfoo\n---\n", encoding="utf-8")
+    with pytest.raises(NotesParseError):
+        read_safe_notes(p)
 
 
 # ---- read_notes (with filesystem) -----------------------------------------
