@@ -72,7 +72,8 @@ def _structure(
     attachment_count: int = 0,
     attachment_names: tuple[str, ...] = (),
     inline_image_count: int = 0,
-    total_size_bytes: int = 1024,
+    plain_size_bytes: int = 200,
+    html_size_bytes: int = 0,
     body_truncated_in_prompt: bool = False,
 ) -> MessageStructure:
     return MessageStructure(
@@ -80,7 +81,8 @@ def _structure(
         attachment_count=attachment_count,
         attachment_names=attachment_names,
         inline_image_count=inline_image_count,
-        total_size_bytes=total_size_bytes,
+        plain_size_bytes=plain_size_bytes,
+        html_size_bytes=html_size_bytes,
         body_truncated_in_prompt=body_truncated_in_prompt,
     )
 
@@ -239,7 +241,8 @@ def test_user_message_renders_structure_facts() -> None:
             attachment_count=2,
             attachment_names=("contract.pdf", "scan.jpg"),
             inline_image_count=1,
-            total_size_bytes=51234,
+            plain_size_bytes=120,
+            html_size_bytes=4800,
             body_truncated_in_prompt=True,
         ),
     )
@@ -248,8 +251,11 @@ def test_user_message_renders_structure_facts() -> None:
     assert "contract.pdf" in msg
     assert "scan.jpg" in msg
     assert "inline_image_count: 1" in msg
-    assert "total_size_bytes: 51234" in msg
+    assert "plain_size_bytes: 120" in msg
+    assert "html_size_bytes: 4800" in msg
     assert "body_truncated_in_prompt: true" in msg
+    # The retired field must not appear.
+    assert "total_size_bytes" not in msg
 
 
 def test_user_message_truncates_long_attachment_lists() -> None:

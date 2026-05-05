@@ -192,9 +192,9 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
 
 
 def load(
-    path: Path = DEFAULT_CONFIG_PATH,
+    path: Path | None = None,
     *,
-    secrets_path: Path = DEFAULT_SECRETS_PATH,
+    secrets_path: Path | None = None,
 ) -> Config:
     """Parse the INI file at `path`, splice in secrets from
     `secrets_path` if it exists, return a validated Config.
@@ -208,7 +208,15 @@ def load(
       - A secret found in BOTH the INI and secrets.toml is a misconfig:
         the migrator should have stripped the INI copy. We refuse to
         start in that case.
+
+    Defaults are looked up at call time (not via mutable-default
+    arguments) so tests can monkeypatch `DEFAULT_SECRETS_PATH` to
+    isolate from the operator's live ~/.config/nightjar/.
     """
+    if path is None:
+        path = DEFAULT_CONFIG_PATH
+    if secrets_path is None:
+        secrets_path = DEFAULT_SECRETS_PATH
     if not path.exists():
         raise ConfigError(f"config not found at {path}")
 

@@ -249,8 +249,45 @@ def test_extract_structure_plain_text_only() -> None:
     assert s.attachment_count == 0
     assert s.attachment_names == ()
     assert s.inline_image_count == 0
-    assert s.total_size_bytes == len(blob)
+    # Plain-text body bytes (after Content-Transfer-Encoding decode).
+    # The Subject and From headers do NOT contribute — that's the
+    # point of the new schema.
+    assert s.plain_size_bytes == len(b"Just text.\r\n")
+    assert s.html_size_bytes == 0
     assert s.body_truncated_in_prompt is False
+
+
+def test_extract_structure_separates_plain_and_html_sizes() -> None:
+    """Bug fix: a plain-text email arriving via Gmail has 5+ KB of
+    MTA-injected headers. We must not let header bytes inflate the
+    "size" we report to the LLM. Only the part bodies count."""
+    plain_body = b"Hi, just a quick check-in.\r\n"
+    html_body = b"<p>Hi, just a quick check-in.</p>\r\n"
+    blob = (
+        b"From: x@example.com\r\n"
+        b"Subject: alt\r\n"
+        # Imagine 4 KB of ARC/DKIM/Received headers here in practice.
+        b"X-Spurious-Big-Header: " + b"A" * 4000 + b"\r\n"
+        b"Content-Type: multipart/alternative; boundary=BOUND\r\n"
+        b"\r\n"
+        b"--BOUND\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        + plain_body +
+        b"--BOUND\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        + html_body +
+        b"--BOUND--\r\n"
+    )
+    msg = _make_msg(blob)
+    s = InboxWatcher._extract_message_structure(
+        msg, raw_size=len(blob), body_truncated=False,
+    )
+    # Header bloat does NOT contribute to either size.
+    assert s.plain_size_bytes < 100
+    assert s.html_size_bytes < 100
+    # And both got measured.
+    assert s.plain_size_bytes > 0
+    assert s.html_size_bytes > 0
 
 
 def test_extract_structure_detects_html_alternative() -> None:

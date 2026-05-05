@@ -95,12 +95,26 @@ class MessageStructure:
     LLM sees it. The LLM sees only the plain-text body; this dataclass
     is what it would learn if it could read the headers and walk the
     parts. Used to ground hidden-content detection.
+
+    `plain_size_bytes` and `html_size_bytes` are the byte sizes of the
+    decoded plain-text and (if present) HTML alternatives respectively.
+    Reporting them separately lets the LLM compare the two: a sparse
+    plain-text body with a much larger HTML alternative is the real
+    signal that the HTML carries content the plain-text view doesn't.
+
+    We deliberately do NOT report the size of the entire raw RFC822
+    envelope — that includes 5+ KB of MTA-injected headers (ARC-Seal,
+    ARC-Message-Signature, DKIM, Received chains) which have nothing
+    to do with the content the sender actually wrote, and would
+    consistently make small plain-text emails look "huge" and trip
+    the hidden-content sweep falsely.
     """
     has_html_alternative: bool
     attachment_count: int
     attachment_names: tuple[str, ...]
     inline_image_count: int
-    total_size_bytes: int
+    plain_size_bytes: int
+    html_size_bytes: int  # 0 when no HTML alternative is present
     body_truncated_in_prompt: bool
 
 
@@ -365,7 +379,8 @@ def build_user_message(
         f"attachment_count: {structure.attachment_count}\n"
         f"attachment_names: {_render_attachment_names(structure.attachment_names)}\n"
         f"inline_image_count: {structure.inline_image_count}\n"
-        f"total_size_bytes: {structure.total_size_bytes}\n"
+        f"plain_size_bytes: {structure.plain_size_bytes}\n"
+        f"html_size_bytes: {structure.html_size_bytes}\n"
         f"body_truncated_in_prompt: {str(structure.body_truncated_in_prompt).lower()}\n"
         "</message_structure>\n"
         "\n"
