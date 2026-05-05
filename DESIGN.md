@@ -553,14 +553,14 @@ flow). Both feed into the same execution layer once approved.
 |-------|-----------------|-----------------|
 | `AUTH_CHECK` | Principal-claimed email arrived | to `PARSED` or `AUTH_REJECTED` |
 | `AUTH_REJECTED` | TOTP missing/invalid/replay/DMARC fail | terminal; switch counter increments |
-| `PARSED` | TOTP valid; deterministic command parser ran | to `TIER_1_AUTOEXEC`, `AWAITING_APPROVAL`, or `INTERPRET_OFFERED` |
+| `PARSED` | TOTP valid; deterministic command parser ran | to `TIER_1_AUTOEXEC`, `AWAITING_APPROVAL`, or `INTERPRETING` |
 | `TIER_1_AUTOEXEC` | Tier-1 verb recognised (status, list, query) | to `RESPONDED` directly |
 | `AWAITING_APPROVAL` | Tier-2+ verb recognised; approval ping sent | to `APPROVED`, `DENIED`, `EXPIRED`, or back to `AWAITING_APPROVAL` if the verdict reply was UNCLEAR or insufficient (tier-4 needs YES IRREVERSIBLE) |
 | `APPROVED` | Verdict reply matched (yes for tier-2; YES IRREVERSIBLE for tier-4) | to `EXECUTED` or `EXECUTION_FAILED` |
 | `DENIED` | Principal replied no/deny/stop | terminal |
 | `EXPIRED` | No verdict reply within window (default 7 days) | terminal |
-| `INTERPRET_OFFERED` | Free-form principal request; daemon asked "spend tokens to interpret?" | to `INTERPRETING` (yes interpret), `INTERPRET_DECLINED` (no), or `INTERPRET_STUBBED` (yes, but LLM not yet wired in current build step) |
-| `INTERPRETING` | LLM call to parse the free-form request into a structured plan | to `AWAITING_APPROVAL` (plan generated) |
+| `INTERPRETING` | Free-form principal request; LLM is parsing it into either a tier-1 inline answer or a tier-2+ structured plan | to `RESPONDED` (tier-1 inline answer) or `AWAITING_APPROVAL` (tier-2+ plan) |
+| `INTERPRET_STUBBED` | Free-form arrived, but the principal-interpret Claude call is not yet wired in the current build (#108) | terminal until #108 lands |
 | `EXECUTED` | Approved verb ran successfully; reply sent | terminal |
 | `EXECUTION_FAILED` | Approved verb raised or returned ok=False | terminal (recorded for diagnostic) |
 | `RESPONDED` | Tier-1 reply sent | terminal |
@@ -753,34 +753,36 @@ dicts so the running daemon picks up the change without a restart.
 ### Free-form requests (LLM-interpreted)
 
 Anything not matching a deterministic verb is a free-form request.
-The daemon does not silently invoke the LLM; it sends a brief
-clarification:
+An authenticated principal sending a free-form query already
+authorises the daemon to spend Claude tokens interpreting it within
+the tier ceiling — there is no second confirmation gate (the
+earlier "yes interpret" prompt was dropped on 2026-05-06; it was
+friction without security value once the token+TOTP envelope and
+tier confirmation already gate destructive verbs).
 
-```
-[Nightjar] Free-form request, interpret with LLM?
+Tiered output:
 
-Your request:
-> Nightjar, can you take a look at the failing build and figure
-> out why the music tests are red?
+- **Tier-1 inline answer**: read-only queries ("what's my status?",
+  "any pending approvals?") get an inline reply email. No approval
+  queue. Same shape as deterministic tier-1 verbs.
+- **Tier-2+ structured plan**: queries that imply a side-effect
+  produce a `draft_plan` that lands in the same approval queue
+  tier-2+ deterministic verbs use. The principal approves with the
+  usual `[Nightjar #token]` reply.
 
-I can either:
-  - Reply "yes interpret" to spend tokens (~$0.01-$0.05) on
-    parsing this and producing a structured plan
-  - Reply with a recognised verb instead
-  - Reply "no" to drop the request
+Tier ceiling matches triage (`TRIAGE_MAX_TIER`); validation in
+Python refuses any plan above the ceiling regardless of what the
+LLM produces. A token-cost backstop (default ~$0.10/message,
+configurable as `[claude].principal_per_message_cost_cents`) catches
+runaway interpretations: if a single pass would blow past the
+ceiling, the daemon sends one approval ping with the partial result
+and a "continue?" verdict request rather than spending more.
 
-Note: any tier-4 or tier-5 actions in the resulting plan will
-require explicit double-confirmation regardless of how the request
-is interpreted.
-```
-
-When the principal replies `yes interpret`, the LLM call (system
-prompt: `principal_command.md`) parses the request into a
-structured plan with explicit tier annotations. The daemon enforces
-the tier requirements on the plan; the LLM cannot produce a plan
-that bypasses double-confirm on a tier-4 action because the daemon
-checks the plan's tier annotations against the action types
-defined in code.
+An optional experimental knob, `[claude].principal_always_direct`,
+ships off-by-default. When on, even side-effect queries get an
+inline prose response that suggests the deterministic verb to issue
+manually. Useful for operators who want a chattier UX without
+enlarging the auto-action surface.
 
 ### Conversational continuity (sessions)
 

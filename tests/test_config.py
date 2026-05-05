@@ -434,6 +434,10 @@ def test_claude_minimal_uses_defaults(tmp_path: Path) -> None:
     assert cfg.claude.default_model == "claude-haiku-4-5"
     assert cfg.claude.per_hour_max_invocations == 30
     assert cfg.claude.per_invocation_max_input_tokens == 8000
+    # Cost backstop defaults (Step 6f).
+    assert cfg.claude.principal_per_message_cost_cents == 10
+    assert cfg.claude.principal_hard_kill_multiplier == 5
+    assert cfg.claude.principal_always_direct is False
 
 
 def test_claude_explicit_values_round_trip(tmp_path: Path) -> None:
@@ -443,7 +447,10 @@ def test_claude_explicit_values_round_trip(tmp_path: Path) -> None:
             f"[claude]\n        api_key = {_FAKE_CLAUDE_KEY}\n"
             "        default_model = claude-sonnet-4-6\n"
             "        per_hour_max_invocations = 10\n"
-            "        per_invocation_max_input_tokens = 4000"
+            "        per_invocation_max_input_tokens = 4000\n"
+            "        principal_per_message_cost_cents = 25\n"
+            "        principal_hard_kill_multiplier = 3\n"
+            "        principal_always_direct = true"
         ),
     )
     cfg = load_config(path)
@@ -451,6 +458,51 @@ def test_claude_explicit_values_round_trip(tmp_path: Path) -> None:
     assert cfg.claude.default_model == "claude-sonnet-4-6"
     assert cfg.claude.per_hour_max_invocations == 10
     assert cfg.claude.per_invocation_max_input_tokens == 4000
+    assert cfg.claude.principal_per_message_cost_cents == 25
+    assert cfg.claude.principal_hard_kill_multiplier == 3
+    assert cfg.claude.principal_always_direct is True
+
+
+def test_claude_rejects_zero_cost_cap(tmp_path: Path) -> None:
+    path = _conf_with_claude(
+        tmp_path,
+        claude_block=(
+            f"[claude]\n        api_key = {_FAKE_CLAUDE_KEY}\n"
+            "        principal_per_message_cost_cents = 0"
+        ),
+    )
+    with pytest.raises(
+        ConfigError, match="principal_per_message_cost_cents must be > 0"
+    ):
+        load_config(path)
+
+
+def test_claude_rejects_negative_kill_multiplier(tmp_path: Path) -> None:
+    path = _conf_with_claude(
+        tmp_path,
+        claude_block=(
+            f"[claude]\n        api_key = {_FAKE_CLAUDE_KEY}\n"
+            "        principal_hard_kill_multiplier = 0"
+        ),
+    )
+    with pytest.raises(
+        ConfigError, match="principal_hard_kill_multiplier must be >= 1"
+    ):
+        load_config(path)
+
+
+def test_claude_rejects_invalid_always_direct(tmp_path: Path) -> None:
+    path = _conf_with_claude(
+        tmp_path,
+        claude_block=(
+            f"[claude]\n        api_key = {_FAKE_CLAUDE_KEY}\n"
+            "        principal_always_direct = maybe"
+        ),
+    )
+    with pytest.raises(
+        ConfigError, match="principal_always_direct must be a boolean"
+    ):
+        load_config(path)
 
 
 def test_claude_rejects_missing_api_key(tmp_path: Path) -> None:

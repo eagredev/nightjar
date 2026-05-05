@@ -116,8 +116,8 @@ impossible rather than promising it through prompts.
    │  → tier-based path  │                  │
    │                     │                  ▼
    │  unrecognised       │       ┌──────────────────────┐
-   │  → "interpret with  │       │  Plan emailed to     │
-   │     LLM?" prompt    │       │  operator for        │
+   │  → principal-       │       │  Plan emailed to     │
+   │     interpret pass  │       │  operator for        │
    └──────────┬──────────┘       │  approval            │
               │                  └──────────┬───────────┘
               ▼                              │

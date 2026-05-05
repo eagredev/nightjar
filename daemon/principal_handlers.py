@@ -98,14 +98,14 @@ def handle_list_pending(*, config: Config, state: State, args: dict[str, str]) -
     """
     counts = state.count_by_state()
     awaiting = counts.get("AWAITING_APPROVAL", 0)
-    interpret = counts.get("INTERPRET_OFFERED", 0)
+    interpreting = counts.get("INTERPRETING", 0)
     pending_approvals = state.list_pending_approvals()
 
     lines = [
         f"Pending items @ {_now_iso()}",
         "",
         f"  message rows AWAITING_APPROVAL:   {awaiting}",
-        f"  message rows INTERPRET_OFFERED:   {interpret}",
+        f"  message rows INTERPRETING:        {interpreting}",
         f"  approval-queue rows:              {len(pending_approvals)}",
         "",
     ]
@@ -132,7 +132,7 @@ def handle_list_pending(*, config: Config, state: State, args: dict[str, str]) -
         lines.append(
             "  (tier-4 needs body 'YES IRREVERSIBLE' uppercase)"
         )
-    elif awaiting == 0 and interpret == 0:
+    elif awaiting == 0 and interpreting == 0:
         lines.append("Nothing pending.")
     return _subject("list pending"), "\n".join(lines) + "\n"
 

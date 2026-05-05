@@ -30,7 +30,17 @@ from pathlib import Path
 
 from aioimaplib import aioimaplib
 
-from . import auth, dmarc, executor, notifier, principal_commands, principal_handlers, triage
+from . import (
+    auth,
+    cost_guard,
+    dmarc,
+    executor,
+    notifier,
+    principal_commands,
+    principal_handlers,
+    principal_interpret,
+    triage,
+)
 from .config import InboxConfig, Config
 from .dmarc import (
     DMARC_FAIL,
@@ -41,6 +51,14 @@ from .dmarc import (
     DMARC_TEMPERROR,
 )
 from .log import JSONLLogger
+from .principal_interpret import (
+    ActionProposal,
+    DaemonStateSnapshot,
+    DeterministicDispatch,
+    InlineResponse,
+    InterpretError,
+    VerbRegistrySummary,
+)
 from .state import State
 from .triage import TriageError, TriagePlan
 
@@ -571,7 +589,7 @@ class InboxWatcher:
             # approval replies, which prompts the principal to retry.
             body_result = await self._fetch_body_text(client, uid)
             body_text = body_result[0] if body_result is not None else None
-            self._dispatch_principal_command(
+            await self._dispatch_principal_command(
                 message_id=message_id, subject=subject,
                 body=body_text, from_addr=from_addr,
             )
@@ -725,7 +743,7 @@ class InboxWatcher:
         # Set our own stop event so this watcher exits its loop promptly.
         self._stop_event.set()
 
-    def _dispatch_principal_command(
+    async def _dispatch_principal_command(
         self,
         *,
         message_id: str,
@@ -735,26 +753,26 @@ class InboxWatcher:
     ) -> None:
         """Parse and handle one authenticated principal email.
 
-        Five branches:
+        Four branches:
 
         1. Approval-token reply: look up the pending approval, validate
            the verdict (tier-2 needs APPROVE, tier-4 needs IRREVERSIBLE),
            on approve dispatch the executor, send confirmation. State
            transitions to APPROVED, DENIED, or APPROVAL_UNCLEAR.
 
-        2. Interpret-choice reply: 'yes interpret' transitions to
-           INTERPRETING and sends the LLM-stubbed reply (Step 5 wires
-           the actual call). 'no' transitions to INTERPRET_DECLINED.
-
-        3. Tier-1 verb: dispatch the handler, send the reply, transition
+        2. Tier-1 verb: dispatch the handler, send the reply, transition
            to RESPONDED.
 
-        4. Tier-2+ verb: queue an approval row with a fresh token, ping
+        3. Tier-2+ verb: queue an approval row with a fresh token, ping
            the principal with [Nightjar #token] subject describing the
            proposed action, transition to AWAITING_APPROVAL.
 
-        5. Free-form: send the 'interpret with LLM?' prompt, transition
-           to INTERPRET_OFFERED.
+        4. Free-form: hand directly to the principal-interpret pass
+           (Claude call). The pass either answers inline (tier-1) or
+           proposes a structured plan that joins the approval queue
+           (tier-2+). The earlier "yes interpret" confirmation gate was
+           removed: an authenticated principal sending free-form already
+           authorises interpretation within the tier ceiling.
 
         SMTP failures here are non-fatal: the inbound message stays
         recorded; the operator just doesn't get a reply. That's a
@@ -764,12 +782,6 @@ class InboxWatcher:
 
         if cmd.approval_token is not None:
             self._resolve_approval_reply(
-                message_id=message_id, command=cmd, from_addr=from_addr
-            )
-            return
-
-        if cmd.interpret_choice is not None:
-            self._resolve_interpret_reply(
                 message_id=message_id, command=cmd, from_addr=from_addr
             )
             return
@@ -786,31 +798,9 @@ class InboxWatcher:
             )
             return
 
-        # Free-form fallback.
-        grammar = principal_commands.describe_grammar()
-        self._send_deterministic_reply(
-            message_id=message_id,
-            from_addr=from_addr,
-            subject="Nightjar: free-form request, interpret with LLM?",
-            body=(
-                "I didn't recognise this as a deterministic command.\n"
-                "\n"
-                "Your request:\n"
-                f"> {cmd.payload or '(empty)'}\n"
-                "\n"
-                "Reply with one of:\n"
-                "  - '[<code>] yes interpret' to spend tokens on parsing this\n"
-                "    into a structured plan (LLM call lands in Step 5;\n"
-                "    will currently stub a no-op response).\n"
-                "  - '[<code>] no' to drop the request.\n"
-                "  - '[<code>] <recognised verb>' to issue a fresh command.\n"
-                "\n"
-                "Recognised verbs:\n"
-                f"{grammar}\n"
-            ),
-            next_state="INTERPRET_OFFERED",
-            event_name="principal_free_form",
-            detail=cmd.payload[:80] if cmd.payload else "",
+        # Free-form: direct interpretation pass via Claude.
+        await self._dispatch_principal_interpret(
+            message_id=message_id, command=cmd, from_addr=from_addr
         )
 
     def _send_tier1_reply(
@@ -1097,47 +1087,469 @@ class InboxWatcher:
             detail=f"token={token} verb={verb} ok={result.ok}",
         )
 
-    def _resolve_interpret_reply(
+    async def _dispatch_principal_interpret(
         self, *, message_id: str, command, from_addr: str
     ) -> None:
-        """Handle 'yes interpret' / 'no' replies to a free-form prompt.
+        """Hand a free-form principal request to the principal-interpret
+        Claude pass.
 
-        The LLM call is stubbed (Step 5 wires claude-agent-sdk). For
-        now, 'yes interpret' produces a polite 'not yet wired' reply
-        and transitions to INTERPRETING (which then settles to
-        EXECUTION_FAILED via a follow-up in this same call). 'no'
-        transitions to INTERPRET_DECLINED, terminal.
+        Outcomes (with the message-state transition for each):
+
+          - No claude_client wired:           RECEIVED -> INTERPRET_SKIPPED
+          - Rate-limit cap hit:               RECEIVED -> INTERPRET_FAILED
+          - SDK / validation error:           RECEIVED -> INTERPRET_FAILED
+          - InlineResponse:                   RECEIVED -> RESPONDED
+          - DeterministicDispatch:            RECEIVED -> RESPONDED (verb runs)
+          - ActionProposal (tier 2 or 3):     RECEIVED -> AWAITING_APPROVAL
+
+        Failure paths still send the principal a deterministic reply so
+        they know the request was received but produced nothing
+        actionable.
         """
-        if command.interpret_choice == "NO_INTERPRET":
+        if self._claude_client is None:
             self._send_deterministic_reply(
                 message_id=message_id,
                 from_addr=from_addr,
-                subject="Nightjar: interpret declined",
+                subject="Nightjar: interpret skipped (no Claude config)",
                 body=(
-                    "Got it; the free-form request was dropped without\n"
-                    "interpretation. No action taken.\n"
+                    "Free-form request received, but the daemon has no\n"
+                    "[claude] section configured, so the principal-interpret\n"
+                    "pass cannot run. Re-issue your request as a deterministic\n"
+                    "verb (e.g. `[code] list pending`) or add a [claude]\n"
+                    "section to nightjar.conf and restart the daemon.\n"
                 ),
-                next_state="INTERPRET_DECLINED",
-                event_name="principal_interpret_declined",
+                next_state="INTERPRET_SKIPPED",
+                event_name="principal_interpret_skipped",
+                detail="no_claude_config",
             )
             return
 
-        # INTERPRET. Step 5 will replace this stub with a real Claude call.
+        claude_cfg = self.config.claude
+        assert claude_cfg is not None  # client is non-None iff config is
+
+        # In-daemon rate limit: same window the contact-triage path uses.
+        now = int(time.time())
+        recent = self.state.count_claude_invocations_since(
+            since_ts=now - RATE_LIMIT_WINDOW_SECONDS
+        )
+        if recent >= claude_cfg.per_hour_max_invocations:
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret cap reached",
+                body=(
+                    f"Free-form request received, but the in-daemon Claude\n"
+                    f"cap of {claude_cfg.per_hour_max_invocations}/hour has\n"
+                    f"been reached. Re-issue once the rate window reopens,\n"
+                    f"or use a deterministic verb (which doesn't spend the\n"
+                    f"Claude budget).\n"
+                ),
+                next_state="INTERPRET_FAILED",
+                event_name="principal_interpret_cap_blocked",
+                detail=f"recent={recent}",
+            )
+            return
+
+        snapshot = self._build_daemon_state_snapshot()
+        registry = self._build_verb_registry_summary()
+
+        outcome = await principal_interpret.interpret_principal_request(
+            request_subject=command.raw_subject or "",
+            request_body=command.payload or "",
+            state_snapshot=snapshot,
+            verb_registry=registry,
+            config=claude_cfg,
+            client=self._claude_client,
+            prompts_dir=PROMPTS_DIR,
+        )
+
+        # Ledger row for every call (success or fail). The token counts
+        # are zero on failure.
+        if isinstance(outcome, InterpretError):
+            self.state.record_claude_invocation(
+                purpose="principal_interpret",
+                contact_id="principal",
+                model=claude_cfg.default_model,
+                input_tokens=0, output_tokens=0,
+                ok=False,
+                error_reason=outcome.reason,
+                ts=now,
+            )
+            self.logger.event(
+                "principal_interpret_failed",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                reason=outcome.reason, detail=outcome.detail,
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret failed",
+                body=(
+                    f"Free-form interpretation didn't produce a usable plan.\n"
+                    f"\n"
+                    f"Reason: {outcome.reason}\n"
+                    f"Detail: {outcome.detail}\n"
+                    f"\n"
+                    f"Try re-issuing with a deterministic verb (see\n"
+                    f"`list pending`/`status`/`show contact`/etc.) or\n"
+                    f"rephrase the request more directly.\n"
+                ),
+                next_state="INTERPRET_FAILED",
+                event_name="principal_interpret_error_replied",
+                detail=outcome.reason,
+            )
+            return
+
+        # Success: record token spend.
+        self.state.record_claude_invocation(
+            purpose="principal_interpret",
+            contact_id="principal",
+            model=claude_cfg.default_model,
+            input_tokens=outcome.raw_input_tokens,
+            output_tokens=outcome.raw_output_tokens,
+            ok=True,
+            ts=now,
+        )
+
+        # Cost-cap check. The interpret-gate drop (#107) replaced the
+        # up-front "yes interpret" confirmation with this post-hoc
+        # backstop. Three bands:
+        #   ok        -> dispatch as normal
+        #   over_soft -> dispatch, but prepend a cost-overage notice
+        #                (loud on tier-2+ approvals, brief on tier-1)
+        #   over_hard -> refuse to surface the output; reply with a
+        #                cost-killed notice instead.
+        cost_verdict = cost_guard.evaluate_cost(
+            model=claude_cfg.default_model,
+            input_tokens=outcome.raw_input_tokens,
+            output_tokens=outcome.raw_output_tokens,
+            soft_cap_cents=claude_cfg.principal_per_message_cost_cents,
+            hard_kill_multiplier=claude_cfg.principal_hard_kill_multiplier,
+        )
+        if cost_verdict.verdict == cost_guard.COST_OVER_HARD:
+            self.logger.event(
+                "principal_interpret_cost_killed",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                cost_cents=round(cost_verdict.cost_cents_value, 4),
+                soft_cap_cents=cost_verdict.soft_cap_cents,
+                hard_cap_cents=cost_verdict.hard_cap_cents,
+                input_tokens=outcome.raw_input_tokens,
+                output_tokens=outcome.raw_output_tokens,
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret refused (cost over hard cap)",
+                body=(
+                    f"Free-form interpretation completed but the call cost\n"
+                    f"{cost_guard.format_cents(cost_verdict.cost_cents_value)}, "
+                    f"which is at or above the hard kill cap of "
+                    f"{cost_guard.format_cents(cost_verdict.hard_cap_cents)} "
+                    f"({cost_verdict.hard_cap_cents}\n"
+                    f"cents = {claude_cfg.principal_hard_kill_multiplier}x the "
+                    f"soft cap of {cost_verdict.soft_cap_cents} cents).\n"
+                    f"\n"
+                    f"The result is being dropped to defend against runaway\n"
+                    f"costs (a single interpret pass should not require\n"
+                    f"this much output). Re-issue with a more focused\n"
+                    f"request, or raise [claude].principal_hard_kill_multiplier\n"
+                    f"if this is legitimate.\n"
+                    f"\n"
+                    f"Tokens: input={outcome.raw_input_tokens}, "
+                    f"output={outcome.raw_output_tokens}.\n"
+                ),
+                next_state="INTERPRET_FAILED",
+                event_name="principal_interpret_cost_killed_replied",
+                detail=(
+                    f"cost={cost_verdict.cost_cents_value:.2f}c "
+                    f"hard={cost_verdict.hard_cap_cents}c"
+                ),
+            )
+            return
+
+        is_overage = cost_verdict.verdict == cost_guard.COST_OVER_SOFT
+        if is_overage:
+            self.logger.event(
+                "principal_interpret_cost_overage",
+                level="info",
+                inbox=self.inbox.name, message_id=message_id,
+                cost_cents=round(cost_verdict.cost_cents_value, 4),
+                soft_cap_cents=cost_verdict.soft_cap_cents,
+                input_tokens=outcome.raw_input_tokens,
+                output_tokens=outcome.raw_output_tokens,
+            )
+
+        if isinstance(outcome, InlineResponse):
+            self.logger.event(
+                "principal_interpret_inline",
+                inbox=self.inbox.name, message_id=message_id,
+                input_tokens=outcome.raw_input_tokens,
+                output_tokens=outcome.raw_output_tokens,
+            )
+            body = outcome.body.rstrip() + "\n"
+            if is_overage:
+                # Brief, non-loud line for tier-1 — the principal isn't
+                # being asked to authorise anything, so the warning is
+                # informational.
+                body = body + (
+                    "\n"
+                    f"(Note: this interpret cost "
+                    f"{cost_guard.format_cents(cost_verdict.cost_cents_value)}, "
+                    f"above your "
+                    f"{cost_guard.format_cents(cost_verdict.soft_cap_cents)} "
+                    f"soft cap.)\n"
+                )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject=f"Nightjar: {outcome.summary}",
+                body=body,
+                next_state="RESPONDED",
+                event_name="principal_interpret_inline_replied",
+                detail=outcome.summary[:80],
+            )
+            return
+
+        if isinstance(outcome, DeterministicDispatch):
+            self.logger.event(
+                "principal_interpret_dispatched",
+                inbox=self.inbox.name, message_id=message_id,
+                verb=outcome.verb, args=outcome.args,
+                input_tokens=outcome.raw_input_tokens,
+                output_tokens=outcome.raw_output_tokens,
+            )
+            self._dispatch_interpreted_tier1(
+                message_id=message_id, from_addr=from_addr,
+                outcome=outcome,
+                cost_verdict=cost_verdict if is_overage else None,
+            )
+            return
+
+        if isinstance(outcome, ActionProposal):
+            self.logger.event(
+                "principal_interpret_action_proposed",
+                inbox=self.inbox.name, message_id=message_id,
+                verb=outcome.verb, tier=outcome.tier,
+                input_tokens=outcome.raw_input_tokens,
+                output_tokens=outcome.raw_output_tokens,
+            )
+            self._queue_interpreted_action(
+                message_id=message_id, from_addr=from_addr,
+                outcome=outcome,
+                cost_verdict=cost_verdict if is_overage else None,
+            )
+            return
+
+        # Defensive: unreachable given the union shape, but if a future
+        # shape gets added without wiring, fail loud.
+        self.logger.event(
+            "principal_interpret_unhandled_outcome",
+            level="error",
+            inbox=self.inbox.name, message_id=message_id,
+            outcome_type=type(outcome).__name__,
+        )
+
+    def _build_daemon_state_snapshot(self) -> DaemonStateSnapshot:
+        """Cheap state-db snapshot for the principal-interpret user
+        message. No IMAP I/O. State counts are unconstrained-time
+        (count_by_state aggregates the whole messages table); for now
+        that's sufficient context for the LLM. A 24h-bounded variant
+        can land later if the unbounded view becomes noisy."""
+        counts = self.state.count_by_state()
+        pending = self.state.list_pending_approvals()
+        last_catchup_ts = self.state.get_last_catchup_at(self.inbox.name)
+        if last_catchup_ts is None:
+            last_iso = "(never)"
+        else:
+            import datetime
+            last_iso = datetime.datetime.fromtimestamp(
+                last_catchup_ts, tz=datetime.timezone.utc
+            ).isoformat()
+        return DaemonStateSnapshot(
+            pending_approvals=tuple(pending),
+            state_counts_24h=dict(counts),
+            last_catchup_iso=last_iso,
+        )
+
+    def _build_verb_registry_summary(self) -> VerbRegistrySummary:
+        """Project the deterministic verb registry into the per-tier
+        summary the principal-interpret prompt expects."""
+        tier1: list[str] = []
+        tier23: list[str] = []
+        for spec in principal_commands.VERB_REGISTRY:
+            if spec.tier == 1:
+                tier1.append(spec.name)
+            elif 2 <= spec.tier <= 3:
+                tier23.append(spec.name)
+        return VerbRegistrySummary(
+            tier1_names=tuple(tier1),
+            tier2_3_names=tuple(tier23),
+        )
+
+    def _dispatch_interpreted_tier1(
+        self, *, message_id: str, from_addr: str,
+        outcome: DeterministicDispatch,
+        cost_verdict: "cost_guard.CostVerdict | None" = None,
+    ) -> None:
+        """Run a deterministic tier-1 verb the LLM picked, email the
+        result, transition to RESPONDED. The synthetic ParsedCommand
+        carries the LLM-chosen verb and args; principal_handlers.dispatch
+        runs the same handler the user typing the verb directly would
+        hit."""
+        spec = next(
+            (s for s in principal_commands.VERB_REGISTRY if s.name == outcome.verb),
+            None,
+        )
+        if spec is None or spec.tier != 1:
+            # Defensive: validate_payload already screened for tier-1
+            # registry membership, but in case the registry changes
+            # mid-flight or a future shape slips through.
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret picked an unrecognised verb",
+                body=(
+                    f"The interpret pass suggested the verb {outcome.verb!r}\n"
+                    f"but it's not in the deterministic tier-1 registry.\n"
+                    f"This is a daemon-side mismatch, not your problem.\n"
+                ),
+                next_state="INTERPRET_FAILED",
+                event_name="principal_interpret_dispatch_unknown_verb",
+                detail=outcome.verb,
+            )
+            return
+        synthetic_cmd = principal_commands.ParsedCommand(
+            raw_subject=f"(interpret) {outcome.verb}",
+            verb=spec.name,
+            tier=spec.tier,
+            args=dict(outcome.args),
+            handler=spec.handler,
+            payload=outcome.summary,
+        )
+        result = principal_handlers.dispatch(
+            command=synthetic_cmd, config=self.config, state=self.state
+        )
+        if result is None:
+            self.logger.event(
+                "principal_interpret_handler_missing",
+                level="warn",
+                inbox=self.inbox.name, message_id=message_id,
+                verb=outcome.verb,
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: interpret dispatch failed",
+                body=(
+                    f"The interpret pass picked verb {outcome.verb!r} but no\n"
+                    f"handler is wired for it. This is a daemon-side bug.\n"
+                ),
+                next_state="INTERPRET_FAILED",
+                event_name="principal_interpret_handler_missing_replied",
+                detail=outcome.verb,
+            )
+            return
+        reply_subject, reply_body = result
+        # Prepend a one-liner explaining the redirection so the principal
+        # sees what the LLM thought they meant.
+        annotated_body = (
+            f"(Interpret picked: {outcome.verb} — {outcome.reasoning.strip()})\n"
+            f"\n"
+            f"{reply_body}"
+        )
+        if cost_verdict is not None:
+            annotated_body = annotated_body.rstrip() + (
+                "\n\n"
+                f"(Note: this interpret cost "
+                f"{cost_guard.format_cents(cost_verdict.cost_cents_value)}, "
+                f"above your "
+                f"{cost_guard.format_cents(cost_verdict.soft_cap_cents)} "
+                f"soft cap.)\n"
+            )
         self._send_deterministic_reply(
             message_id=message_id,
             from_addr=from_addr,
-            subject="Nightjar: LLM interpret not yet wired",
+            subject=reply_subject,
+            body=annotated_body,
+            next_state="RESPONDED",
+            event_name="principal_interpret_dispatched_replied",
+            detail=f"verb={outcome.verb}",
+        )
+
+    def _queue_interpreted_action(
+        self, *, message_id: str, from_addr: str,
+        outcome: ActionProposal,
+        cost_verdict: "cost_guard.CostVerdict | None" = None,
+    ) -> None:
+        """Queue a tier-2/3 ActionProposal in the approvals table and
+        ping the principal with the same shape `_queue_tier2_plus` uses
+        for deterministic verbs. The verb may be a registry name OR a
+        free-form action description; the approvals table doesn't care.
+        The executor for free-form verbs is part of the manifest-gated
+        work and may not yet be wired — the approval row will sit
+        until the principal approves, at which point the existing
+        executor dispatch will either find a handler or log the
+        un-handled verb (failing safely)."""
+        token = self._generate_approval_token()
+        self.state.queue_approval(
+            token=token,
+            message_id=message_id,
+            verb=outcome.verb,
+            args=dict(outcome.args),
+            tier=outcome.tier,
+        )
+        warning_block = ""
+        if outcome.irreversible_warning:
+            warning_block = f"\nWarning: {outcome.irreversible_warning}\n"
+        # Loud cost-overage banner for tier-2+ approvals: the principal
+        # is about to authorise a side effect, so the cost overrun is
+        # material context. Goes ABOVE the summary so it's visible
+        # before they read the action description.
+        cost_banner = ""
+        if cost_verdict is not None:
+            cost_banner = (
+                f"!!! COST OVERAGE !!!\n"
+                f"This interpret cost "
+                f"{cost_guard.format_cents(cost_verdict.cost_cents_value)} "
+                f"(soft cap "
+                f"{cost_guard.format_cents(cost_verdict.soft_cap_cents)}).\n"
+                f"Tokens: input={outcome.raw_input_tokens}, "
+                f"output={outcome.raw_output_tokens}.\n"
+                f"If this is unexpected, deny the approval and re-issue\n"
+                f"with a more focused request.\n"
+                f"---\n"
+                f"\n"
+            )
+        self._send_deterministic_reply(
+            message_id=message_id,
+            from_addr=from_addr,
+            subject=f"[Nightjar #{token}]",
             body=(
-                "You replied 'yes interpret', but the Claude call hasn't\n"
-                "landed yet (Step 5). The state machine recorded the\n"
-                "request but no plan was produced and no action will run.\n"
-                "\n"
-                "When Step 5 ships, this same reply will trigger the\n"
-                "interpretation pass and produce a structured plan for\n"
-                "your approval.\n"
+                f"{cost_banner}"
+                f"Approval needed (interpreted from your free-form request):\n"
+                f"\n"
+                f"Summary:    {outcome.summary}\n"
+                f"Verb:       {outcome.verb}\n"
+                f"Args:       {dict(outcome.args)}\n"
+                f"Tier:       {outcome.tier}\n"
+                f"\n"
+                f"Reasoning:  {outcome.reasoning}\n"
+                f"{warning_block}"
+                f"\n"
+                f"To approve, hit reply, paste your code at the end of the\n"
+                f"auto-filled subject, and put your verdict in the body:\n"
+                f"  Subject: Re: [Nightjar #{token}] <code>\n"
+                f"  Body:    yes\n"
+                f"\n"
+                f"To deny, same subject, body 'no'.\n"
+                f"\n"
+                f"Approval expires in 7 days.\n"
             ),
-            next_state="INTERPRET_STUBBED",
-            event_name="principal_interpret_stubbed",
+            next_state="AWAITING_APPROVAL",
+            event_name="principal_interpret_approval_queued",
+            detail=f"verb={outcome.verb} tier={outcome.tier} token={token}",
         )
 
     def _send_deterministic_reply(

@@ -24,9 +24,13 @@ matching keeps the grammar unambiguous: a subject is a command, not
 a sentence.
 
 Anything that doesn't match a recognised verb OR an approval token is
-classified as `free_form`. The watcher will then send the operator a
-deterministic "interpret with LLM?" prompt rather than silently
-invoking Claude.
+classified as `free_form`. The watcher hands free-form requests to
+the principal-interpret pass (see daemon/principal_interpret.py), which
+asks Claude to either answer inline (tier-1) or propose a structured
+plan for approval (tier-2+). The earlier "yes interpret" confirmation
+gate was dropped on 2026-05-06 — once an authenticated principal sends
+a free-form query, that's already authority enough to run interpretation
+within the tier ceiling.
 """
 from __future__ import annotations
 
@@ -219,12 +223,8 @@ class ParsedCommand:
       - approval_token + approval_verdict: a reply to a pending
         approval ping. verdict is one of APPROVE, DENY, IRREVERSIBLE,
         UNCLEAR (token recognised but the verdict word didn't match).
-      - interpret_choice: the principal replied to a free-form
-        clarification with "yes interpret" or "no". Surfaces as
-        INTERPRET, NO_INTERPRET, or None. Mutually exclusive with
-        verb / approval_token because they live in different reply
-        threads.
-      - is_free_form=True: anything else, deferred to the LLM gate
+      - is_free_form=True: anything else, handed to the principal-
+        interpret pass (Claude call) for inline answer or plan.
     """
     raw_subject: str
     verb: str | None = None
@@ -232,12 +232,11 @@ class ParsedCommand:
     args: dict[str, str] = field(default_factory=dict)
     approval_token: str | None = None
     approval_verdict: str | None = None  # APPROVE | DENY | IRREVERSIBLE | UNCLEAR
-    interpret_choice: str | None = None  # INTERPRET | NO_INTERPRET
     is_free_form: bool = False
     handler: str | None = None
     # The subject after stripping the code prefix and "Nightjar," lead-in.
-    # Useful for logging and for the LLM prompt if interpretation is
-    # later authorised.
+    # Used for logging and as the user query for the principal-interpret
+    # LLM call.
     payload: str = ""
 
 
@@ -296,25 +295,7 @@ def parse_principal_command(
     if not payload:
         return ParsedCommand(raw_subject=raw, is_free_form=True, payload="")
 
-    # Free-form clarification reply: "yes interpret" or "no" arrives as
-    # the entire post-code subject after the principal replies to the
-    # interpret-with-LLM prompt. We catch these BEFORE the verb registry
-    # because "no" would otherwise hit the free-form fallback. Strict
-    # match: trailing decoration disqualifies, same as verbs.
     lowered = payload.lower()
-    if lowered == "yes interpret":
-        return ParsedCommand(
-            raw_subject=raw,
-            interpret_choice="INTERPRET",
-            payload=payload,
-        )
-    if lowered == "no":
-        return ParsedCommand(
-            raw_subject=raw,
-            interpret_choice="NO_INTERPRET",
-            payload=payload,
-        )
-
     for spec in VERB_REGISTRY:
         m = re.match(spec.pattern, lowered, re.IGNORECASE)
         if m:

@@ -48,8 +48,8 @@ def test_parse_recognises_tier1_verbs(subject: str, verb: str, expected_args: di
 ])
 def test_parse_rejects_decorative_lead_in(subject: str) -> None:
     """Strict matching: 'Nightjar,' prefix is not accepted. Falls through
-    to free-form so the operator gets the 'interpret?' prompt rather than
-    a silent verb match. See module docstring for rationale."""
+    to free-form so the watcher hands it to the principal-interpret pass
+    rather than silently matching a verb. See module docstring."""
     cmd = parse_principal_command(subject)
     assert cmd.is_free_form is True
     assert cmd.verb is None
@@ -118,9 +118,12 @@ def test_parse_trailing_bracketed_code_after_token() -> None:
     assert cmd.approval_verdict == "APPROVE"
 
 
-def test_parse_bare_code_with_yes_interpret() -> None:
-    cmd = parse_principal_command("123456 yes interpret")
-    assert cmd.interpret_choice == "INTERPRET"
+def test_parse_bare_code_with_free_form_falls_through() -> None:
+    """The 'yes interpret' gate is gone; free-form just stays free-form
+    for the watcher to hand to the principal-interpret pass."""
+    cmd = parse_principal_command("123456 something to think about")
+    assert cmd.is_free_form is True
+    assert cmd.payload == "something to think about"
 
 
 def test_parse_show_contact_requires_arg() -> None:
@@ -344,35 +347,22 @@ def test_parse_approval_verdict_with_leading_code_in_subject() -> None:
     assert cmd.approval_verdict == "APPROVE"
 
 
-# ---- Interpret-choice replies (Build Step 4b) -----------------------------
+# ---- Free-form (gate removed 2026-05-06) ----------------------------------
 
 
-def test_parse_yes_interpret() -> None:
+def test_parse_yes_interpret_now_free_form() -> None:
+    """Post-gate-drop, 'yes interpret' is just a free-form payload —
+    the parser no longer special-cases it."""
     cmd = parse_principal_command("yes interpret")
-    assert cmd.interpret_choice == "INTERPRET"
-    assert cmd.verb is None
-    assert cmd.is_free_form is False
+    assert cmd.is_free_form is True
+    assert cmd.payload == "yes interpret"
 
 
-def test_parse_no_interprets_as_no_interpret() -> None:
-    """A bare 'no' is the principal declining the interpret offer.
-    Without context it's ambiguous, but the watcher only routes
-    interpret-choice when the message is a reply to an INTERPRET_OFFERED
-    parent. The parser surfaces the choice; the watcher decides whether
-    to act on it."""
+def test_parse_bare_no_is_free_form() -> None:
+    """A bare 'no' to a non-approval thread is just an unrecognised
+    free-form payload. (Approval replies route via [Nightjar #token];
+    this test covers the case where no token tag is present.)"""
     cmd = parse_principal_command("no")
-    assert cmd.interpret_choice == "NO_INTERPRET"
-
-
-def test_parse_interpret_with_leading_code() -> None:
-    cmd = parse_principal_command("[123456] yes interpret")
-    assert cmd.interpret_choice == "INTERPRET"
-
-
-def test_parse_interpret_strict_no_extra_words() -> None:
-    """Trailing words disqualify, same strictness as verbs."""
-    cmd = parse_principal_command("yes interpret please")
-    assert cmd.interpret_choice is None
     assert cmd.is_free_form is True
 
 

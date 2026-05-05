@@ -105,6 +105,9 @@ DEFAULT_AUTH_MODE = "hotp"
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
 DEFAULT_PER_HOUR_MAX_INVOCATIONS = 30
 DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS = 8000
+DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS = 10  # $0.10 soft cap
+DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER = 5  # 5x soft cap = hard refusal
+DEFAULT_PRINCIPAL_ALWAYS_DIRECT = False
 
 
 @dataclass(frozen=True)
@@ -133,11 +136,36 @@ class ClaudeConfig:
     size. A pathological email body should not be allowed to spend a
     whole hour's budget in one call. 8000 is enough for a normal
     email plus the system prompt and recent thread context.
+
+    `principal_per_message_cost_cents` is the soft cost ceiling for ONE
+    principal-interpret call. When a call exceeds this (computed from
+    actual token usage and the model's published rates), the daemon
+    surfaces the result to the principal but flags the overage in the
+    reply or approval ping. Default 10 cents; configurable to suit
+    operators with higher or lower tolerance. The cap exists because
+    the gate-drop change (#107) removed the up-front 'yes interpret'
+    confirmation, so this is the post-hoc backstop that catches
+    runaway interpretations.
+
+    `principal_hard_kill_multiplier` defines the 'absolutely no, drop
+    the result' threshold. If a call costs more than `principal_per_message_cost_cents
+    * principal_hard_kill_multiplier`, the daemon refuses to surface
+    the LLM output at all and emails the principal a brief 'killed for
+    cost' notice. Defends against pathological loops where the LLM
+    somehow generates very large output. Default 5x the soft cap.
+
+    `principal_always_direct` is an experimental UX knob. When true,
+    even side-effect queries get an inline prose answer that suggests
+    the deterministic verb to issue manually, instead of a structured
+    plan that lands in the approval queue. Off by default.
     """
     api_key: str
     default_model: str = DEFAULT_CLAUDE_MODEL
     per_hour_max_invocations: int = DEFAULT_PER_HOUR_MAX_INVOCATIONS
     per_invocation_max_input_tokens: int = DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS
+    principal_per_message_cost_cents: int = DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS
+    principal_hard_kill_multiplier: int = DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER
+    principal_always_direct: bool = DEFAULT_PRINCIPAL_ALWAYS_DIRECT
 
 
 @dataclass(frozen=True)
@@ -501,17 +529,46 @@ def load(
             per_inv_tokens = int(claude_section.get(
                 "per_invocation_max_input_tokens", str(DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS)
             ))
+            cost_cents = int(claude_section.get(
+                "principal_per_message_cost_cents",
+                str(DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS),
+            ))
+            kill_multiplier = int(claude_section.get(
+                "principal_hard_kill_multiplier",
+                str(DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER),
+            ))
         except ValueError as e:
             raise ConfigError(f"[claude] integer field must be int: {e}") from e
+        always_direct_raw = claude_section.get(
+            "principal_always_direct",
+            "true" if DEFAULT_PRINCIPAL_ALWAYS_DIRECT else "false",
+        ).strip().lower()
+        if always_direct_raw not in ("true", "false", "1", "0", "yes", "no"):
+            raise ConfigError(
+                "[claude].principal_always_direct must be a boolean "
+                f"(true/false), got: {always_direct_raw!r}"
+            )
+        always_direct = always_direct_raw in ("true", "1", "yes")
         if per_hour <= 0:
             raise ConfigError("[claude].per_hour_max_invocations must be > 0")
         if per_inv_tokens <= 0:
             raise ConfigError("[claude].per_invocation_max_input_tokens must be > 0")
+        if cost_cents <= 0:
+            raise ConfigError(
+                "[claude].principal_per_message_cost_cents must be > 0"
+            )
+        if kill_multiplier < 1:
+            raise ConfigError(
+                "[claude].principal_hard_kill_multiplier must be >= 1"
+            )
         claude = ClaudeConfig(
             api_key=api_key,
             default_model=default_model,
             per_hour_max_invocations=per_hour,
             per_invocation_max_input_tokens=per_inv_tokens,
+            principal_per_message_cost_cents=cost_cents,
+            principal_hard_kill_multiplier=kill_multiplier,
+            principal_always_direct=always_direct,
         )
 
     return Config(
