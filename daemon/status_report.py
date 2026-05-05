@@ -452,9 +452,15 @@ def render_status_report(report: StatusReport) -> str:
             ts_iso = _iso_or_never(r.get("ts"))
             ok_marker = "ok" if r.get("ok") else "FAIL"
             out.append(
-                f"  {ts_iso}  [{ok_marker}]  -> {r.get('to_addr', '?')[:40]}  "
-                f"{(r.get('subject') or '')[:30]}"
+                f"  {ts_iso}  [{ok_marker}]  -> {r.get('to_addr', '?')[:40]}"
             )
+            # Subject on its own indented line — no length cap. The
+            # subject is the most useful field for spotting accidental
+            # sends; we don't truncate it. Wrapping in email clients
+            # is fine.
+            subj = r.get("subject") or ""
+            if subj:
+                out.append(f"      {subj}")
     out.append("")
 
     # 7. Footer.

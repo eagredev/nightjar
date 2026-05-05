@@ -919,7 +919,7 @@ class State:
         self,
         *,
         states: tuple[str, ...] = (
-            "RECEIVED", "TRIAGE_FAILED", "TRIAGED",
+            "RECEIVED", "TRIAGE_FAILED",
             "INTERPRET_FAILED", "INTERPRET_SKIPPED",
         ),
         older_than_seconds: int | None = None,
