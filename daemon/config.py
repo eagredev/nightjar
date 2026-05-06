@@ -60,6 +60,18 @@ class Contact:
     # `Config.scopes` (the [scopes] registry); cross-validation
     # happens in load() because the loader can't see the registry.
     scopes: tuple[str, ...] = ()
+    # Scope/sensitivity Part 1: two-axis scope vocabulary. `facets` are
+    # universal axes (calendar, communication-style, finance, etc.)
+    # that apply across most contacts; `projects` are specific shared
+    # contexts (aurora, nightjar-dev). Project names may carry
+    # dot-separated sub-scopes (aurora.music) with parent/child
+    # visibility rules in notes_store.
+    #
+    # Mutual exclusion with `scopes`: a contact uses EITHER the legacy
+    # `scopes` field OR the (facets, projects) pair. Mixing both is a
+    # config error — the migration is deliberate, not silent.
+    facets: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -226,6 +238,17 @@ class Config:
     descriptions are fed into triage's prompt so the LLM has a
     concrete anchor for what each tag means.
     """
+    facets: dict[str, str] = field(default_factory=dict)
+    """Scope/sensitivity Part 1: facets registry — universal axes that
+    cross most contacts (calendar, communication-style, finance,
+    health, etc.). Same shape as `scopes`, distinct namespace. Facets
+    are flat names; no dot-notation."""
+    projects: dict[str, str] = field(default_factory=dict)
+    """Scope/sensitivity Part 1: projects registry — specific shared
+    contexts (aurora, nightjar-dev). Project names may include
+    dot-separated sub-projects (aurora.music). The registry stores
+    each entry as its full dotted name; parent existence is enforced
+    at load time."""
 
 
 def _parse_daily_limit(raw: str) -> int:
@@ -258,6 +281,13 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
 # enough that the LLM can echo them back without tokenisation surprises.
 _SCOPE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
+# Project names: scope-name segments separated by dots. Each segment
+# must satisfy _SCOPE_NAME_RE; "aurora.music" and "aurora.music.demo"
+# are both valid. Facets do NOT use this — they're flat by design.
+_PROJECT_NAME_RE = re.compile(
+    r"^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$"
+)
+
 
 def _validate_scope_name(name: str, *, source: str) -> None:
     """Raise ConfigError if `name` doesn't fit the scope-name shape.
@@ -269,6 +299,98 @@ def _validate_scope_name(name: str, *, source: str) -> None:
             f"{_SCOPE_NAME_RE.pattern} (lowercase letters, digits, "
             "underscore, hyphen; first char must be a letter)"
         )
+
+
+def _validate_facet_name(name: str, *, source: str) -> None:
+    """Facets are flat names (no dots). Same shape as legacy scopes."""
+    _validate_scope_name(name, source=source)
+
+
+def _validate_project_name(name: str, *, source: str) -> None:
+    """Project names may include dot-separated sub-projects. Each
+    segment is a valid scope name; the whole thing matches
+    _PROJECT_NAME_RE."""
+    if not _PROJECT_NAME_RE.match(name):
+        raise ConfigError(
+            f"{source}: project name {name!r} is invalid; must match "
+            f"{_PROJECT_NAME_RE.pattern} (dot-separated lowercase "
+            "segments, e.g. 'aurora' or 'aurora.music')"
+        )
+
+
+def project_parent(name: str) -> str | None:
+    """Return the immediate parent of a dotted project name, or None.
+
+    `aurora.music` -> `aurora`; `aurora.music.demo` -> `aurora.music`;
+    `aurora` -> None. The caller can walk this iteratively for
+    ancestor enumeration.
+    """
+    if "." not in name:
+        return None
+    return name.rsplit(".", 1)[0]
+
+
+def project_ancestors(name: str) -> tuple[str, ...]:
+    """Return all ancestors of `name`, root-first.
+
+    `aurora.music.demo` -> ('aurora', 'aurora.music').
+    `aurora` -> ().
+    """
+    parts = name.split(".")
+    if len(parts) == 1:
+        return ()
+    out = []
+    for i in range(1, len(parts)):
+        out.append(".".join(parts[:i]))
+    return tuple(out)
+
+
+def project_descendant_of(child: str, ancestor: str) -> bool:
+    """True if `child` is `ancestor` or any sub-project of it.
+
+    `aurora.music` is descendant_of `aurora` and of `aurora.music`;
+    `aurora.legal` is NOT descendant_of `aurora.music`.
+    """
+    if child == ancestor:
+        return True
+    return child.startswith(ancestor + ".")
+
+
+def project_visibility(
+    bullet_project: str, contact_projects: tuple[str, ...] | frozenset[str],
+) -> bool:
+    """Decide whether a note bullet tagged with `bullet_project` is
+    visible to a contact whose project list is `contact_projects`.
+
+    Bidirectional visibility:
+
+    - Bullet tagged exactly matches when the contact has that project
+      OR any ancestor of it. Example: a bullet tagged `aurora.music`
+      is visible to a contact with `aurora.music` or with `aurora`
+      (parent subsumes child).
+    - Bullet tagged a parent is visible to a contact with any
+      descendant. Example: a bullet tagged `aurora` is visible to a
+      contact with `aurora.music` (the contact has access to a
+      sub-area, so generic-aurora content is appropriate).
+    - Sibling sub-scopes are isolated: a bullet tagged `aurora.music`
+      is NOT visible to a contact with only `aurora.legal`.
+
+    Both arguments are pre-validated project names (caller is expected
+    to have routed them through `_validate_project_name` upstream).
+    """
+    contact_set = (
+        contact_projects if isinstance(contact_projects, (set, frozenset))
+        else set(contact_projects)
+    )
+    for cp in contact_set:
+        # Contact's project covers bullet (contact has parent or exact).
+        if project_descendant_of(bullet_project, cp):
+            return True
+        # Contact's project is a descendant of the bullet's project
+        # (bullet tags a parent, contact has a child).
+        if project_descendant_of(cp, bullet_project):
+            return True
+    return False
 
 
 def load(
@@ -492,10 +614,92 @@ def load(
                 )
             scopes[name] = description
 
-    # Cross-check: every scope referenced by any contact must exist in
-    # the registry. We deferred this from the contacts_loader because
-    # the loader can't see the [scopes] section.
+    # Scope/sensitivity Part 1: [facets] registry. Universal axes,
+    # flat names. Same description-required rule as [scopes].
+    facets: dict[str, str] = {}
+    if "facets" in parser:
+        facets_section = parser["facets"]
+        for name, description in facets_section.items():
+            _validate_facet_name(name, source="[facets]")
+            description = description.strip()
+            if not description:
+                raise ConfigError(
+                    f"[facets].{name} has empty description; every facet "
+                    "must have a one-line description (it's fed into the "
+                    "triage prompt)"
+                )
+            facets[name] = description
+
+    # Scope/sensitivity Part 1: [projects] registry. Specific contexts,
+    # dot-separated names allowed for sub-projects. Each project's
+    # parent (if any) must also exist in the registry — we enforce this
+    # after parsing all entries because the order in the INI file is
+    # not guaranteed parent-first.
+    projects: dict[str, str] = {}
+    if "projects" in parser:
+        projects_section = parser["projects"]
+        for name, description in projects_section.items():
+            _validate_project_name(name, source="[projects]")
+            description = description.strip()
+            if not description:
+                raise ConfigError(
+                    f"[projects].{name} has empty description; every "
+                    "project must have a one-line description (it's "
+                    "fed into the triage prompt)"
+                )
+            projects[name] = description
+        for name in projects:
+            for ancestor in project_ancestors(name):
+                if ancestor not in projects:
+                    raise ConfigError(
+                        f"[projects].{name} declares a sub-project but "
+                        f"its parent {ancestor!r} is not defined. Add "
+                        f"{ancestor} = <description> to [projects] or "
+                        f"rename {name!r} so it has no parent."
+                    )
+
+    # Cross-check namespaces don't collide. A name appearing in both
+    # [facets] and [projects] (or in either + [scopes]) would create
+    # ambiguity at the contact-TOML level (which axis does this name
+    # belong to?). Reject at config load.
+    if facets.keys() & projects.keys():
+        clash = sorted(facets.keys() & projects.keys())
+        raise ConfigError(
+            f"name(s) {clash!r} appear in both [facets] and [projects]; "
+            "each name must belong to exactly one axis. Rename one side."
+        )
+    if scopes.keys() & facets.keys():
+        clash = sorted(scopes.keys() & facets.keys())
+        raise ConfigError(
+            f"name(s) {clash!r} appear in both [scopes] (legacy) and "
+            "[facets]. Remove from one side; the migration is meant to "
+            "be deliberate, not silent."
+        )
+    if scopes.keys() & projects.keys():
+        clash = sorted(scopes.keys() & projects.keys())
+        raise ConfigError(
+            f"name(s) {clash!r} appear in both [scopes] (legacy) and "
+            "[projects]. Remove from one side; the migration is meant "
+            "to be deliberate, not silent."
+        )
+
+    # Cross-check: every scope/facet/project referenced by any contact
+    # must exist in its respective registry. We deferred this from the
+    # contacts_loader because the loader can't see these sections.
     for contact in contacts.values():
+        # Mutual exclusion: contact uses EITHER legacy `scopes` OR the
+        # (facets, projects) pair. Mixing both is a config error — the
+        # migration is deliberate, not silent.
+        has_legacy = bool(contact.scopes)
+        has_new = bool(contact.facets) or bool(contact.projects)
+        if has_legacy and has_new:
+            raise ConfigError(
+                f"contact {contact.contact_id!r} mixes legacy "
+                f"`scopes` with new `facets`/`projects`. Pick one "
+                "axis vocabulary per contact; mixing them at the "
+                "same time is ambiguous."
+            )
+
         for scope in contact.scopes:
             if scope not in scopes:
                 raise ConfigError(
@@ -503,6 +707,26 @@ def load(
                     f"{scope!r} but it is not defined in the [scopes] "
                     f"registry in {path}. Either add a "
                     f"{scope} = <description> entry under [scopes], "
+                    f"or remove it from "
+                    f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
+                )
+        for facet in contact.facets:
+            if facet not in facets:
+                raise ConfigError(
+                    f"contact {contact.contact_id!r} lists facet "
+                    f"{facet!r} but it is not defined in the [facets] "
+                    f"registry in {path}. Either add a "
+                    f"{facet} = <description> entry under [facets], "
+                    f"or remove it from "
+                    f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
+                )
+        for project in contact.projects:
+            if project not in projects:
+                raise ConfigError(
+                    f"contact {contact.contact_id!r} lists project "
+                    f"{project!r} but it is not defined in the "
+                    f"[projects] registry in {path}. Either add a "
+                    f"{project} = <description> entry under [projects], "
                     f"or remove it from "
                     f"{daemon.contacts_dir / (contact.contact_id + '.toml')}."
                 )
@@ -678,4 +902,6 @@ def load(
         claude=claude,
         address_index=address_index,
         scopes=scopes,
+        facets=facets,
+        projects=projects,
     )

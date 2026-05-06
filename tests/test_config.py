@@ -13,7 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from daemon.config import ConfigError, load as load_config
+from daemon.config import (
+    ConfigError,
+    load as load_config,
+    project_ancestors,
+    project_descendant_of,
+    project_parent,
+    project_visibility,
+)
 
 
 _PRINCIPAL_TOML = """
@@ -971,4 +978,415 @@ def test_contact_scopes_must_be_list_of_strings(tmp_path: Path) -> None:
         aurora = the Aurora work
     """)
     with pytest.raises(ConfigError, match="scopes must be a list"):
+        load_config(path)
+
+
+# ---- Scope/sensitivity Part 1: facets and projects -----------------------
+
+
+def test_project_helpers_parent() -> None:
+    assert project_parent("aurora") is None
+    assert project_parent("aurora.music") == "aurora"
+    assert project_parent("aurora.music.demo") == "aurora.music"
+
+
+def test_project_helpers_ancestors() -> None:
+    assert project_ancestors("aurora") == ()
+    assert project_ancestors("aurora.music") == ("aurora",)
+    assert project_ancestors("aurora.music.demo") == ("aurora", "aurora.music")
+
+
+def test_project_helpers_descendant_of() -> None:
+    # Self is descendant of self
+    assert project_descendant_of("aurora", "aurora")
+    # Direct child
+    assert project_descendant_of("aurora.music", "aurora")
+    # Indirect descendant
+    assert project_descendant_of("aurora.music.demo", "aurora")
+    # Sibling is NOT descendant
+    assert not project_descendant_of("aurora.legal", "aurora.music")
+    # Unrelated project
+    assert not project_descendant_of("nightjar-dev", "aurora")
+    # Edge: parent is not descendant of child
+    assert not project_descendant_of("aurora", "aurora.music")
+    # Edge: prefix-without-dot is not descendant (aurora-clone vs aurora)
+    assert not project_descendant_of("aurora-clone", "aurora")
+
+
+# ---- Project visibility (bidirectional) ----------------------------------
+
+
+def test_project_visibility_exact_match() -> None:
+    """Bullet tagged X is visible to contact with X."""
+    assert project_visibility("aurora", ("aurora",))
+    assert project_visibility("aurora.music", ("aurora.music",))
+
+
+def test_project_visibility_parent_sees_child() -> None:
+    """Bullet tagged with a sub-project is visible to a contact with
+    the parent project — parent subsumes children."""
+    assert project_visibility("aurora.music", ("aurora",))
+    assert project_visibility("aurora.music.demo", ("aurora",))
+    assert project_visibility("aurora.music.demo", ("aurora.music",))
+
+
+def test_project_visibility_child_sees_parent_tagged() -> None:
+    """Bullet tagged with a parent project is visible to a contact
+    who has any sub-scope of that parent — having access to a sub-area
+    implies the generic project context is appropriate."""
+    assert project_visibility("aurora", ("aurora.music",))
+    assert project_visibility("aurora", ("aurora.music.demo",))
+    assert project_visibility("aurora.music", ("aurora.music.demo",))
+
+
+def test_project_visibility_siblings_do_not_see() -> None:
+    """Sub-scopes at the same level are isolated from each other."""
+    assert not project_visibility("aurora.music", ("aurora.legal",))
+    assert not project_visibility("aurora.legal", ("aurora.music",))
+    # Even with multiple siblings on the contact side, only matching
+    # branches see each other.
+    assert not project_visibility(
+        "aurora.music", ("aurora.legal", "aurora.finance"),
+    )
+
+
+def test_project_visibility_unrelated_projects() -> None:
+    """A bullet in an entirely different project tree is not visible."""
+    assert not project_visibility("aurora", ("nightjar-dev",))
+    assert not project_visibility("aurora.music", ("nightjar-dev",))
+
+
+def test_project_visibility_empty_contact_projects() -> None:
+    """A contact with no projects sees no project-tagged bullets."""
+    assert not project_visibility("aurora", ())
+    assert not project_visibility("aurora.music", ())
+
+
+def test_project_visibility_accepts_frozenset() -> None:
+    """Caller may pass a frozenset of contact projects (efficient when
+    walking many bullets against the same contact)."""
+    contact = frozenset({"aurora.music", "calendar"})
+    assert project_visibility("aurora.music", contact)
+    assert project_visibility("aurora", contact)
+    assert not project_visibility("aurora.legal", contact)
+
+
+def test_project_visibility_multiple_contact_projects() -> None:
+    """A contact with multiple projects sees a bullet visible from
+    any of them."""
+    contact = ("aurora.music", "nightjar-dev")
+    assert project_visibility("aurora.music", contact)
+    assert project_visibility("aurora", contact)  # parent of aurora.music
+    assert project_visibility("nightjar-dev", contact)
+    assert not project_visibility("aurora.legal", contact)
+
+
+def test_facets_section_absent_yields_empty_registry(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    assert cfg.facets == {}
+    assert cfg.projects == {}
+
+
+def test_facets_section_parses(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        calendar = the principal's availability and scheduling
+        communication-style = the contact's tone and cadence
+    """)
+    cfg = load_config(path)
+    assert cfg.facets == {
+        "calendar": "the principal's availability and scheduling",
+        "communication-style": "the contact's tone and cadence",
+    }
+
+
+def test_facets_reject_dotted_names(tmp_path: Path) -> None:
+    """Facets are flat by design; dot-notation is reserved for projects."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        my.facet = nope
+    """)
+    with pytest.raises(ConfigError, match="scope name"):
+        load_config(path)
+
+
+def test_facets_reject_empty_description(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        calendar =
+    """)
+    with pytest.raises(ConfigError, match="empty description"):
+        load_config(path)
+
+
+def test_projects_section_parses_flat(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora = the Aurora redesign
+        nightjar-dev = the Nightjar codebase
+    """)
+    cfg = load_config(path)
+    assert cfg.projects == {
+        "aurora": "the Aurora redesign",
+        "nightjar-dev": "the Nightjar codebase",
+    }
+
+
+def test_projects_section_parses_hierarchical(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora = the Aurora redesign
+        aurora.music = music for Aurora
+        aurora.music.demo = the demo track
+        aurora.legal = legal work for Aurora
+    """)
+    cfg = load_config(path)
+    assert "aurora" in cfg.projects
+    assert "aurora.music" in cfg.projects
+    assert "aurora.music.demo" in cfg.projects
+    assert "aurora.legal" in cfg.projects
+
+
+def test_projects_subscope_without_parent_rejected(tmp_path: Path) -> None:
+    """Declaring a sub-project with no parent is a config error — the
+    operator should declare the parent first or rename the sub-scope."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora.music = music for the Aurora project
+    """)
+    with pytest.raises(ConfigError, match="parent .* is not defined"):
+        load_config(path)
+
+
+def test_facets_and_projects_namespace_collision_rejected(
+    tmp_path: Path,
+) -> None:
+    """A name appearing in both [facets] and [projects] is ambiguous —
+    which axis does a contact's reference belong to? Reject at load."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        aurora = an aurora-shaped facet
+
+        [projects]
+        aurora = the Aurora redesign
+    """)
+    with pytest.raises(ConfigError, match="appear in both"):
+        load_config(path)
+
+
+def test_legacy_scopes_and_facets_collision_rejected(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = legacy aurora
+
+        [facets]
+        aurora = a facet named aurora
+    """)
+    with pytest.raises(ConfigError, match="\\[scopes\\] .* and"):
+        load_config(path)
+
+
+def test_contact_with_known_facets_and_projects_accepted(
+    tmp_path: Path,
+) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        facets = ["calendar", "communication-style"]
+        projects = ["aurora", "aurora.music"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        calendar = scheduling
+        communication-style = tone
+
+        [projects]
+        aurora = the Aurora redesign
+        aurora.music = music for Aurora
+    """)
+    cfg = load_config(path)
+    fraser = cfg.contacts["fraser"]
+    assert fraser.facets == ("calendar", "communication-style")
+    assert fraser.projects == ("aurora", "aurora.music")
+
+
+def test_contact_with_unknown_facet_rejected(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        facets = ["calendar"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    with pytest.raises(ConfigError, match="not defined in the \\[facets\\] registry"):
+        load_config(path)
+
+
+def test_contact_with_unknown_project_rejected(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        projects = ["aurora"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    with pytest.raises(ConfigError, match="not defined in the \\[projects\\] registry"):
+        load_config(path)
+
+
+def test_contact_with_unknown_subproject_rejected(tmp_path: Path) -> None:
+    """Contact references aurora.music but registry only has aurora —
+    the implicit-parent rule applies to read-time visibility, not to
+    declaration. Each leaf in the contact's `projects` list must be
+    explicitly registered."""
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        projects = ["aurora.music"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora = the Aurora redesign
+    """)
+    with pytest.raises(ConfigError, match="not defined in the \\[projects\\] registry"):
+        load_config(path)
+
+
+def test_contact_mixing_legacy_scopes_with_new_axes_rejected(
+    tmp_path: Path,
+) -> None:
+    """A contact uses EITHER legacy `scopes` OR (facets, projects).
+    Mixing both is ambiguous — reject at load. The migration is
+    deliberate, not silent."""
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        scopes = ["aurora"]
+        facets = ["calendar"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [scopes]
+        aurora = legacy
+
+        [facets]
+        calendar = scheduling
+    """)
+    with pytest.raises(ConfigError, match="mixes legacy"):
+        load_config(path)
+
+
+def test_contact_with_empty_facets_and_projects_default(tmp_path: Path) -> None:
+    """A contact with neither legacy `scopes` nor new (facets, projects)
+    is unrestricted — historical default, preserved."""
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    fraser = cfg.contacts["fraser"]
+    assert fraser.scopes == ()
+    assert fraser.facets == ()
+    assert fraser.projects == ()
+
+
+def test_contact_facets_reject_dotted_name(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        facets = ["my.facet"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    with pytest.raises(ConfigError, match="facet name"):
+        load_config(path)
+
+
+def test_contact_projects_accept_dotted_name(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        projects = ["aurora.music"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora = the Aurora redesign
+        aurora.music = music for Aurora
+    """)
+    cfg = load_config(path)
+    assert cfg.contacts["fraser"].projects == ("aurora.music",)
+
+
+def test_contact_rejects_duplicate_facet(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        facets = ["calendar", "calendar"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [facets]
+        calendar = scheduling
+    """)
+    with pytest.raises(ConfigError, match="duplicate facet"):
+        load_config(path)
+
+
+def test_contact_rejects_duplicate_project(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    write_contact(tmp_path, "fraser", """
+        contact_id = "fraser"
+        addresses = ["fraser@example.com"]
+        display_name = "Fraser"
+        daily_limit = 3
+        inboxes = ["nightjar"]
+        projects = ["aurora", "aurora"]
+    """)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [projects]
+        aurora = the Aurora redesign
+    """)
+    with pytest.raises(ConfigError, match="duplicate project"):
         load_config(path)

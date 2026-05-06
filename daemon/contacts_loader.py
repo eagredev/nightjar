@@ -62,6 +62,13 @@ _CONTACT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # is loader-then-config; the cross-validation happens in config.load).
 _SCOPE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
+# Project name format. Mirror of _PROJECT_NAME_RE in config.py.
+# Allows dot-separated sub-project names (aurora.music). Each segment
+# is a valid scope name.
+_PROJECT_NAME_RE = re.compile(
+    r"^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$"
+)
+
 
 @dataclass(frozen=True)
 class LoadResult:
@@ -242,6 +249,14 @@ def _load_one(path: Path) -> Contact:
         seen_scopes.add(scope)
         scopes.append(scope)
 
+    # Scope/sensitivity Part 1: facets list (universal axes) and
+    # projects list (specific contexts; dot-separated sub-projects
+    # allowed). Defaults empty. Mutual exclusion with `scopes` (legacy)
+    # is enforced in config.load() — the loader validates each list
+    # in isolation.
+    facets = _parse_facet_list(data.get("facets", []), path)
+    projects = _parse_project_list(data.get("projects", []), path)
+
     return Contact(
         contact_id=contact_id,
         addresses=tuple(addresses),
@@ -251,7 +266,53 @@ def _load_one(path: Path) -> Contact:
         is_principal=is_principal,
         inboxes=inboxes,
         scopes=tuple(scopes),
+        facets=facets,
+        projects=projects,
     )
+
+
+def _parse_facet_list(raw, path: Path) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise ConfigError(f"{path}: facets must be a list of strings")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in raw:
+        name = raw_name.strip()
+        if not name:
+            continue
+        if not _SCOPE_NAME_RE.match(name):
+            raise ConfigError(
+                f"{path}: facet name {name!r} is invalid; must match "
+                f"{_SCOPE_NAME_RE.pattern}. Facets are flat (no dots) "
+                "by design — use [projects] for hierarchical scopes."
+            )
+        if name in seen:
+            raise ConfigError(f"{path}: duplicate facet {name!r}")
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+def _parse_project_list(raw, path: Path) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise ConfigError(f"{path}: projects must be a list of strings")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in raw:
+        name = raw_name.strip()
+        if not name:
+            continue
+        if not _PROJECT_NAME_RE.match(name):
+            raise ConfigError(
+                f"{path}: project name {name!r} is invalid; must match "
+                f"{_PROJECT_NAME_RE.pattern}. Use dots for sub-projects "
+                "(e.g. 'aurora.music')."
+            )
+        if name in seen:
+            raise ConfigError(f"{path}: duplicate project {name!r}")
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
 
 
 # ---- Field parsers --------------------------------------------------------
