@@ -766,6 +766,181 @@ def test_audit_text_does_not_flag_legacy_bullets() -> None:
     assert "unverified" not in rendered
 
 
+# ---- prompt_text (wave 3b) -------------------------------------------------
+
+
+def test_prompt_text_renders_observed_bare() -> None:
+    """`attr=observed` bullets carry no provenance prefix — the daemon
+    verified them, so no skepticism cue is needed."""
+    text = (
+        "## Style\n"
+        "\n"
+        "- Replies in evenings. [meta: src=<m1@x>; attr=observed]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert "- Replies in evenings." in rendered
+    assert "unverified" not in rendered
+    # No square-bracket prefix in front of an observed bullet.
+    assert "- [unverified" not in rendered
+
+
+def test_prompt_text_renders_self_with_prefix() -> None:
+    """`attr=self` bullets carry the sender's-own-claim prefix so the
+    read-side skeptic rule has metadata to act on."""
+    text = (
+        "## Build state\n"
+        "\n"
+        "- TTL hardcoded at 600s. [meta: src=<m@x>; attr=self]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert "- [unverified — sender's own claim] TTL hardcoded at 600s." in rendered
+
+
+def test_prompt_text_renders_asserted_with_prefix() -> None:
+    """`attr=asserted` bullets carry the third-party-claim prefix."""
+    text = (
+        "## Coordination\n"
+        "\n"
+        "- Dylan signed off on the merge. [meta: src=<m@x>; attr=asserted]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert (
+        "- [unverified — sender's claim about another party] "
+        "Dylan signed off on the merge."
+    ) in rendered
+
+
+def test_prompt_text_renders_legacy_bullets_bare() -> None:
+    """Legacy bullets (no meta tag) render bare. Back-compat: the
+    on-disk file may carry pre-wave-2 bullets the principal hasn't
+    re-tagged. The deterministic gate continues to read the file
+    directly so legacy bullets aren't a free enumeration target."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- Legacy bullet with no provenance.\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert "- Legacy bullet with no provenance." in rendered
+    assert "unverified" not in rendered
+
+
+def test_prompt_text_omits_source_message_id() -> None:
+    """Source message-IDs are noise in the prompt — only audit_text
+    renders them."""
+    text = (
+        "## Section\n"
+        "\n"
+        "- A claim. [meta: src=<msg42@example>; attr=self]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert "msg42" not in rendered
+    assert "src=" not in rendered
+
+
+def test_prompt_text_honours_active_scope() -> None:
+    """Same scope-policy as filtered_text: bullets/sections out of
+    scope are dropped."""
+    text = (
+        "## Aurora [scopes: aurora]\n"
+        "\n"
+        "- Aurora bullet. [meta: src=<m1@x>; attr=observed]\n"
+        "\n"
+        "## Personal [scopes: personal]\n"
+        "\n"
+        "- Personal bullet. [meta: src=<m2@x>; attr=self]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope="aurora")
+    assert "Aurora bullet." in rendered
+    assert "Personal bullet." not in rendered
+    # Personal bullet's prefix shouldn't survive the filter either.
+    assert "sender's own claim" not in rendered
+
+
+def test_prompt_text_drops_section_with_no_surviving_bullets() -> None:
+    """If every bullet in a section is filtered out, the heading
+    drops too."""
+    text = (
+        "## Aurora [scopes: aurora]\n"
+        "\n"
+        "- Aurora-only. [meta: src=<m@x>; attr=observed]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope="personal")
+    assert rendered == ""
+
+
+def test_prompt_text_omits_frontmatter() -> None:
+    """Frontmatter is daemon metadata — never enters the prompt."""
+    text = (
+        "---\n"
+        "contact_id: fraser\n"
+        "created_at: 2026-05-06T14:23:11Z\n"
+        "---\n"
+        "\n"
+        "## Section\n"
+        "\n"
+        "- A bullet. [meta: src=<m@x>; attr=observed]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope=None)
+    assert "contact_id" not in rendered
+    assert "fraser" not in rendered
+
+
+def test_prompt_text_excludes_meta_and_scope_tags_from_render() -> None:
+    """Per-bullet `[meta: ...]` and `[scopes: ...]` tags are stripped
+    by the parser — they reach the prompt only as the leading
+    provenance prefix, not as raw on-disk syntax."""
+    text = (
+        "## Project [scopes: nightjar-dev]\n"
+        "\n"
+        "- Bullet body. [meta: src=<m@x>; attr=self] [scopes: nightjar-dev]\n"
+    )
+    p = parse(text)
+    rendered = notes_store.prompt_text(p, active_scope="nightjar-dev")
+    assert "[meta:" not in rendered
+    assert "[scopes:" not in rendered
+    assert "attr=" not in rendered
+
+
+# ---- read_notes wave-3b path verification ---------------------------------
+
+
+def test_read_notes_carries_provenance_prefix_into_render(
+    tmp_path: Path,
+) -> None:
+    """Wave 3b: the triage prompt path uses prompt_text, so read_notes
+    output for a contact with provenance-tagged notes carries the
+    sender-claim prefixes the read-side rule reasons about."""
+    p = tmp_path / "sam.md"
+    text = (
+        "## Build state\n"
+        "\n"
+        "- TTL hardcoded at 600s. [meta: src=<m@x>; attr=self]\n"
+        "- Dylan signed off. [meta: src=<m2@x>; attr=asserted]\n"
+        "- Replies in evenings. [meta: src=<m3@x>; attr=observed]\n"
+    )
+    p.write_text(text, encoding="utf-8")
+    rendered = read_notes(p, active_scope=None)
+    assert "[unverified — sender's own claim] TTL hardcoded at 600s." in rendered
+    assert (
+        "[unverified — sender's claim about another party] Dylan signed off."
+    ) in rendered
+    # Observed bullet stays bare.
+    obs_line = [
+        line for line in rendered.splitlines()
+        if "Replies in evenings" in line
+    ][0]
+    assert "unverified" not in obs_line
+
+
 def test_append_then_parse_roundtrip_preserves_provenance(tmp_path: Path) -> None:
     """Round-trip: write with provenance → read back → fields intact."""
     p = tmp_path / "fraser.md"

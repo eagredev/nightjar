@@ -388,6 +388,68 @@ _ATTRIBUTION_BADGE = {
 }
 
 
+# Wave-3b proposal A: per-bullet provenance prefixes for the triage
+# prompt path. `audit_text` uses ⚠ markers (principal-facing UI);
+# `prompt_text` uses plain English so the model has metadata to
+# reason about without parsing decoration. `observed` renders bare:
+# the daemon verified it, so no skepticism cue is needed.
+_ATTRIBUTION_PROMPT_PREFIX = {
+    "observed": "",
+    "asserted": "[unverified — sender's claim about another party] ",
+    "self": "[unverified — sender's own claim] ",
+}
+
+
+def prompt_text(parsed: ParsedNotes, active_scope: str | None) -> str:
+    """Render `parsed` for the triage LLM prompt.
+
+    Same scope-policy as `filtered_text` — only content whose resolved
+    scopes include `active_scope` (or `*`) survives. Differs in that
+    each bullet carries a leading provenance phrase derived from its
+    `attribution` metadata, so the prompt-side reasoning constraint
+    in `prompts/triage_default.md` ('Reading notes — non-negotiable')
+    has the information it needs to do real work.
+
+    Wave-3a's read-side rule taught the model to read `attr=` tags as
+    reasoning constraints. The wave-3a `filtered_text` render stripped
+    those tags before assembly, so the rule was content-heuristic only
+    — confirmed by loop-2 r3s2 where the model called an `attr=self`
+    bullet a 'daemon-verified observed fact'. This render closes that
+    asymmetry by carrying the metadata into the prompt explicitly.
+
+    Bullets without recorded attribution (legacy, predating wave 2)
+    render bare. Back-compat: the principal can re-tag manually if
+    they care, and the wave-3a deterministic gate continues to read
+    the on-disk file directly so legacy bullets aren't a free
+    enumeration target.
+
+    Source message-IDs are NOT rendered here — they're noise to the
+    model. The principal-facing `audit_text` still carries them.
+    """
+    out: list[str] = []
+    for section in parsed.sections:
+        section_scopes = section.scopes if section.scopes else (_WILDCARD_SCOPE,)
+
+        kept_bullets: list[str] = []
+        for bullet in section.bullets:
+            effective = bullet.scopes if bullet.scopes else section_scopes
+            if _scope_matches(effective, active_scope):
+                prefix = _ATTRIBUTION_PROMPT_PREFIX.get(bullet.attribution, "")
+                kept_bullets.append(f"- {prefix}{bullet.text}")
+
+        if not kept_bullets:
+            continue
+
+        out.append(f"## {section.heading}")
+        out.append("")
+        out.extend(kept_bullets)
+        out.append("")
+
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
 def audit_text(parsed: ParsedNotes) -> str:
     """Render `parsed` as a principal-facing audit view.
 
@@ -488,17 +550,26 @@ def read_safe_notes(path: Path) -> str:
 
 
 def read_notes(path: Path, active_scope: str | None) -> str:
-    """Read and scope-filter a contact's notes file.
+    """Read and scope-filter a contact's notes file for the triage
+    prompt.
 
     Returns "" when the file doesn't exist (legitimate: a contact may
     have no notes yet). Raises NotesParseError on malformed content —
     callers should fail closed (i.e. omit the notes block from the
-    triage prompt) rather than silently include unfiltered text."""
+    triage prompt) rather than silently include unfiltered text.
+
+    Wave-3b: this is the prompt-path read. `prompt_text` carries
+    per-bullet provenance prefixes so the read-side skeptic rule has
+    the metadata it needs. `filtered_text` (the wave-3a render that
+    strips provenance) remains in the module for any future caller
+    that needs a metadata-free view, but the triage path no longer
+    uses it.
+    """
     if not path.exists():
         return ""
     text = path.read_text(encoding="utf-8")
     parsed = parse(text)
-    return filtered_text(parsed, active_scope)
+    return prompt_text(parsed, active_scope)
 
 
 # ---- Append ---------------------------------------------------------------
