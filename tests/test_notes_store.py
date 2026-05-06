@@ -8,10 +8,13 @@ import pytest
 from daemon import notes_store
 from daemon.notes_store import (
     NotesParseError,
+    ScopeContext,
     append_note,
     filtered_text,
     parse,
+    prompt_text_two_axis,
     read_notes,
+    read_notes_two_axis,
     read_safe_notes,
     safe_text,
 )
@@ -980,3 +983,266 @@ def test_append_note_with_provenance_idempotent_serialize(tmp_path: Path) -> Non
     text = p.read_text(encoding="utf-8")
     re_serialized = notes_store._serialize(parse(text))
     assert re_serialized == text
+
+
+# ===========================================================================
+# Scope/sensitivity Part 1: two-axis visibility
+# ===========================================================================
+
+
+# A fixture that uses both facet-flat tags (calendar, communication-style)
+# AND hierarchical project tags (aurora, aurora.music, aurora.legal).
+TWO_AXIS_SAMPLE = """---
+contact_id: fraser
+created_at: 2026-05-06T14:23:11Z
+last_updated: 2026-05-06T18:42:03Z
+---
+
+## Aurora overall [scopes: aurora]
+
+- Project codename "Aurora", started Feb. [scopes: aurora]
+- Generic context anyone with aurora access should see.
+
+## Aurora music [scopes: aurora.music]
+
+- Working on track 3 of the OST.
+- Prefers reference tracks for feedback. [scopes: aurora.music]
+
+## Aurora legal [scopes: aurora.legal]
+
+- Contract review with the publisher pending. [scopes: aurora.legal]
+
+## Scheduling [scopes: calendar]
+
+- Available Tue/Thu evenings.
+- Travelling 12-15 May. [scopes: calendar]
+
+## Communication notes [scopes: communication-style]
+
+- Prefers direct, short replies. [scopes: communication-style]
+
+## General
+
+- British English. [scopes: *]
+- Wildcard fact visible to all scopes. [scopes: *]
+"""
+
+
+def _ctx(
+    facets: tuple[str, ...] = (),
+    projects: tuple[str, ...] = (),
+) -> ScopeContext:
+    return ScopeContext(
+        facets=frozenset(facets),
+        projects=frozenset(projects),
+    )
+
+
+# ---- prompt_text_two_axis: facets ----------------------------------------
+
+
+def test_two_axis_facets_only_calendar() -> None:
+    """Active calendar facet, no project: only calendar bullets +
+    wildcards visible."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(facets=("calendar",)))
+    assert "Available Tue/Thu evenings." in out
+    assert "Travelling 12-15 May." in out
+    assert "British English." in out
+    assert "Wildcard fact visible to all scopes." in out
+    # Project content not visible.
+    assert "Working on track 3" not in out
+    assert "Aurora music" not in out
+    # Other-facet content not visible.
+    assert "Prefers direct, short replies." not in out
+
+
+def test_two_axis_multiple_facets() -> None:
+    """Multiple facets active: union of their bullets visible."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(
+        parsed, _ctx(facets=("calendar", "communication-style")),
+    )
+    assert "Available Tue/Thu evenings." in out
+    assert "Prefers direct, short replies." in out
+    assert "British English." in out  # wildcard
+    # No project content.
+    assert "Working on track 3" not in out
+
+
+# ---- prompt_text_two_axis: project hierarchy -----------------------------
+
+
+def test_two_axis_project_subscope_sees_parent_content() -> None:
+    """Active context = aurora.music. Bullet tagged `aurora` is
+    visible (parent content shown to a child contact); bullet tagged
+    `aurora.music` is visible (exact); bullet tagged `aurora.legal`
+    is NOT (sibling)."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(projects=("aurora.music",)))
+    assert 'Project codename "Aurora"' in out  # parent-tagged bullet
+    assert "Working on track 3" in out  # exact-match bullet
+    # Sibling sub-scope must NOT leak.
+    assert "Contract review" not in out
+
+
+def test_two_axis_parent_project_sees_all_subscopes() -> None:
+    """Active context = aurora. ALL aurora.* sub-scopes' content is
+    visible (parent subsumes children)."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(projects=("aurora",)))
+    assert 'Project codename "Aurora"' in out
+    assert "Working on track 3" in out
+    assert "Contract review" in out  # sibling visible from parent
+    # Wildcards still visible.
+    assert "British English." in out
+
+
+def test_two_axis_sibling_subscopes_isolated() -> None:
+    """Active context = aurora.legal. aurora.music content is NOT
+    visible (sibling sub-scopes do not see each other)."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(projects=("aurora.legal",)))
+    assert "Contract review" in out
+    assert 'Project codename "Aurora"' in out  # parent visible
+    # Sibling NOT visible.
+    assert "Working on track 3" not in out
+    assert "Prefers reference tracks" not in out
+
+
+def test_two_axis_combined_facet_and_project() -> None:
+    """Active context combines a facet and a project — both axes'
+    content is visible."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(
+        parsed,
+        _ctx(facets=("calendar",), projects=("aurora.music",)),
+    )
+    # Project axis
+    assert "Working on track 3" in out
+    assert 'Project codename "Aurora"' in out
+    # Facet axis
+    assert "Available Tue/Thu evenings." in out
+    # Wildcard
+    assert "British English." in out
+    # Other facet not active
+    assert "Prefers direct, short replies." not in out
+    # Sibling sub-scope not active
+    assert "Contract review" not in out
+
+
+# ---- prompt_text_two_axis: edge cases ------------------------------------
+
+
+def test_two_axis_empty_context_keeps_only_wildcards() -> None:
+    """Fail-closed shape: ScopeContext.empty() keeps only `*`-tagged
+    content. Triage caller falls back to this when classifier fails."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, ScopeContext.empty())
+    assert "British English." in out
+    assert "Wildcard fact visible to all scopes." in out
+    # Nothing else.
+    assert "Working on track 3" not in out
+    assert "Available Tue/Thu evenings." not in out
+    assert "Prefers direct, short replies." not in out
+
+
+def test_two_axis_full_audit_returns_everything() -> None:
+    """ScopeContext.make_full_audit() ignores tags — used by the
+    principal-facing audit dump."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, ScopeContext.make_full_audit())
+    assert "Working on track 3" in out
+    assert "Contract review" in out
+    assert "Available Tue/Thu evenings." in out
+    assert "Prefers direct, short replies." in out
+    assert "British English." in out
+
+
+def test_two_axis_drops_section_with_no_surviving_bullets() -> None:
+    """A section whose every bullet is filtered out drops entirely
+    — same convention as filtered_text."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(facets=("calendar",)))
+    # The Aurora music heading must NOT appear; calendar is not
+    # related, all bullets in that section are filtered.
+    assert "## Aurora music" not in out
+
+
+def test_two_axis_carries_provenance_prefix() -> None:
+    """The two-axis renderer reuses prompt_text's per-bullet provenance
+    prefix — wave-3b A's read-side metadata stays load-bearing."""
+    text = """---
+contact_id: x
+created_at: 2026-05-06T14:23:11Z
+last_updated: 2026-05-06T14:23:11Z
+---
+
+## Aurora work [scopes: aurora.music]
+
+- They claim track 3 is done. [meta: src=msg-1; attr=self]
+"""
+    parsed = parse(text)
+    out = prompt_text_two_axis(parsed, _ctx(projects=("aurora.music",)))
+    assert "[unverified — sender's own claim]" in out
+
+
+def test_two_axis_unrelated_project_not_visible() -> None:
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, _ctx(projects=("nightjar-dev",)))
+    # No aurora content, no calendar content; only wildcards.
+    assert 'Project codename "Aurora"' not in out
+    assert "Working on track 3" not in out
+    assert "British English." in out
+
+
+# ---- read_notes_two_axis (file IO + parse) -------------------------------
+
+
+def test_read_notes_two_axis_missing_file_returns_empty(tmp_path: Path) -> None:
+    out = read_notes_two_axis(
+        tmp_path / "nonexistent.md",
+        _ctx(projects=("aurora",)),
+    )
+    assert out == ""
+
+
+def test_read_notes_two_axis_reads_and_filters(tmp_path: Path) -> None:
+    p = tmp_path / "fraser.md"
+    p.write_text(TWO_AXIS_SAMPLE, encoding="utf-8")
+    out = read_notes_two_axis(p, _ctx(projects=("aurora.music",)))
+    assert "Working on track 3" in out
+    assert "Contract review" not in out  # sibling
+
+
+def test_read_notes_two_axis_raises_on_malformed(tmp_path: Path) -> None:
+    p = tmp_path / "fraser.md"
+    p.write_text("---\nbad frontmatter\n", encoding="utf-8")
+    with pytest.raises(NotesParseError):
+        read_notes_two_axis(p, _ctx(projects=("aurora",)))
+
+
+# ---- ScopeContext factories ----------------------------------------------
+
+
+def test_scope_context_empty_factory() -> None:
+    ctx = ScopeContext.empty()
+    assert ctx.facets == frozenset()
+    assert ctx.projects == frozenset()
+    assert ctx.full_audit is False
+
+
+def test_scope_context_full_audit_factory() -> None:
+    ctx = ScopeContext.make_full_audit()
+    assert ctx.full_audit is True
+
+
+def test_scope_context_full_audit_overrides_empty_axes() -> None:
+    """Even with empty facet/project sets, full_audit=True must
+    return everything — the caller is the principal asking for an
+    audit dump."""
+    parsed = parse(TWO_AXIS_SAMPLE)
+    out = prompt_text_two_axis(parsed, ScopeContext.make_full_audit())
+    # Everything should be present.
+    assert "Working on track 3" in out
+    assert "Contract review" in out

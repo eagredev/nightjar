@@ -328,3 +328,420 @@ async def classify_scope(
         raw_input_tokens=response.input_tokens,
         raw_output_tokens=response.output_tokens,
     )
+
+
+# ===========================================================================
+# Scope/sensitivity Part 1: two-axis classifier.
+#
+# When a contact uses the new (facets, projects) vocabulary, pass-1
+# answers TWO questions instead of one:
+#
+#   1. Which facets (0-N from the contact's facet list) does this
+#      message touch? Universal axes can stack: a message can be both
+#      `calendar` and `personal-life`.
+#   2. Which project (0-1 from the contact's project list, or
+#      out_of_scope) does it classify into? Specific contexts — by
+#      design at most one applies per message; out_of_scope means none.
+#
+# A successful two-axis classification routes to triage with both axes
+# active. The notes-block assembly walks both axes and includes any
+# bullet whose facet OR project tags match. Sub-projects use the
+# bidirectional visibility rules in `daemon.config.project_visibility`.
+#
+# Out-of-scope semantics:
+#
+#   - facets empty AND project=out_of_scope: full out-of-scope path.
+#     Synthesise a polite decline with no triage call. Same posture as
+#     legacy out_of_scope — fail closed.
+#   - facets non-empty (regardless of project): route to triage. The
+#     contact has SOME relevant axis; triage runs with the matched
+#     axes only. This matches the design doc's "single message can be
+#     'scheduling for aurora music work'" framing.
+#   - facets empty BUT project in-scope: route to triage with project
+#     only. (Common case: a message about a specific shared project
+#     that doesn't touch any universal axis.)
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class TwoAxisResult:
+    """A successfully classified two-axis inbound message.
+
+    `facets` is a tuple of zero or more facet names from the contact's
+    facet list. `project` is either a project name from the contact's
+    project list OR the OUT_OF_SCOPE sentinel.
+    """
+    facets: tuple[str, ...]
+    project: str  # project name OR OUT_OF_SCOPE
+    raw_input_tokens: int
+    raw_output_tokens: int
+
+    def is_full_out_of_scope(self) -> bool:
+        """True when no axis matched. Caller should synthesise a
+        decline plan instead of routing to triage."""
+        return not self.facets and self.project == OUT_OF_SCOPE
+
+
+def _two_axis_tool_schema(
+    allowed_facets: tuple[str, ...],
+    allowed_projects: tuple[str, ...],
+) -> dict[str, Any]:
+    """Tool definition for the two-axis classifier call.
+
+    Two enum-constrained input fields. Anthropic's tool-schema
+    validation rejects out-of-enum values upstream; we belt-and-brace
+    in the validator.
+
+    The `facets` array enum is constrained per-element. An empty array
+    is allowed and means "no universal axis applies." `project` is a
+    single string; the enum includes the OUT_OF_SCOPE sentinel so the
+    model can pick it cleanly when no project fits.
+    """
+    facet_enum = list(allowed_facets)
+    project_enum = list(allowed_projects) + [OUT_OF_SCOPE]
+    properties: dict[str, Any] = {
+        "project": {
+            "type": "string",
+            "enum": project_enum,
+            "description": (
+                "The single project context this message classifies "
+                f"into, or {OUT_OF_SCOPE!r} if no project fits. At "
+                "most one project applies per message."
+            ),
+        },
+    }
+    # If the contact has no facets, the schema field is still present
+    # but with an empty enum — the model can only return []. This is
+    # the correct shape: a contact may have projects but no facets, or
+    # vice versa.
+    if facet_enum:
+        properties["facets"] = {
+            "type": "array",
+            "items": {"type": "string", "enum": facet_enum},
+            "description": (
+                "Zero or more universal axes this message touches. "
+                "Multiple may apply (e.g. a scheduling message about "
+                "music work touches both `calendar` and `music-tech`)."
+            ),
+        }
+    else:
+        properties["facets"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 0,
+            "description": (
+                "This contact has no facets configured; return []."
+            ),
+        }
+    return {
+        "name": "classify_two_axis",
+        "description": (
+            "Classify the inbound message along TWO axes: which "
+            "universal facets (0-N) does it touch, and which "
+            "specific project (0-1) does it classify into."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": ["facets", "project"],
+            "additionalProperties": False,
+        },
+    }
+
+
+_TWO_AXIS_SYSTEM_PROMPT = """You classify inbound emails along two axes.
+
+You will be given:
+  - the contact metadata (who's writing)
+  - the inbound message (sender, subject, body)
+  - a registry of universal FACETS (calendar, communication-style,
+    finance, etc.) the contact has access to, each with a description
+  - a registry of specific PROJECTS (or sub-projects via dot-notation)
+    the contact has access to, each with a description
+  - any unscoped or wildcard-visible notes about the contact
+
+Your job is to answer two questions:
+
+  1. FACETS — which universal axes does this message touch? Zero or
+     more facets may apply. A message asking 'when can we meet to
+     review the demo' touches `calendar` (scheduling) and possibly
+     a project like `aurora.music` (the demo). A message that's pure
+     small-talk touches no facet — return [].
+
+  2. PROJECT — which single specific context does this message
+     classify into? Pick exactly one project name from the contact's
+     project list, OR pick "out_of_scope" if no project fits. At most
+     one project applies per message; if a message could fit two
+     projects, pick the one most central to the message.
+
+Boundary discipline:
+
+  - Incidental pleasantries do not change the classification. Only
+    the message's primary intent counts.
+  - For sub-projects (dot-notation like `aurora.music`): pick the most
+    specific level that fits. Don't pick `aurora` if the message is
+    clearly about `aurora.music` and the contact has access to both.
+  - Be conservative on the project boundary. If a message could
+    plausibly fit a project but is mostly drifting, pick out_of_scope
+    and let facets carry whatever universal context applies.
+
+You MUST call the classify_two_axis tool exactly once. Never produce
+text. Never call any other tool.
+"""
+
+
+def _format_two_axis_blocks(
+    contact: Contact,
+    facets_registry: dict[str, str],
+    projects_registry: dict[str, str],
+) -> tuple[str, str]:
+    """Render the (facets, projects) blocks for the user message."""
+    facet_lines = []
+    for name in contact.facets:
+        desc = facets_registry.get(name, "(no description)")
+        facet_lines.append(f"  - {name}: {desc}")
+    if not facet_lines:
+        facet_block = "  (this contact has no facets configured)"
+    else:
+        facet_block = "\n".join(facet_lines)
+
+    project_lines = []
+    for name in contact.projects:
+        desc = projects_registry.get(name, "(no description)")
+        project_lines.append(f"  - {name}: {desc}")
+    if not project_lines:
+        project_block = "  (this contact has no projects configured)"
+    else:
+        project_block = "\n".join(project_lines)
+
+    return facet_block, project_block
+
+
+def build_two_axis_user_message(
+    *,
+    contact: Contact,
+    sender: str,
+    subject: str,
+    body: str,
+    facets_registry: dict[str, str],
+    projects_registry: dict[str, str],
+    safe_notes: str,
+) -> str:
+    """Render the user message for a two-axis classifier call.
+
+    Same close-tag-injection scrubbing as the legacy classifier. Both
+    registry blocks appear; the model picks 0+ facets and exactly one
+    project (or out_of_scope).
+    """
+    from .triage import _strip_block_delimiters
+
+    safe_sender = _strip_block_delimiters(sender)
+    safe_subject = _strip_block_delimiters(subject)
+    safe_body = _strip_block_delimiters(body)
+    facet_block, project_block = _format_two_axis_blocks(
+        contact, facets_registry, projects_registry,
+    )
+    notes_block = safe_notes.strip() or "(no shareable notes)"
+    return (
+        "<contact_metadata>\n"
+        f"contact_id: {contact.contact_id}\n"
+        f"display_name: {contact.display_name}\n"
+        f"relationship: {contact.relationship}\n"
+        "</contact_metadata>\n"
+        "\n"
+        "<allowed_facets>\n"
+        f"{facet_block}\n"
+        "</allowed_facets>\n"
+        "\n"
+        "<allowed_projects>\n"
+        f"{project_block}\n"
+        "</allowed_projects>\n"
+        "\n"
+        "<safe_notes>\n"
+        f"{notes_block}\n"
+        "</safe_notes>\n"
+        "\n"
+        "<sender>\n"
+        f"{safe_sender}\n"
+        "</sender>\n"
+        "\n"
+        "<subject>\n"
+        f"{safe_subject}\n"
+        "</subject>\n"
+        "\n"
+        "<body>\n"
+        f"{safe_body}\n"
+        "</body>\n"
+    )
+
+
+def validate_two_axis_payload(
+    payload: dict[str, Any],
+    *,
+    allowed_facets: tuple[str, ...],
+    allowed_projects: tuple[str, ...],
+) -> tuple[tuple[str, ...], str] | ClassifierError:
+    """Validate the tool_use input. Returns (facets, project) tuple
+    on success, or a ClassifierError. Anthropic's enum validation
+    catches most violations upstream; this is the belt-and-brace path
+    for malformed SDK payloads or pathological model output."""
+    if not isinstance(payload, dict):
+        return ClassifierError(
+            reason="invalid_payload",
+            detail=f"expected dict, got {type(payload).__name__}",
+        )
+
+    raw_facets = payload.get("facets")
+    if not isinstance(raw_facets, list):
+        return ClassifierError(
+            reason="missing_facets",
+            detail=(
+                f"payload had no list 'facets' field: {payload!r}"
+            ),
+        )
+    facets: list[str] = []
+    seen: set[str] = set()
+    allowed_facets_set = set(allowed_facets)
+    for item in raw_facets:
+        if not isinstance(item, str):
+            return ClassifierError(
+                reason="non_string_facet",
+                detail=f"facets contained non-string: {item!r}",
+            )
+        if item not in allowed_facets_set:
+            return ClassifierError(
+                reason="unknown_facet",
+                detail=(
+                    f"model returned facet {item!r} but allowed values "
+                    f"are {list(allowed_facets)!r}"
+                ),
+            )
+        if item in seen:
+            # De-duplicate silently — the model occasionally repeats.
+            continue
+        seen.add(item)
+        facets.append(item)
+
+    project = payload.get("project")
+    if not isinstance(project, str):
+        return ClassifierError(
+            reason="missing_project",
+            detail=f"payload had no string 'project' field: {payload!r}",
+        )
+    if project != OUT_OF_SCOPE and project not in allowed_projects:
+        return ClassifierError(
+            reason="unknown_project",
+            detail=(
+                f"model returned project {project!r} but allowed values "
+                f"are {list(allowed_projects) + [OUT_OF_SCOPE]!r}"
+            ),
+        )
+
+    return tuple(facets), project
+
+
+async def classify_two_axis(
+    *,
+    contact: Contact,
+    sender: str,
+    subject: str,
+    body: str,
+    facets_registry: dict[str, str],
+    projects_registry: dict[str, str],
+    safe_notes: str,
+    config: ClaudeConfig,
+    client: ClaudeClient,
+) -> TwoAxisResult | ClassifierError:
+    """Run pass-1 two-axis classification.
+
+    Pre-conditions:
+      - contact uses new vocabulary: contact.facets OR contact.projects
+        is non-empty (caller skips this module otherwise).
+      - Every facet in contact.facets exists in facets_registry; every
+        project in contact.projects exists in projects_registry.
+        (config.load enforces both cross-checks.)
+
+    `safe_notes` MUST contain only unscoped + wildcard content. Same
+    constraint as the legacy classifier: passing scoped content here
+    defeats the two-pass safety property.
+    """
+    if not contact.facets and not contact.projects:
+        return ClassifierError(
+            reason="empty_axes",
+            detail=(
+                "classify_two_axis was called on a contact with no "
+                "facets and no projects; the caller should skip "
+                "pass-1 in that case."
+            ),
+        )
+
+    user = build_two_axis_user_message(
+        contact=contact,
+        sender=sender,
+        subject=subject,
+        body=body,
+        facets_registry=facets_registry,
+        projects_registry=projects_registry,
+        safe_notes=safe_notes,
+    )
+    tool = _two_axis_tool_schema(contact.facets, contact.projects)
+
+    try:
+        response = await client.call(
+            model=config.scope_classifier_model,
+            system=_TWO_AXIS_SYSTEM_PROMPT,
+            user=user,
+            tools=[tool],
+            # Two enum fields cap output tightly; 256 is plenty.
+            max_tokens=256,
+        )
+    except Exception as e:
+        return ClassifierError(reason="sdk_error", detail=str(e))
+
+    if not response.tool_uses:
+        return ClassifierError(
+            reason="no_tool_call",
+            detail=(
+                f"stop_reason={response.stop_reason!r}, "
+                f"text_blocks={len(response.text_blocks)}"
+            ),
+            raw_input_tokens=response.input_tokens,
+            raw_output_tokens=response.output_tokens,
+        )
+    if len(response.tool_uses) > 1:
+        return ClassifierError(
+            reason="multiple_tool_calls",
+            detail=f"got {len(response.tool_uses)}",
+            raw_input_tokens=response.input_tokens,
+            raw_output_tokens=response.output_tokens,
+        )
+
+    tool_use = response.tool_uses[0]
+    if tool_use.get("name") != "classify_two_axis":
+        return ClassifierError(
+            reason="unexpected_tool",
+            detail=str(tool_use.get("name")),
+            raw_input_tokens=response.input_tokens,
+            raw_output_tokens=response.output_tokens,
+        )
+
+    validated = validate_two_axis_payload(
+        tool_use.get("input", {}),
+        allowed_facets=contact.facets,
+        allowed_projects=contact.projects,
+    )
+    if isinstance(validated, ClassifierError):
+        return ClassifierError(
+            reason=validated.reason,
+            detail=validated.detail,
+            raw_input_tokens=response.input_tokens,
+            raw_output_tokens=response.output_tokens,
+        )
+
+    facets, project = validated
+    return TwoAxisResult(
+        facets=facets,
+        project=project,
+        raw_input_tokens=response.input_tokens,
+        raw_output_tokens=response.output_tokens,
+    )

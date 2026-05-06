@@ -453,3 +453,336 @@ def test_classifier_error_carries_classifier_tokens(tmp_path: Path) -> None:
     assert isinstance(result, TriagePlan)
     assert result.raw_input_tokens == 600
     assert result.raw_output_tokens == 10
+
+
+# ===========================================================================
+# Scope/sensitivity Part 1: two-axis orchestrator path
+# ===========================================================================
+
+
+_FACETS_REGISTRY = {
+    "calendar": "scheduling and availability",
+    "communication-style": "tone and cadence",
+}
+
+_PROJECTS_REGISTRY = {
+    "aurora": "the Aurora redesign",
+    "aurora.music": "music for Aurora",
+    "aurora.legal": "legal work for Aurora",
+}
+
+
+def _make_two_axis_contact(
+    facets: tuple[str, ...] = ("calendar",),
+    projects: tuple[str, ...] = ("aurora", "aurora.music"),
+) -> Contact:
+    return Contact(
+        contact_id="fraser",
+        addresses=("fraser@example.com",),
+        display_name="Fraser",
+        relationship="collaborator",
+        daily_limit=3,
+        is_principal=False,
+        inboxes=("nightjar",),
+        scopes=(),
+        facets=facets,
+        projects=projects,
+    )
+
+
+def _two_axis_classifier_response(
+    *,
+    facets: list[str],
+    project: str,
+    in_tokens: int = 700,
+    out_tokens: int = 14,
+) -> ClaudeResponse:
+    return ClaudeResponse(
+        tool_uses=(
+            {
+                "name": "classify_two_axis",
+                "input": {"facets": facets, "project": project},
+            },
+        ),
+        text_blocks=(),
+        stop_reason="tool_use",
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+    )
+
+
+def test_two_axis_in_scope_runs_classifier_then_triage(tmp_path: Path) -> None:
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(facets=["calendar"], project="aurora.music"),
+        _triage_response(),
+    ])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="fraser@example.com",
+        subject="track 3 demo", body="when can we sync about the demo?",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    assert result.verb == "reply"
+    # Two calls: classifier then triage.
+    assert len(client.calls) == 2
+    assert client.calls[0].tools[0]["name"] == "classify_two_axis"
+    assert client.calls[1].tools[0]["name"] == "draft_plan"
+
+
+def test_two_axis_full_out_of_scope_returns_decline(tmp_path: Path) -> None:
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(facets=[], project="out_of_scope"),
+    ])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="fraser@example.com",
+        subject="hi", body="random thing not in scope",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    assert result.verb == "out_of_scope_decline"
+    # Triage NOT called.
+    assert len(client.calls) == 1
+
+
+def test_two_axis_facets_only_routes_to_triage(tmp_path: Path) -> None:
+    """Facets non-empty + project=out_of_scope is NOT full out-of-scope.
+    Triage runs with facet-only visibility."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(
+            facets=["calendar"], project="out_of_scope",
+        ),
+        _triage_response(),
+    ])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="fraser@example.com",
+        subject="when free?", body="schedule check",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    assert result.verb == "reply"
+    assert len(client.calls) == 2
+
+
+def test_two_axis_project_filters_notes_by_hierarchy(tmp_path: Path) -> None:
+    """Notes tagged aurora.legal must NOT reach triage when classifier
+    chose aurora.music (sibling sub-scopes are isolated)."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    notes_path = notes_dir / "fraser.md"
+    notes_path.write_text(
+        "---\ncontact_id: fraser\n---\n\n"
+        "## Aurora overall [scopes: aurora]\n\n"
+        "- Generic aurora context.\n\n"
+        "## Aurora music [scopes: aurora.music]\n\n"
+        "- Track 3 in progress.\n\n"
+        "## Aurora legal [scopes: aurora.legal]\n\n"
+        "- Contract pending.\n",
+        encoding="utf-8",
+    )
+    contact = _make_two_axis_contact(
+        facets=(), projects=("aurora.music",),
+    )
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(facets=[], project="aurora.music"),
+        _triage_response(),
+    ])
+
+    _run(triage_with_scope(
+        contact=contact, sender="fraser@example.com",
+        subject="s", body="b", structure=_structure(),
+        config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    triage_call = client.calls[1]
+    # Sub-scope content visible.
+    assert "Track 3 in progress" in triage_call.user
+    # Parent content visible (parent-tagged bullet at parent visible to child).
+    assert "Generic aurora context" in triage_call.user
+    # Sibling NOT visible.
+    assert "Contract pending" not in triage_call.user
+
+
+def test_two_axis_classifier_error_returns_decline(tmp_path: Path) -> None:
+    """If the two-axis classifier returns an unknown facet, the
+    validator surfaces a ClassifierError → synthetic decline."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+    bad_response = ClaudeResponse(
+        tool_uses=(
+            {
+                "name": "classify_two_axis",
+                "input": {"facets": ["finance"], "project": "out_of_scope"},
+            },
+        ),
+        text_blocks=(),
+        stop_reason="tool_use",
+        input_tokens=400,
+        output_tokens=8,
+    )
+    client = FakeClaudeClient(responses=[bad_response])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="x@y.z", subject="s", body="b",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    assert result.verb == "out_of_scope_decline"
+    # Triage not called.
+    assert len(client.calls) == 1
+
+
+def test_two_axis_combined_token_accounting(tmp_path: Path) -> None:
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(
+            facets=["calendar"], project="aurora",
+            in_tokens=700, out_tokens=14,
+        ),
+        _triage_response(in_tokens=2000, out_tokens=150),
+    ])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="x@y.z", subject="s", body="b",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    # Tokens summed across passes.
+    assert result.raw_input_tokens == 2700
+    assert result.raw_output_tokens == 164
+
+
+def test_two_axis_decline_body_lists_facets_and_projects(
+    tmp_path: Path,
+) -> None:
+    """The decline body for a two-axis contact should list the
+    contact's facets AND projects (using their human descriptions)."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact(
+        facets=("calendar",),
+        projects=("aurora",),
+    )
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(facets=[], project="out_of_scope"),
+    ])
+
+    result = _run(triage_with_scope(
+        contact=contact, sender="x@y.z", subject="s", body="b",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    body = result.args["body"]
+    # Both axes' descriptions appear.
+    assert "scheduling and availability" in body  # calendar
+    assert "the Aurora redesign" in body  # aurora
+
+
+def test_two_axis_safe_notes_passed_to_classifier(tmp_path: Path) -> None:
+    """Pass-1 classifier sees only safe (unscoped+wildcard) notes, just
+    like the legacy single-axis path."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    notes_path = notes_dir / "fraser.md"
+    notes_path.write_text(
+        "---\ncontact_id: fraser\n---\n\n"
+        "## General\n\n"
+        "- Wildcard fact. [scopes: *]\n\n"
+        "## Aurora [scopes: aurora]\n\n"
+        "- Project secret.\n",
+        encoding="utf-8",
+    )
+    contact = _make_two_axis_contact(
+        facets=(), projects=("aurora",),
+    )
+    client = FakeClaudeClient(responses=[
+        _two_axis_classifier_response(facets=[], project="aurora"),
+        _triage_response(),
+    ])
+
+    _run(triage_with_scope(
+        contact=contact, sender="fraser@example.com",
+        subject="s", body="b", structure=_structure(),
+        config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    classifier_call = client.calls[0]
+    assert "Wildcard fact" in classifier_call.user
+    # Scoped content MUST NOT appear in classifier prompt.
+    assert "Project secret" not in classifier_call.user
+
+
+def test_two_axis_classifier_sdk_failure_fails_closed(tmp_path: Path) -> None:
+    """SDK exception during pass-1 → synthetic decline (fail closed)."""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    contact = _make_two_axis_contact()
+
+    @dataclass
+    class _RaisingClient:
+        calls: list[Any] = field(default_factory=list)
+
+        async def call(
+            self, *, model: str, system: str, user: str,
+            tools: list[dict[str, Any]], max_tokens: int,
+        ) -> ClaudeResponse:
+            self.calls.append((model, user))
+            raise RuntimeError("SDK exploded")
+
+    client = _RaisingClient()
+    result = _run(triage_with_scope(
+        contact=contact, sender="x@y.z", subject="s", body="b",
+        structure=_structure(), config=_make_config(), client=client,
+        prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
+        scopes_registry={},
+        facets_registry=_FACETS_REGISTRY,
+        projects_registry=_PROJECTS_REGISTRY,
+    ))
+    assert isinstance(result, TriagePlan)
+    assert result.verb == "out_of_scope_decline"
+    # Only the classifier call was attempted.
+    assert len(client.calls) == 1

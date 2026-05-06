@@ -345,6 +345,80 @@ def _scope_matches(scopes: tuple[str, ...], active_scope: str | None) -> bool:
     return active_scope in scopes
 
 
+# Scope/sensitivity Part 1: two-axis visibility context. Captures both
+# the facet set the message touches AND the project (or sub-project)
+# context. Notes-block assembly walks both axes and keeps any bullet
+# whose tag matches either.
+@dataclass(frozen=True)
+class ScopeContext:
+    """Active context for two-axis scope filtering.
+
+    `facets` — universal axes the inbound message classified into.
+    `projects` — exactly one project (the classifier picks at most one),
+    expressed as a set so the matching code can pre-compute hierarchy
+    questions over it. Empty set means the project axis didn't fire.
+
+    Use `ScopeContext.full_audit()` for the principal-facing dump
+    (returns everything regardless of tags); use `ScopeContext.empty()`
+    for the fail-closed path (no notes visible at all).
+    """
+    facets: frozenset[str]
+    projects: frozenset[str]
+    full_audit: bool = False
+
+    @classmethod
+    def make_full_audit(cls) -> "ScopeContext":
+        """Audit view: see everything, ignore tags."""
+        return cls(facets=frozenset(), projects=frozenset(), full_audit=True)
+
+    @classmethod
+    def empty(cls) -> "ScopeContext":
+        """Fail-closed: no facet, no project; only `*` survives."""
+        return cls(facets=frozenset(), projects=frozenset())
+
+
+def _tag_matches_context(tag: str, ctx: ScopeContext) -> bool:
+    """Does a single scope tag on a bullet match the active context?
+
+    The tag name may belong to either the facet or project namespace.
+    Config's namespace-collision check guarantees the name is in at
+    most one. Match logic:
+
+      - `*` (wildcard): always matches.
+      - Exact match in `ctx.facets`: facet tag, visible.
+      - Otherwise: try project visibility (covers dotted sub-project
+        tags as well). The hierarchy rules in `project_visibility`
+        give parent-sees-child and child-sees-parent semantics.
+    """
+    if tag == _WILDCARD_SCOPE:
+        return True
+    if tag in ctx.facets:
+        return True
+    if not ctx.projects:
+        return False
+    # Lazy import to avoid circular dependency at module load.
+    from .config import project_visibility
+    return project_visibility(tag, ctx.projects)
+
+
+def _scope_matches_context(
+    scopes: tuple[str, ...], ctx: ScopeContext,
+) -> bool:
+    """Two-axis visibility: any tag on the bullet matches the context.
+
+    `full_audit=True` short-circuits to "always visible" (the principal
+    dump path). Empty scopes tuple is the caller's responsibility to
+    resolve via inheritance before calling this — same convention as
+    the legacy `_scope_matches`.
+    """
+    if ctx.full_audit:
+        return True
+    for tag in scopes:
+        if _tag_matches_context(tag, ctx):
+            return True
+    return False
+
+
 def filtered_text(parsed: ParsedNotes, active_scope: str | None) -> str:
     """Render `parsed` to a prompt-ready string, including only content
     whose resolved scopes include `active_scope` (or `*`).
@@ -570,6 +644,57 @@ def read_notes(path: Path, active_scope: str | None) -> str:
     text = path.read_text(encoding="utf-8")
     parsed = parse(text)
     return prompt_text(parsed, active_scope)
+
+
+def prompt_text_two_axis(parsed: ParsedNotes, ctx: ScopeContext) -> str:
+    """Two-axis variant of `prompt_text` for contacts using the new
+    facets/projects vocabulary.
+
+    Same provenance-prefix render as `prompt_text`; differs in the
+    visibility rule. A bullet's scope tags are matched against
+    `ctx.facets` and `ctx.projects` via `_tag_matches_context`, which
+    handles the bidirectional project-hierarchy rule
+    (parent-sees-child, child-sees-parent, siblings isolated).
+
+    Untagged bullets inherit the section's tags; sections without tags
+    are wildcard-visible (matches the legacy single-axis convention).
+    """
+    out: list[str] = []
+    for section in parsed.sections:
+        section_scopes = section.scopes if section.scopes else (_WILDCARD_SCOPE,)
+        kept_bullets: list[str] = []
+        for bullet in section.bullets:
+            effective = bullet.scopes if bullet.scopes else section_scopes
+            if _scope_matches_context(effective, ctx):
+                prefix = _ATTRIBUTION_PROMPT_PREFIX.get(bullet.attribution, "")
+                kept_bullets.append(f"- {prefix}{bullet.text}")
+
+        if not kept_bullets:
+            continue
+
+        out.append(f"## {section.heading}")
+        out.append("")
+        out.extend(kept_bullets)
+        out.append("")
+
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def read_notes_two_axis(path: Path, ctx: ScopeContext) -> str:
+    """Two-axis variant of `read_notes` for the triage prompt.
+
+    Same fail-closed posture as `read_notes`: missing file returns "";
+    parse errors raise NotesParseError. The triage caller should pass
+    `ScopeContext.empty()` to fall back to wildcard-only visibility
+    when the classifier couldn't reach a verdict.
+    """
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    parsed = parse(text)
+    return prompt_text_two_axis(parsed, ctx)
 
 
 # ---- Append ---------------------------------------------------------------

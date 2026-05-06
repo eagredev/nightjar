@@ -2104,6 +2104,8 @@ class InboxWatcher:
             prompts_dir=PROMPTS_DIR,
             notes_dir=self.config.daemon.notes_dir,
             scopes_registry=self.config.scopes,
+            facets_registry=self.config.facets,
+            projects_registry=self.config.projects,
         )
 
         # 5. Ledger row regardless of outcome (audit trail, rate counter).

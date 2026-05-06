@@ -1081,6 +1081,8 @@ def _build_decline_body(
     contact: Contact,
     scopes_registry: dict[str, str],
     reason_was_classifier_failure: bool,
+    facets_registry: dict[str, str] | None = None,
+    projects_registry: dict[str, str] | None = None,
 ) -> str:
     """Compose the polite decline body for an out-of-scope conversation.
 
@@ -1089,6 +1091,10 @@ def _build_decline_body(
     LLM-authored prose under those conditions. The body cites the
     contact's allowed scopes (using their human descriptions from the
     registry) so the contact knows what they can come back with.
+
+    Two-axis path (Scope/sensitivity Part 1): when the contact uses
+    facets+projects instead of legacy scopes, list both axes' allowed
+    topics. Same template shape — only the topic list changes.
     """
     if contact.scopes:
         topic_lines = []
@@ -1096,6 +1102,22 @@ def _build_decline_body(
             description = scopes_registry.get(scope_name, scope_name)
             topic_lines.append(f"  - {description}")
         topics = "\n".join(topic_lines)
+        topic_block = (
+            "I'm only set up to discuss the following topics on this channel:\n"
+            f"\n{topics}\n"
+        )
+    elif contact.facets or contact.projects:
+        # Two-axis contact: build topic list from both registries.
+        topic_lines = []
+        for facet_name in contact.facets:
+            desc = (facets_registry or {}).get(facet_name, facet_name)
+            topic_lines.append(f"  - {desc}")
+        for project_name in contact.projects:
+            desc = (projects_registry or {}).get(project_name, project_name)
+            topic_lines.append(f"  - {desc}")
+        topics = "\n".join(topic_lines) if topic_lines else (
+            "  - (no topics configured)"
+        )
         topic_block = (
             "I'm only set up to discuss the following topics on this channel:\n"
             f"\n{topics}\n"
@@ -1132,17 +1154,25 @@ def _synth_out_of_scope_plan(
     detail: str,
     classifier_input_tokens: int,
     classifier_output_tokens: int,
+    facets_registry: dict[str, str] | None = None,
+    projects_registry: dict[str, str] | None = None,
 ) -> TriagePlan:
     """Construct the synthetic plan for an out-of-scope outcome.
 
     No LLM call goes into this; the body is templated and the metadata
     is built from the classifier's reason. Tokens are carried through
     so the cost backstop sees the classifier's spend.
+
+    Two-axis contacts: pass `facets_registry` and `projects_registry`
+    so the decline body lists the right topics. Legacy contacts
+    leave them None.
     """
     body = _build_decline_body(
         contact=contact,
         scopes_registry=scopes_registry,
         reason_was_classifier_failure=(reason != "out_of_scope"),
+        facets_registry=facets_registry,
+        projects_registry=projects_registry,
     )
     if reason == "out_of_scope":
         summary = (
@@ -1178,6 +1208,131 @@ def _synth_out_of_scope_plan(
     )
 
 
+async def _triage_two_axis(
+    *,
+    contact: Contact,
+    sender: str,
+    subject: str,
+    body: str,
+    structure: MessageStructure,
+    config: ClaudeConfig,
+    client: ClaudeClient,
+    prompts_dir: Path,
+    notes_path: Path,
+    facets_registry: dict[str, str],
+    projects_registry: dict[str, str],
+) -> TriagePlan | TriageError:
+    """Two-axis triage path. Classifier returns (facets, project);
+    notes are filtered through a ScopeContext that walks both axes.
+
+    Failure modes mirror the legacy path:
+      - SDK / parse errors: synthetic decline (fail closed).
+      - Full out-of-scope (no facets, no in-scope project): synthetic
+        decline.
+      - Otherwise: triage with notes filtered to the matching context.
+    """
+    from . import notes_store
+    from . import scope_classifier as sc_module
+
+    try:
+        safe_notes = notes_store.read_safe_notes(notes_path)
+    except notes_store.NotesParseError:
+        safe_notes = ""
+
+    classification = await sc_module.classify_two_axis(
+        contact=contact,
+        sender=sender,
+        subject=subject,
+        body=body,
+        facets_registry=facets_registry,
+        projects_registry=projects_registry,
+        safe_notes=safe_notes,
+        config=config,
+        client=client,
+    )
+
+    if isinstance(classification, sc_module.ClassifierError):
+        return _synth_out_of_scope_plan(
+            contact=contact,
+            scopes_registry={},
+            reason=classification.reason,
+            detail=classification.detail,
+            classifier_input_tokens=classification.raw_input_tokens,
+            classifier_output_tokens=classification.raw_output_tokens,
+            facets_registry=facets_registry,
+            projects_registry=projects_registry,
+        )
+
+    if classification.is_full_out_of_scope():
+        return _synth_out_of_scope_plan(
+            contact=contact,
+            scopes_registry={},
+            reason="out_of_scope",
+            detail="",
+            classifier_input_tokens=classification.raw_input_tokens,
+            classifier_output_tokens=classification.raw_output_tokens,
+            facets_registry=facets_registry,
+            projects_registry=projects_registry,
+        )
+
+    # In-scope (any axis matched): build ScopeContext and read notes.
+    project_set: frozenset[str] = (
+        frozenset({classification.project})
+        if classification.project != sc_module.OUT_OF_SCOPE
+        else frozenset()
+    )
+    ctx = notes_store.ScopeContext(
+        facets=frozenset(classification.facets),
+        projects=project_set,
+    )
+
+    try:
+        scoped_notes = notes_store.read_notes_two_axis(notes_path, ctx)
+    except notes_store.NotesParseError:
+        scoped_notes = ""
+
+    plan_or_error = await _triage_with_notes(
+        contact=contact,
+        sender=sender,
+        subject=subject,
+        body=body,
+        structure=structure,
+        notes=scoped_notes,
+        config=config,
+        client=client,
+        prompts_dir=prompts_dir,
+    )
+
+    if isinstance(plan_or_error, TriageError):
+        return plan_or_error
+
+    # Step 7 wave 3a: read-side provenance gate. Same gate as the
+    # legacy path; operates on the parsed notes file directly.
+    parsed = _read_parsed_notes(notes_path)
+    plan_or_error = _gate_reply_against_unverified_notes(
+        plan_or_error, parsed_notes=parsed,
+    )
+
+    return TriagePlan(
+        verb=plan_or_error.verb,
+        tier=plan_or_error.tier,
+        args=plan_or_error.args,
+        summary=plan_or_error.summary,
+        reasoning=plan_or_error.reasoning,
+        risk_flags=plan_or_error.risk_flags,
+        notes=plan_or_error.notes,
+        raw_input_tokens=(
+            plan_or_error.raw_input_tokens
+            + classification.raw_input_tokens
+        ),
+        raw_output_tokens=(
+            plan_or_error.raw_output_tokens
+            + classification.raw_output_tokens
+        ),
+        note_proposals=plan_or_error.note_proposals,
+    )
+
+
 async def triage_with_scope(
     *,
     contact: Contact,
@@ -1190,18 +1345,26 @@ async def triage_with_scope(
     prompts_dir: Path,
     notes_dir: Path,
     scopes_registry: dict[str, str],
+    facets_registry: dict[str, str] | None = None,
+    projects_registry: dict[str, str] | None = None,
 ) -> TriagePlan | TriageError:
     """Step 7b orchestrator. Two-pass triage when the contact has scopes.
 
-    Sequencing:
-      - Empty contact.scopes: skip classification entirely. Read full
-        notes (active_scope=None) for the prompt and run triage as
-        before. Behaviour matches pre-Step-7b for unscoped contacts.
-      - Non-empty contact.scopes: build safe-only notes for pass 1,
-        run scope_classifier. On in-scope result, read scope-filtered
-        notes and run triage. On out-of-scope result OR any classifier
-        error, return a synthetic out_of_scope_decline plan without
-        calling triage proper (fail closed).
+    Sequencing (per axis vocabulary the contact uses):
+
+      - Legacy single-axis (`contact.scopes` non-empty): pass-1
+        classifier + scope-filtered notes for triage. On out-of-scope
+        OR classifier error, synthetic decline.
+      - Two-axis (`contact.facets` or `contact.projects` non-empty):
+        pass-1 two-axis classifier returning (facets, project). If
+        the result is full out-of-scope, synthetic decline. Otherwise
+        triage runs with notes filtered through the matching
+        `ScopeContext`.
+      - Unrestricted (all axes empty): skip classification; full
+        notes; existing behaviour.
+
+    Two-axis vs legacy is mutually exclusive (config.load enforces
+    this), so dispatch is unambiguous.
 
     Cost: pass-1 classifier tokens always counted; pass-2 triage
     tokens added when the in-scope path is taken. Caller's cost
@@ -1217,6 +1380,18 @@ async def triage_with_scope(
     from . import scope_classifier as sc_module
 
     notes_path = notes_dir / f"{contact.contact_id}.md"
+
+    # Two-axis path: contact has facets and/or projects (and no legacy
+    # `scopes` — config.load enforces mutual exclusion). Goes through
+    # `classify_two_axis` and `read_notes_two_axis` with a ScopeContext.
+    if contact.facets or contact.projects:
+        return await _triage_two_axis(
+            contact=contact, sender=sender, subject=subject, body=body,
+            structure=structure, config=config, client=client,
+            prompts_dir=prompts_dir, notes_path=notes_path,
+            facets_registry=facets_registry or {},
+            projects_registry=projects_registry or {},
+        )
 
     # Empty scopes path: skip classification, read full notes, pass
     # through to triage_contact_mail. Existing behaviour preserved.
