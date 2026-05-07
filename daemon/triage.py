@@ -1024,7 +1024,7 @@ async def triage_contact_mail(
 
     try:
         response = await client.call(
-            model=config.default_model,
+            model=config.model_for_site("triage"),
             system=system,
             user=user,
             tools=[build_draft_plan_tool(contact)],
@@ -1216,7 +1216,8 @@ async def _triage_two_axis(
     body: str,
     structure: MessageStructure,
     config: ClaudeConfig,
-    client: ClaudeClient,
+    triage_client: ClaudeClient,
+    classifier_client: ClaudeClient,
     prompts_dir: Path,
     notes_path: Path,
     facets_registry: dict[str, str],
@@ -1248,7 +1249,7 @@ async def _triage_two_axis(
         projects_registry=projects_registry,
         safe_notes=safe_notes,
         config=config,
-        client=client,
+        client=classifier_client,
     )
 
     if isinstance(classification, sc_module.ClassifierError):
@@ -1299,7 +1300,7 @@ async def _triage_two_axis(
         structure=structure,
         notes=scoped_notes,
         config=config,
-        client=client,
+        client=triage_client,
         prompts_dir=prompts_dir,
     )
 
@@ -1341,7 +1342,8 @@ async def triage_with_scope(
     body: str,
     structure: MessageStructure,
     config: ClaudeConfig,
-    client: ClaudeClient,
+    triage_client: ClaudeClient,
+    classifier_client: ClaudeClient | None = None,
     prompts_dir: Path,
     notes_dir: Path,
     scopes_registry: dict[str, str],
@@ -1385,9 +1387,19 @@ async def triage_with_scope(
     # `scopes` — config.load enforces mutual exclusion). Goes through
     # `classify_two_axis` and `read_notes_two_axis` with a ScopeContext.
     if contact.facets or contact.projects:
+        if classifier_client is None:
+            return TriageError(
+                reason="missing_classifier_client",
+                detail=(
+                    "contact uses two-axis scopes but no scope_classifier "
+                    "client was wired; check [llm.scope_classifier] config"
+                ),
+            )
         return await _triage_two_axis(
             contact=contact, sender=sender, subject=subject, body=body,
-            structure=structure, config=config, client=client,
+            structure=structure, config=config,
+            triage_client=triage_client,
+            classifier_client=classifier_client,
             prompts_dir=prompts_dir, notes_path=notes_path,
             facets_registry=facets_registry or {},
             projects_registry=projects_registry or {},
@@ -1413,7 +1425,7 @@ async def triage_with_scope(
             structure=structure,
             notes=full_notes,
             config=config,
-            client=client,
+            client=triage_client,
             prompts_dir=prompts_dir,
         )
         if isinstance(plan_or_error, TriageError):
@@ -1436,6 +1448,14 @@ async def triage_with_scope(
         # still runs (it has the metadata + message body to work on).
         safe_notes = ""
 
+    if classifier_client is None:
+        return TriageError(
+            reason="missing_classifier_client",
+            detail=(
+                "contact uses legacy scopes but no scope_classifier "
+                "client was wired; check [llm.scope_classifier] config"
+            ),
+        )
     classification = await sc_module.classify_scope(
         contact=contact,
         sender=sender,
@@ -1444,7 +1464,7 @@ async def triage_with_scope(
         scopes_registry=scopes_registry,
         safe_notes=safe_notes,
         config=config,
-        client=client,
+        client=classifier_client,
     )
 
     if isinstance(classification, sc_module.ClassifierError):
@@ -1485,7 +1505,7 @@ async def triage_with_scope(
         structure=structure,
         notes=scoped_notes,
         config=config,
-        client=client,
+        client=triage_client,
         prompts_dir=prompts_dir,
     )
 
@@ -1550,7 +1570,7 @@ async def _triage_with_notes(
 
     try:
         response = await client.call(
-            model=config.default_model,
+            model=config.model_for_site("triage"),
             system=system,
             user=user,
             tools=[build_draft_plan_tool(contact)],

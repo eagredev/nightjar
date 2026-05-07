@@ -231,6 +231,32 @@ CREATE TABLE IF NOT EXISTS inbox_state (
 );
 """
 
+# V11 adds:
+#   - secondary_hotp_counter on daemon_state — the second HOTP counter
+#     used by the `do` verb's two-secret gate. Independent of the
+#     primary hotp_counter so the two seeds advance separately.
+#   - agent_sessions table — one row per `do`-verb session. Used to
+#     look up an existing session on a reply, advance message threading,
+#     and surface in-flight runs in status reports.
+SCHEMA_V11_ALTER_SECONDARY_HOTP = (
+    "ALTER TABLE daemon_state "
+    "ADD COLUMN secondary_hotp_counter INTEGER NOT NULL DEFAULT 0"
+)
+SCHEMA_V11_AGENT_SESSIONS = """
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    session_id              TEXT PRIMARY KEY,
+    originating_message_id  TEXT NOT NULL,
+    last_message_id         TEXT NOT NULL,
+    started_at              INTEGER NOT NULL,
+    completed_at            INTEGER,
+    status                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_last_message_id
+    ON agent_sessions(last_message_id);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_status
+    ON agent_sessions(status);
+"""
+
 # How long a used TOTP code is remembered. Codes outside the verification
 # window (±30s) cannot succeed anyway, so 90s of replay-protection memory
 # is plenty.
@@ -272,12 +298,18 @@ class State:
                 conn.execute(SCHEMA_V9_ALTER_MACHINE_ID_FP)
             # V10: inbox_state table for catchup watermark.
             conn.executescript(SCHEMA_V10)
+            # V11: secondary_hotp_counter + agent_sessions. The ALTER is
+            # gated on column presence; the table is CREATE IF NOT EXISTS.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(daemon_state)")}
+            if "secondary_hotp_counter" not in cols:
+                conn.execute(SCHEMA_V11_ALTER_SECONDARY_HOTP)
+            conn.executescript(SCHEMA_V11_AGENT_SESSIONS)
             cur = conn.execute("SELECT version FROM schema_version")
             row = cur.fetchone()
             if row is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (10)")
-            elif row["version"] < 10:
-                conn.execute("UPDATE schema_version SET version = 10")
+                conn.execute("INSERT INTO schema_version (version) VALUES (11)")
+            elif row["version"] < 11:
+                conn.execute("UPDATE schema_version SET version = 11")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -425,6 +457,111 @@ class State:
                 "UPDATE daemon_state SET hotp_counter = ? WHERE id = 1",
                 (counter,),
             )
+
+    def get_secondary_hotp_counter(self) -> int:
+        """Counter for the second HOTP secret (used by the `do` verb).
+        0 means no codes consumed. Independent of the primary counter."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT secondary_hotp_counter FROM daemon_state WHERE id = 1"
+            ).fetchone()
+            return int(row["secondary_hotp_counter"]) if row else 0
+
+    def set_secondary_hotp_counter(self, counter: int) -> None:
+        """Advance the secondary HOTP counter. Called on accepted codes
+        only (no automatic provisioning reset; secondary seed is set up
+        out-of-band)."""
+        if counter < 0:
+            raise ValueError("secondary_hotp_counter must be >= 0")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_state SET secondary_hotp_counter = ? WHERE id = 1",
+                (counter,),
+            )
+
+    # ---- agent_sessions -----------------------------------------------------
+
+    def agent_session_create(
+        self,
+        *,
+        session_id: str,
+        originating_message_id: str,
+        started_at: int,
+    ) -> None:
+        """Insert a new agent session row in status='in_progress'.
+        Caller is responsible for advancing/completing later."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO agent_sessions "
+                "(session_id, originating_message_id, last_message_id, "
+                " started_at, completed_at, status) "
+                "VALUES (?, ?, ?, ?, NULL, 'in_progress')",
+                (session_id, originating_message_id, originating_message_id, started_at),
+            )
+
+    def agent_session_advance(
+        self, *, session_id: str, last_message_id: str,
+    ) -> None:
+        """Update last_message_id when a continuation reply lands. The
+        next reply's In-Reply-To will then point at this message,
+        keeping the lookup chain unbroken."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE agent_sessions SET last_message_id = ? "
+                "WHERE session_id = ?",
+                (last_message_id, session_id),
+            )
+
+    def agent_session_complete(
+        self, *, session_id: str, status: str, completed_at: int,
+    ) -> None:
+        """Mark a session terminal. status in {completed, killed, errored}."""
+        if status not in {"completed", "killed", "errored"}:
+            raise ValueError(f"unexpected agent_session status: {status!r}")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE agent_sessions SET status = ?, completed_at = ? "
+                "WHERE session_id = ?",
+                (status, completed_at, session_id),
+            )
+
+    def agent_session_lookup_by_last_message(
+        self, last_message_id: str,
+    ) -> dict | None:
+        """Find the agent session whose last outbound was message_id.
+        Used when a principal reply lands: walk In-Reply-To, look here,
+        if matched dispatch as a continuation."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id, originating_message_id, last_message_id, "
+                "started_at, completed_at, status "
+                "FROM agent_sessions WHERE last_message_id = ?",
+                (last_message_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def agent_session_get(self, session_id: str) -> dict | None:
+        """Fetch a session row by id. Returns None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id, originating_message_id, last_message_id, "
+                "started_at, completed_at, status "
+                "FROM agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def agent_sessions_in_progress(self) -> list[dict]:
+        """List all sessions currently in-progress. Used by the DMS
+        kill path and by status reports."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id, originating_message_id, last_message_id, "
+                "started_at, completed_at, status "
+                "FROM agent_sessions WHERE status = 'in_progress' "
+                "ORDER BY started_at"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_machine_id_fp(self) -> str | None:
         """Return the stored machine-id fingerprint, or None if never set.

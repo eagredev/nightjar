@@ -24,6 +24,7 @@ import email
 import email.utils
 import random
 import secrets
+import socket
 import time
 from email.header import decode_header, make_header
 from pathlib import Path
@@ -31,12 +32,14 @@ from pathlib import Path
 from aioimaplib import aioimaplib
 
 from . import (
+    agent_router,
     auth,
     cost_guard,
     dmarc,
     executor,
     notes_store,
     notifier,
+    principal_agent,
     principal_commands,
     principal_handlers,
     principal_interpret,
@@ -79,6 +82,39 @@ IDLE_REFRESH_SECONDS = 27 * 60
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 300.0
 
+# Hard timeout for the per-poll NOOP socket-health probe. If a NOOP
+# doesn't round-trip within this window, the socket is presumed dead
+# (typical cause: Steam Deck sleep timed out the TCP connection on
+# Gmail's side without us noticing). The watcher raises so the outer
+# run() loop reconnects. 5s is enough headroom for normal Gmail
+# latency without dragging out a known-dead connection.
+NOOP_HEALTH_TIMEOUT_SECONDS = 5.0
+
+# TCP keepalive parameters for the IMAP socket (Issue #42 fix).
+# Without these the kernel won't probe a silent peer for ~2 hours,
+# so a half-open socket from Steam Deck sleep or a network drop
+# leaves wait_server_push() blocked indefinitely. With these, the
+# kernel notices a dead peer in roughly idle + (cnt * intvl) =
+# 60 + (4 * 15) = 120s and surfaces it as a transport error that
+# breaks the IDLE wait so the outer run() loop reconnects.
+TCP_KEEPALIVE_IDLE_SECONDS = 60      # idle before first probe
+TCP_KEEPALIVE_INTERVAL_SECONDS = 15  # spacing between probes
+TCP_KEEPALIVE_PROBE_COUNT = 4        # probes before tearing down
+
+# How long _wait_for_activity blocks on a single wait_server_push()
+# slice before checking transport health. Short slices mean we
+# notice a torn-down transport (typically from the keepalive fix
+# above firing) within at most this interval, even when no IDLE
+# response ever arrives. Without this, a single
+# wait_server_push() call could block for ~29 minutes regardless of
+# socket state.
+IDLE_PUSH_SLICE_SECONDS = 30
+
+# Hard cap on how long we wait for the IDLE response future to
+# resolve after sending DONE. On a dead socket this future will
+# never complete. 10s is generous for a healthy server.
+IDLE_TEARDOWN_HARD_CAP_SECONDS = 10
+
 # Max plaintext body bytes the watcher will hand to triage. Anything
 # longer is truncated and a "body_truncated" flag is added to the plan's
 # notes. 32 KiB is well above a normal email and below the prompt-token
@@ -99,6 +135,89 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 RATE_LIMIT_WINDOW_SECONDS = 3600
 
 
+def _get_underlying_socket(client: aioimaplib.IMAP4_SSL):
+    """Walk the aioimaplib client → asyncio transport → raw socket.
+
+    Returns None if any link in the chain is missing (e.g. the
+    transport hasn't connected yet, or aioimaplib's internals
+    change shape in a future release). Caller must handle None
+    gracefully — keepalive is best-effort, not load-bearing.
+
+    The returned object is duck-typed: it must have setsockopt and
+    getsockopt. We don't require socket.socket subclass because
+    asyncio's SSL transport returns asyncio.TransportSocket which
+    wraps the real socket but is NOT a subclass of socket.socket.
+    Both setsockopt and getsockopt pass through to the underlying
+    real socket.
+    """
+    protocol = getattr(client, "protocol", None)
+    if protocol is None:
+        return None
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        return None
+    sock = transport.get_extra_info("socket")
+    if sock is None:
+        return None
+    if not hasattr(sock, "setsockopt") or not hasattr(sock, "getsockopt"):
+        return None
+    return sock
+
+
+def _enable_tcp_keepalive(client: aioimaplib.IMAP4_SSL) -> bool:
+    """Enable aggressive TCP keepalive on the IMAP socket so a dead
+    peer is noticed within ~120s rather than the default ~2 hours.
+
+    Returns True if all four sockopts were set, False if anything
+    was missing or unsupported (the caller treats keepalive as
+    best-effort defence-in-depth — the wait_server_push slicing
+    in _wait_for_activity is the second layer).
+    """
+    sock = _get_underlying_socket(client)
+    if sock is None:
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT are Linux-only
+        # but Steam Deck is Linux. On other platforms these names
+        # may be missing — guard each lookup.
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,
+                TCP_KEEPALIVE_IDLE_SECONDS,
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
+                TCP_KEEPALIVE_INTERVAL_SECONDS,
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPCNT,
+                TCP_KEEPALIVE_PROBE_COUNT,
+            )
+    except OSError:
+        return False
+    return True
+
+
+def _transport_is_dead(client: aioimaplib.IMAP4_SSL) -> bool:
+    """Return True if asyncio considers the IMAP transport closed
+    or in the process of closing. Used between IDLE wait slices to
+    bail out of an otherwise-blocking IDLE when TCP keepalive has
+    torn the connection down.
+    """
+    protocol = getattr(client, "protocol", None)
+    if protocol is None:
+        return True
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        return True
+    if transport.is_closing():
+        return True
+    return False
+
+
 class InboxWatcher:
     def __init__(
         self,
@@ -108,7 +227,7 @@ class InboxWatcher:
         state: State,
         logger: JSONLLogger,
         on_panic: "callable | None" = None,
-        claude_client: "object | None" = None,
+        claude_clients: "dict[str, object] | None" = None,
     ) -> None:
         self.inbox = inbox
         self.config = config
@@ -119,12 +238,13 @@ class InboxWatcher:
         # Called with (reason: str) when the dead-man's-switch trips.
         # main.py uses this to trigger a clean daemon shutdown.
         self._on_panic = on_panic
-        # Anthropic Messages API client for contact-mail triage. None
-        # when [claude] is missing from config or when triage is
-        # otherwise disabled. The watcher checks this BEFORE issuing a
-        # body fetch so an unconfigured daemon doesn't waste a round
-        # trip pulling bodies it can't triage.
-        self._claude_client = claude_client
+        # Per-call-site Claude clients keyed by site name (see
+        # config.KNOWN_LLM_SITES). Empty dict when [claude] is missing
+        # from config or when triage is otherwise disabled. Helper
+        # methods check the relevant entry BEFORE issuing a body fetch
+        # so an unconfigured daemon doesn't waste a round trip pulling
+        # bodies it can't triage.
+        self._claude_clients = claude_clients or {}
 
     async def run(self) -> None:
         """Run forever (until stop() is called or asyncio cancels us)."""
@@ -190,7 +310,12 @@ class InboxWatcher:
             with contextlib.suppress(Exception):
                 await client.logout()
 
-    async def _catch_up(self, client: aioimaplib.IMAP4_SSL) -> None:
+    async def _catch_up(
+        self,
+        client: aioimaplib.IMAP4_SSL,
+        *,
+        wake_reason: str = "startup",
+    ) -> None:
         """Reconcile recent IMAP mail against the state-db.
 
         Step 6e (receipt reliability) replaced the prior `UNSEEN`-based
@@ -297,6 +422,19 @@ class InboxWatcher:
             errors=errors,
         )
 
+        # Belt-and-braces telemetry: a poll-driven catchup that
+        # actually processed something means IDLE silently dropped a
+        # push. Quantifying this tells us whether IDLE is healthy,
+        # marginal, or broken on a given account.
+        if wake_reason == "poll" and processed > 0:
+            self.logger.event(
+                "poll_caught_missed_push",
+                inbox=self.inbox.name,
+                level="warn",
+                processed=processed,
+                detail="IDLE did not push these — the periodic poll caught them",
+            )
+
         # First-run reconciliation summary. This pass walked a wider
         # 30-day window to catch up any mail that the old UNSEEN-based
         # logic may have silently skipped. If we found anything new,
@@ -324,66 +462,206 @@ class InboxWatcher:
         return f"{t.tm_mday:02d}-{months[t.tm_mon - 1]}-{t.tm_year:04d}"
 
     async def _idle_once(self, client: aioimaplib.IMAP4_SSL) -> None:
-        """Issue one IDLE, wait for activity or refresh timeout, then DONE.
+        """Issue one IDLE, wait for activity / poll timer / refresh /
+        stop, then DONE.
 
-        On activity (untagged response indicating EXISTS), runs a fresh
-        UNSEEN search and processes anything new. On timeout, returns;
-        the outer loop re-IDLEs.
+        Wake reasons, in priority order if multiple resolve at once:
+          - stop_event: clean shutdown, return immediately, skip catchup.
+          - activity (server push): IDLE pushed something — re-search.
+          - poll timer: belt-and-braces backstop for missed pushes.
+          - refresh timer: long-cycle IDLE rotation, ~Gmail's 29 min cap.
+
+        The poll timer is what bounds worst-case latency when Gmail
+        silently fails to push a new-mail notification. Without it,
+        missed pushes wait up to IDLE_REFRESH_SECONDS (~27 min) to be
+        caught. With it, they're caught in poll_interval_seconds (60s
+        default).
         """
+        # Issue #42 defence-in-depth: enable TCP keepalive on the
+        # underlying socket BEFORE entering IDLE. The kernel will
+        # probe the peer ~60s of silence and tear the socket down
+        # after a few failed probes, which surfaces as the IDLE
+        # response future erroring or wait_server_push() raising —
+        # either way, the race below resolves and we reconnect.
+        # Without this, a half-open socket (Steam Deck sleep, network
+        # drop) can keep wait_server_push() blocked indefinitely.
+        _enable_tcp_keepalive(client)
+
         idle_task = await client.idle_start(timeout=IDLE_REFRESH_SECONDS + 30)
+        wake_reason = "refresh"  # default if loop body never reassigns
         try:
-            # Race three conditions: server push (activity), stop_event
-            # (clean shutdown), and the refresh timer. Whichever resolves
-            # first wins; the others are cancelled in the finally block.
+            # Race four conditions: server push (activity, with
+            # internal short-timeout polling so a dead socket is
+            # noticed without waiting on the long IDLE refresh),
+            # stop_event (clean shutdown), the poll timer
+            # (belt-and-braces), and the long IDLE-refresh timer.
+            # Whichever resolves first wins; others are cancelled in
+            # the finally block.
             activity_task = asyncio.create_task(self._wait_for_activity(client))
             stop_task = asyncio.create_task(self._stop_event.wait())
             timer_task = asyncio.create_task(asyncio.sleep(IDLE_REFRESH_SECONDS))
+            poll_interval = self.inbox.poll_interval_seconds
+            poll_enabled = poll_interval > 0
+            poll_task = (
+                asyncio.create_task(asyncio.sleep(poll_interval))
+                if poll_enabled
+                else None
+            )
+            racing = {activity_task, stop_task, timer_task}
+            if poll_task is not None:
+                racing.add(poll_task)
             try:
                 done, pending = await asyncio.wait(
-                    {activity_task, stop_task, timer_task},
+                    racing,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for t in pending:
                     t.cancel()
-                # Surface any exception from the winning task.
+                # Surface any exception from the winning task —
+                # including the dead-socket RuntimeError that
+                # _wait_for_activity raises when its transport-health
+                # check trips. That propagates to the run() loop
+                # which tears down and reconnects.
                 for t in done:
                     exc = t.exception()
                     if exc is not None and not isinstance(exc, asyncio.CancelledError):
                         raise exc
                 if stop_task in done:
+                    wake_reason = "stop"
                     self.logger.event("idle_stop_requested", inbox=self.inbox.name)
                 elif activity_task in done:
+                    wake_reason = "activity"
                     self.logger.event("idle_activity", inbox=self.inbox.name)
+                elif poll_task is not None and poll_task in done:
+                    wake_reason = "poll"
+                    self.logger.event(
+                        "idle_poll",
+                        inbox=self.inbox.name,
+                        interval_seconds=poll_interval,
+                    )
                 else:
+                    wake_reason = "refresh"
                     self.logger.event("idle_refresh", inbox=self.inbox.name)
             finally:
                 for t in (activity_task, stop_task, timer_task):
                     if not t.done():
                         t.cancel()
+                if poll_task is not None and not poll_task.done():
+                    poll_task.cancel()
                 # Drain cancellations.
+                tasks_to_drain = [activity_task, stop_task, timer_task]
+                if poll_task is not None:
+                    tasks_to_drain.append(poll_task)
                 with contextlib.suppress(asyncio.CancelledError, BaseException):
-                    await asyncio.gather(activity_task, stop_task, timer_task, return_exceptions=True)
+                    await asyncio.gather(*tasks_to_drain, return_exceptions=True)
         finally:
             client.idle_done()
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(idle_task, timeout=10)
+                await asyncio.wait_for(
+                    idle_task, timeout=IDLE_TEARDOWN_HARD_CAP_SECONDS,
+                )
 
         # If we're stopping, don't bother running another catch-up.
         if self._stop_event.is_set():
             return
-        # Otherwise, do an UNSEEN search regardless of which path woke us.
+        # Probe the socket before catchup. After Steam Deck sleep (or
+        # any flaky network event), the IDLE teardown above might
+        # appear to succeed but leave us with a half-open TCP socket
+        # — Gmail timed out their side, our kernel didn't notice. The
+        # next IMAP command would block forever on do_epoll_wait. A
+        # NOOP with a hard timeout flushes that out: it either
+        # completes promptly (socket fine, proceed to catchup) or
+        # times out (socket dead, raise so the outer run() loop
+        # reconnects).
+        await self._probe_socket_alive(client)
+        # Otherwise, do a search regardless of which path woke us.
         # Catching up twice is cheaper than missing a message once.
-        await self._catch_up(client)
+        # `wake_reason` is threaded through so catchup can emit the
+        # 'poll_caught_missed_push' telemetry event when a poll wake
+        # actually finds new mail (i.e. IDLE silently dropped it).
+        await self._catch_up(client, wake_reason=wake_reason)
+
+    async def _probe_socket_alive(self, client: aioimaplib.IMAP4_SSL) -> None:
+        """Verify the IMAP socket is responsive with a NOOP under a
+        hard timeout. Raises on dead-socket or NOOP failure so the
+        outer run() loop tears down and reconnects.
+
+        Why this is necessary: Steam Deck sleep (or any extended
+        network drop) freezes the TCP connection. Our kernel keeps
+        the socket FD valid; Gmail's side times out and forgets. On
+        wake, the next IMAP command blocks forever waiting for a
+        response that will never come because the peer no longer
+        knows we exist. The poll backstop alone doesn't help — the
+        poll itself blocks on the dead socket. NOOP with
+        asyncio.wait_for() is the cheapest portable probe.
+        """
+        try:
+            response = await asyncio.wait_for(
+                client.noop(), timeout=NOOP_HEALTH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as e:
+            self.logger.event(
+                "imap_socket_dead",
+                inbox=self.inbox.name,
+                level="warn",
+                detail=(
+                    f"NOOP did not return within "
+                    f"{NOOP_HEALTH_TIMEOUT_SECONDS}s; presuming socket "
+                    f"dead (likely sleep/wake or network drop). "
+                    f"Reconnecting."
+                ),
+            )
+            raise RuntimeError("imap noop probe timed out") from e
+        if response.result != "OK":
+            self.logger.event(
+                "imap_noop_failed",
+                inbox=self.inbox.name,
+                level="warn",
+                result=response.result,
+            )
+            raise RuntimeError(
+                f"imap noop returned {response.result}; reconnecting"
+            )
 
     async def _wait_for_activity(self, client: aioimaplib.IMAP4_SSL) -> None:
-        """Block until the server pushes us something interesting.
+        """Block until the server pushes us something interesting,
+        or raise RuntimeError if the underlying transport dies.
 
         aioimaplib pushes IDLE responses via client.wait_server_push().
         Any push wakes us up; we re-search rather than try to be clever
         about parsing the push payload.
+
+        We slice the wait into IDLE_PUSH_SLICE_SECONDS chunks so a
+        torn-down transport (typically from TCP keepalive failing
+        after Steam Deck sleep / network drop) is noticed within
+        that interval and reported as a dead-socket error. Without
+        slicing, a single wait_server_push() blocks for the whole
+        IDLE refresh window.
         """
         while not self._stop_event.is_set():
-            push = await client.wait_server_push()
+            try:
+                push = await client.wait_server_push(
+                    timeout=IDLE_PUSH_SLICE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Slice expired with no push — normal on a quiet
+                # mailbox. Check transport before re-arming.
+                if _transport_is_dead(client):
+                    self.logger.event(
+                        "imap_socket_dead_in_idle",
+                        inbox=self.inbox.name,
+                        level="warn",
+                        detail=(
+                            "IDLE wait_server_push slice expired and "
+                            "transport is closing/closed; presuming "
+                            "socket dead (likely sleep/wake or network "
+                            "drop). Reconnecting."
+                        ),
+                    )
+                    raise RuntimeError(
+                        "imap transport dead during idle"
+                    ) from None
+                continue
             if push is None:
                 # Server-pushed empty: keep waiting unless we've been told to stop.
                 continue
@@ -427,6 +705,7 @@ class InboxWatcher:
             # globally unique but good enough to avoid duplicate inserts
             # for messages that lack a Message-ID header.
             message_id = f"<no-msgid-{self.inbox.name}-uid{uid}>"
+        in_reply_to = (msg.get("In-Reply-To") or "").strip() or None
 
         if self.state.message_exists(message_id):
             # Step 6e: log dedup hits at debug level so a catchup that
@@ -486,6 +765,13 @@ class InboxWatcher:
             dmarc_dropped = True
             dmarc_disposition = "dmarc_from_mismatch"
 
+        # Initialised here so the post-record dispatch block can read it
+        # unconditionally; only the principal-agent branch ever sets it
+        # to a non-NOT_AGENT classification.
+        agent_classification = agent_router.AgentClassification(
+            kind=agent_router.CLASS_NOT_AGENT,
+        )
+
         if dmarc_dropped:
             state = "DROPPED"
             detail = dmarc_disposition
@@ -511,12 +797,40 @@ class InboxWatcher:
                 state = "DROPPED"
                 detail = "blocked"
             elif contact.is_principal:
-                # Principal mail must carry a valid TOTP code in the
-                # subject prefix. No code or a bad code is a switch
-                # counter increment; threshold trips the dead-man's-switch.
-                state, detail, panic_trip_reason = self._authenticate_principal(
-                    subject=subject, from_addr=from_addr
+                # Principal mail has two routing modes:
+                #
+                #   (a) AGENT path — body's first line carries one or
+                #       two HOTP codes (and for continuations, the
+                #       In-Reply-To resolves to an active agent
+                #       session). The body IS the auth surface; the
+                #       subject is unused. Fetch body up front, run
+                #       agent_router.classify(), and if it matches,
+                #       validate codes from the body.
+                #
+                #   (b) STANDARD path — subject-based TOTP/HOTP gate
+                #       for deterministic verbs and free-form
+                #       interpret. Existing flow, untouched.
+                #
+                # Body fetch happens only on the agent path; the
+                # standard path's body fetch (for approval-verdict
+                # extraction) still runs after auth as before.
+                agent_classification = await self._classify_agent_mail(
+                    client=client, uid=uid, in_reply_to=in_reply_to,
                 )
+                if agent_classification.is_agent:
+                    state, detail, panic_trip_reason = (
+                        self._authenticate_agent_mail(
+                            classification=agent_classification,
+                            from_addr=from_addr,
+                        )
+                    )
+                else:
+                    # Principal mail must carry a valid TOTP code in the
+                    # subject prefix. No code or a bad code is a switch
+                    # counter increment; threshold trips the dead-man's-switch.
+                    state, detail, panic_trip_reason = self._authenticate_principal(
+                        subject=subject, from_addr=from_addr
+                    )
             else:
                 # Allowlisted, in-quota contact mail. Build Step 2 still
                 # doesn't implement triage; later steps will pick this up.
@@ -582,19 +896,30 @@ class InboxWatcher:
             and contact_id is not None
             and self.config.contacts[contact_id].is_principal
         ):
-            # Body is needed for approval-reply verdict extraction
-            # (`yes` / `no` / `YES IRREVERSIBLE` lives in the reply
-            # body, not the subject). For tier-1 verbs and free-form
-            # requests the body is unused but the extra IMAP round-trip
-            # is cheap. None on fetch failure is fine: the parser
-            # tolerates an absent body and routes to UNCLEAR for
-            # approval replies, which prompts the principal to retry.
-            body_result = await self._fetch_body_text(client, uid)
-            body_text = body_result[0] if body_result is not None else None
-            await self._dispatch_principal_command(
-                message_id=message_id, subject=subject,
-                body=body_text, from_addr=from_addr,
-            )
+            if detail in ("ok_agent_init", "ok_agent_continuation"):
+                # Agent path: hand off to the executor. The classification
+                # carries the request body (already stripped of the auth
+                # line) and the session_id (None for init).
+                await self._dispatch_agent_request(
+                    message_id=message_id,
+                    from_addr=from_addr,
+                    classification=agent_classification,
+                )
+            else:
+                # Standard path. Body is needed for approval-reply
+                # verdict extraction (`yes` / `no` / `YES IRREVERSIBLE`
+                # lives in the reply body, not the subject). For tier-1
+                # verbs and free-form requests the body is unused but
+                # the extra IMAP round-trip is cheap. None on fetch
+                # failure is fine: the parser tolerates an absent body
+                # and routes to UNCLEAR for approval replies, which
+                # prompts the principal to retry.
+                body_result = await self._fetch_body_text(client, uid)
+                body_text = body_result[0] if body_result is not None else None
+                await self._dispatch_principal_command(
+                    message_id=message_id, subject=subject,
+                    body=body_text, from_addr=from_addr,
+                )
 
         # Step 5b: triage for non-principal contact mail. Only runs when
         # the contact-mail branch produced RECEIVED (i.e. allowlisted,
@@ -730,6 +1055,372 @@ class InboxWatcher:
             )
             return "DROPPED", reason, panic_reason
         return "DROPPED", reason, None
+
+    # ---- Agent (do-verb-shaped) routing -----------------------------------
+
+    async def _classify_agent_mail(
+        self,
+        *,
+        client,
+        uid: str,
+        in_reply_to: str | None,
+    ) -> "agent_router.AgentClassification":
+        """Fetch the body and run agent_router.classify(). Returns
+        kind=NOT_AGENT if the body is missing or doesn't match either
+        agent shape — caller falls through to standard subject auth."""
+        body_result = await self._fetch_body_text(client, uid)
+        body_text = body_result[0] if body_result is not None else None
+
+        def _lookup(message_id: str) -> str | None:
+            row = self.state.agent_session_lookup_by_last_message(message_id)
+            if row is None:
+                return None
+            # Reject only 'killed' or 'errored' sessions. 'completed' is
+            # the normal terminal state for a single agent turn — the
+            # whole point of --resume is to continue a completed
+            # session. 'in_progress' shouldn't really happen here (we'd
+            # be racing the executor) but is permitted for robustness.
+            status = row.get("status")
+            if status in ("killed", "errored"):
+                return None
+            return str(row["session_id"])
+
+        return agent_router.classify(
+            body=body_text,
+            in_reply_to=in_reply_to,
+            active_session_lookup=_lookup,
+        )
+
+    def _authenticate_agent_mail(
+        self,
+        *,
+        classification: "agent_router.AgentClassification",
+        from_addr: str,
+    ) -> tuple[str, str, str | None]:
+        """Validate the HOTP codes carried in the body's first line.
+        On success, advances the relevant counter(s) and returns
+        ("RECEIVED", "ok_agent_init"|"ok_agent_continuation", None).
+        On failure, routes through _handle_auth_failure so DMS counts
+        the attempt the same way a bad subject code would.
+        """
+        security = self.config.security
+        if security is None:
+            self.logger.event(
+                "principal_auth_misconfigured",
+                inbox=self.inbox.name,
+                level="warn",
+                from_addr=from_addr,
+            )
+            return "DROPPED", "no_security_config", None
+
+        if not security.secondary_hotp_secret:
+            # Operator has not provisioned the second seed → agent path
+            # is structurally disabled. Surface as a clean auth failure
+            # so DMS counters track abuse attempts.
+            return self._handle_auth_failure(
+                from_addr=from_addr,
+                reason="agent_no_secondary_secret",
+                security=security,
+            )
+
+        # Init: validate primary AND secondary, advance both counters.
+        if classification.kind == agent_router.CLASS_AGENT_INIT:
+            primary_last = self.state.get_hotp_counter()
+            primary_match = auth.verify_hotp(
+                secret=security.totp_secret,
+                code=classification.primary_code or "",
+                last_counter=primary_last,
+            )
+            if primary_match is None:
+                return self._handle_auth_failure(
+                    from_addr=from_addr,
+                    reason="agent_bad_primary_code",
+                    security=security,
+                )
+            secondary_last = self.state.get_secondary_hotp_counter()
+            secondary_match = auth.verify_hotp(
+                secret=security.secondary_hotp_secret,
+                code=classification.secondary_code or "",
+                last_counter=secondary_last,
+            )
+            if secondary_match is None:
+                # Primary was valid but secondary wasn't. We do NOT
+                # advance the primary counter here — the request is
+                # rejected as a whole, and re-allowing the same
+                # primary code on the next attempt is the correct
+                # behaviour for a partial auth failure.
+                return self._handle_auth_failure(
+                    from_addr=from_addr,
+                    reason="agent_bad_secondary_code",
+                    security=security,
+                )
+            # Both valid — commit both counters atomically (in practice
+            # two state-db writes; the brief window between is tolerable
+            # because the watcher is the only writer).
+            self.state.set_hotp_counter(primary_match)
+            self.state.set_secondary_hotp_counter(secondary_match)
+            self.logger.event(
+                "agent_auth_ok",
+                inbox=self.inbox.name,
+                from_addr=from_addr,
+                kind="init",
+                primary_counter=primary_match,
+                secondary_counter=secondary_match,
+            )
+            return "RECEIVED", "ok_agent_init", None
+
+        # Continuation: validate secondary only, advance secondary counter.
+        if classification.kind == agent_router.CLASS_AGENT_CONTINUATION:
+            secondary_last = self.state.get_secondary_hotp_counter()
+            secondary_match = auth.verify_hotp(
+                secret=security.secondary_hotp_secret,
+                code=classification.secondary_code or "",
+                last_counter=secondary_last,
+            )
+            if secondary_match is None:
+                return self._handle_auth_failure(
+                    from_addr=from_addr,
+                    reason="agent_bad_continuation_code",
+                    security=security,
+                )
+            self.state.set_secondary_hotp_counter(secondary_match)
+            self.logger.event(
+                "agent_auth_ok",
+                inbox=self.inbox.name,
+                from_addr=from_addr,
+                kind="continuation",
+                session_id=classification.session_id,
+                secondary_counter=secondary_match,
+            )
+            return "RECEIVED", "ok_agent_continuation", None
+
+        # classification.kind == NOT_AGENT shouldn't reach here (caller
+        # guards on is_agent), but be defensive.
+        return self._handle_auth_failure(
+            from_addr=from_addr,
+            reason="agent_unexpected_classification",
+            security=security,
+        )
+
+    async def _dispatch_agent_request(
+        self,
+        *,
+        message_id: str,
+        from_addr: str,
+        classification: "agent_router.AgentClassification",
+    ) -> None:
+        """Run the principal-agent executor and email the result back.
+        Wraps execution + reply emission so the watcher's main loop
+        stays narrow."""
+        # Reject empty requests loudly — an agent run with no actual
+        # request is meaningless. Send the principal a hint reply.
+        request_text = classification.request_body.strip()
+        if not request_text:
+            self.logger.event(
+                "agent_empty_request",
+                inbox=self.inbox.name,
+                from_addr=from_addr,
+                level="warn",
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: agent request was empty",
+                body=(
+                    "Your request authenticated correctly, but the body\n"
+                    "after the auth line was empty. The agent had nothing\n"
+                    "to do. Send a follow-up with the auth line and your\n"
+                    "actual request below.\n"
+                ),
+                next_state="DROPPED",
+                event_name="agent_empty_request_replied",
+            )
+            return
+
+        principal_name = self._principal_display_name() or "the principal"
+        audit_dir = self.config.daemon.state_dir / "agent-audit"
+        cwd = self.config.daemon.agent_cwd
+        # The agent_cwd lives inside Nightjar's state dir on purpose —
+        # so Claude Code's CLAUDE.md auto-discovery sees only the file
+        # we (or the agent) seed there, not whatever lives in the
+        # principal's $HOME tree. Idempotent: writes a starter
+        # CLAUDE.md only if one is not already present.
+        principal_agent.ensure_agent_workspace(cwd)
+
+        is_continuation = (
+            classification.kind == agent_router.CLASS_AGENT_CONTINUATION
+        )
+        # On init, generate session_id inside the executor; on
+        # continuation, pass the existing one through.
+        existing_session_id = (
+            classification.session_id if is_continuation else None
+        )
+
+        # NOTE: do NOT advance last_message_id to the inbound here.
+        # last_message_id must point at the OUTBOUND reply's Message-ID
+        # so that the principal's next reply's In-Reply-To matches in
+        # agent_session_lookup_by_last_message. We advance it after
+        # _send_agent_reply succeeds, below.
+
+        self.logger.event(
+            "agent_session_started",
+            inbox=self.inbox.name,
+            from_addr=from_addr,
+            kind="continuation" if is_continuation else "init",
+            session_id=existing_session_id or "(new)",
+            originating_message_id=message_id,
+        )
+
+        # The executor itself handles subprocess lifecycle, audit log,
+        # and DMS-cancellation via the inbox's stop event.
+        try:
+            result = await principal_agent.execute(
+                request_body=request_text,
+                principal_name=principal_name,
+                audit_dir=audit_dir,
+                cwd=cwd,
+                session_id=existing_session_id,
+                stop_event=self._stop_event,
+                agent_name=self.config.agent.name,
+                agent_personality=self.config.agent.personality or None,
+            )
+        except Exception as e:
+            self.logger.event(
+                "agent_session_errored",
+                inbox=self.inbox.name,
+                level="error",
+                from_addr=from_addr,
+                detail=str(e)[:400],
+            )
+            self._send_deterministic_reply(
+                message_id=message_id,
+                from_addr=from_addr,
+                subject="Nightjar: agent run failed",
+                body=(
+                    f"The agent run did not complete. Detail:\n\n"
+                    f"  {str(e)[:400]}\n\n"
+                    "No further action was taken. You may retry with a\n"
+                    "fresh primary + secondary code pair.\n"
+                ),
+                next_state="DROPPED",
+                event_name="agent_run_failed_replied",
+            )
+            return
+
+        # If this was an init, register the new session now that we
+        # have its session_id from the executor.
+        if not is_continuation:
+            self.state.agent_session_create(
+                session_id=result.session_id,
+                originating_message_id=message_id,
+                started_at=result.started_at,
+            )
+
+        # Mark the session terminal in the state-db. The executor
+        # already wrote a session-completed/killed envelope to the
+        # audit log; this is just the parallel state-db record.
+        self.state.agent_session_complete(
+            session_id=result.session_id,
+            status=result.status,
+            completed_at=result.completed_at,
+        )
+
+        self.logger.event(
+            "agent_session_finished",
+            inbox=self.inbox.name,
+            from_addr=from_addr,
+            session_id=result.session_id,
+            status=result.status,
+            duration_s=result.completed_at - result.started_at,
+        )
+
+        outbound_message_id = await self._send_agent_reply(
+            originating_message_id=message_id,
+            from_addr=from_addr,
+            result=result,
+        )
+        # Anchor the session to the OUTBOUND message-id. The principal's
+        # next reply's In-Reply-To will reference this id, and
+        # agent_session_lookup_by_last_message uses it to route the
+        # continuation back to this session_id (for --resume).
+        if outbound_message_id is not None:
+            self.state.agent_session_advance(
+                session_id=result.session_id,
+                last_message_id=outbound_message_id,
+            )
+        else:
+            # Send failed — the session is over but we can't anchor a
+            # follow-up. Log loudly so the operator can spot it.
+            self.logger.event(
+                "agent_session_unanchored",
+                level="warn",
+                inbox=self.inbox.name,
+                from_addr=from_addr,
+                session_id=result.session_id,
+                detail="outbound reply send failed; continuations to this session will not route",
+            )
+
+    def _principal_display_name(self) -> str | None:
+        """Look up the principal contact's display name. None if not
+        configured (shouldn't happen, since this code only runs on
+        principal mail)."""
+        for contact in self.config.contacts.values():
+            if contact.is_principal:
+                return contact.display_name or contact.contact_id
+        return None
+
+    async def _send_agent_reply(
+        self,
+        *,
+        originating_message_id: str,
+        from_addr: str,
+        result: "principal_agent.AgentResult",
+    ) -> str | None:
+        """Email the agent's final text back to the principal. Three
+        templates: completed (just the agent's reply + footer), killed
+        (partial output + kill notice), errored (apology + detail).
+
+        Returns the outbound reply's Message-ID on success, None
+        otherwise. The caller threads it into agent_sessions so the
+        principal's next reply (whose In-Reply-To will reference this
+        outbound) routes back to the correct session.
+        """
+        session_short = result.session_id[:8]
+        footer = (
+            f"\n\n---\n"
+            f"Session: {result.session_id}\n"
+            f"Audit log (local): {result.audit_log_path}\n"
+            f"Reply with one HOTP code on the first line to continue.\n"
+        )
+        if result.status == "completed":
+            subject = "Nightjar agent: response"
+            body = (result.final_text or "(agent produced no text)") + footer
+        elif result.status == "killed":
+            subject = f"Nightjar agent: session killed ({session_short})"
+            body = (
+                "The agent run was interrupted before it could complete.\n"
+                f"Reason: {result.error_detail or 'unknown'}\n\n"
+                "Partial output captured before the kill:\n\n"
+                + (result.final_text or "(no text was produced before kill)")
+                + footer
+            )
+        else:  # errored
+            subject = f"Nightjar agent: session errored ({session_short})"
+            body = (
+                "The agent run did not complete cleanly.\n"
+                f"Detail: {result.error_detail or 'unknown'}\n\n"
+                "Partial output (may be empty):\n\n"
+                + (result.final_text or "(no text was produced)")
+                + footer
+            )
+        return self._send_deterministic_reply(
+            message_id=originating_message_id,
+            from_addr=from_addr,
+            subject=subject,
+            body=body,
+            next_state="RESPONDED",
+            event_name="agent_replied",
+        )
 
     def _trip_dead_mans_switch(self, reason: str) -> None:
         """Persist panic state and signal the daemon to halt."""
@@ -1402,7 +2093,8 @@ class InboxWatcher:
         they know the request was received but produced nothing
         actionable.
         """
-        if self._claude_client is None:
+        interpret_client = self._claude_clients.get("principal_interpret")
+        if interpret_client is None:
             self._send_deterministic_reply(
                 message_id=message_id,
                 from_addr=from_addr,
@@ -1455,7 +2147,7 @@ class InboxWatcher:
             state_snapshot=snapshot,
             verb_registry=registry,
             config=claude_cfg,
-            client=self._claude_client,
+            client=interpret_client,
             prompts_dir=PROMPTS_DIR,
         )
 
@@ -1870,8 +2562,13 @@ class InboxWatcher:
         next_state: str,
         event_name: str,
         detail: str = "",
-    ) -> None:
+    ) -> str | None:
         """Common path: notify_principal + state transition + log event.
+
+        Returns the outbound Message-ID on success, None on any failure
+        (skipped, errored, or not-sent). Callers that need to thread the
+        outbound id (e.g. agent-session continuation tracking) should
+        capture it; everyone else can ignore the return value.
 
         Robust to SMTP failures: logs + transitions to RESPONDED_FAILED
         if the send didn't go out. The inbound message stays recorded
@@ -1885,7 +2582,7 @@ class InboxWatcher:
                 message_id=message_id,
                 reason="no_smtp_config",
             )
-            return
+            return None
         try:
             send = notifier.notify_principal(
                 smtp=self.config.smtp,
@@ -1904,7 +2601,7 @@ class InboxWatcher:
                 error=type(e).__name__,
                 message=str(e),
             )
-            return
+            return None
         if send.primary_sent:
             self.state.transition(
                 message_id=message_id,
@@ -1919,20 +2616,21 @@ class InboxWatcher:
                 detail=detail,
                 reply_message_id=send.primary_message_id,
             )
-        else:
-            self.state.transition(
-                message_id=message_id,
-                from_state="RECEIVED",
-                to_state="RESPONDED_FAILED",
-                detail=f"send error: {send.error}",
-            )
-            self.logger.event(
-                "principal_reply_failed",
-                level="error",
-                inbox=self.inbox.name,
-                message_id=message_id,
-                error=send.error,
-            )
+            return send.primary_message_id
+        self.state.transition(
+            message_id=message_id,
+            from_state="RECEIVED",
+            to_state="RESPONDED_FAILED",
+            detail=f"send error: {send.error}",
+        )
+        self.logger.event(
+            "principal_reply_failed",
+            level="error",
+            inbox=self.inbox.name,
+            message_id=message_id,
+            error=send.error,
+        )
+        return None
 
     @staticmethod
     def _extract_literal(data: list) -> bytes | None:
@@ -2014,8 +2712,13 @@ class InboxWatcher:
         Failures ping the principal so they know an email arrived but
         triage didn't complete; they can act manually if needed.
         """
-        # 1. Bail early if no client (no [claude] section).
-        if self._claude_client is None:
+        # 1. Bail early if no triage client (no [claude] section, or
+        # the operator has somehow disabled the triage site only). The
+        # scope_classifier client is checked inside triage_with_scope
+        # — fail-closed there too if it's missing.
+        triage_client = self._claude_clients.get("triage")
+        classifier_client = self._claude_clients.get("scope_classifier")
+        if triage_client is None:
             self.state.transition(
                 message_id=message_id,
                 from_state="RECEIVED",
@@ -2100,7 +2803,8 @@ class InboxWatcher:
             body=body_text,
             structure=structure,
             config=claude_cfg,
-            client=self._claude_client,
+            triage_client=triage_client,
+            classifier_client=classifier_client,
             prompts_dir=PROMPTS_DIR,
             notes_dir=self.config.daemon.notes_dir,
             scopes_registry=self.config.scopes,

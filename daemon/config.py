@@ -39,6 +39,22 @@ class DaemonConfig:
     notes_dir: Path = field(default_factory=lambda: Path("~/nightjar/contacts").expanduser())
     contacts_dir: Path = field(default_factory=lambda: Path("~/.config/nightjar/contacts").expanduser())
 
+    @property
+    def agent_cwd(self) -> Path:
+        """Working directory for the principal-agent subprocess. Lives
+        inside state_dir/agent-workspace so it's clearly under
+        Nightjar's data area (not the user home), and so any CLAUDE.md
+        the agent reads is one Nightjar seeded — not whatever happens
+        to live in the principal's home tree.
+
+        The directory is also the agent's scratch space for
+        notes-to-future-self (per-contact context, ongoing threads,
+        anything the agent wants to persist across turns beyond what
+        Claude's --resume gives it). The agent organises this
+        directory itself; Nightjar makes no a priori structural claim.
+        """
+        return self.state_dir / "agent-workspace"
+
 
 @dataclass(frozen=True)
 class Contact:
@@ -105,6 +121,18 @@ class InboxConfig:
     # variant is what the 'audit' power-tool will provide once it
     # lands; this knob is the per-status-report cap.
     status_walk_count: int = 200
+    # `poll_interval_seconds` belt-and-braces protection against IMAP
+    # IDLE missed pushes. The watcher relies on Gmail's IDLE channel
+    # for sub-second latency on new mail, but Gmail occasionally
+    # silently fails to push a notification — observed in production.
+    # Without a backstop, a missed push waits for the next IDLE
+    # refresh (~27 min). With this set, the watcher tears IDLE down
+    # every N seconds, runs a fresh catchup search, and resumes IDLE.
+    # Worst-case latency drops from ~27 min to N seconds. Cost is one
+    # extra IMAP round-trip per N seconds when no mail is arriving;
+    # negligible at 60s. Set to 0 to disable (re-create the original
+    # IDLE-only behaviour, e.g. for an inbox that's never user-visible).
+    poll_interval_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -134,6 +162,53 @@ DEFAULT_PER_INVOCATION_MAX_INPUT_TOKENS = 8000
 DEFAULT_PRINCIPAL_PER_MESSAGE_COST_CENTS = 10  # $0.10 soft cap
 DEFAULT_PRINCIPAL_HARD_KILL_MULTIPLIER = 5  # 5x soft cap = hard refusal
 DEFAULT_PRINCIPAL_ALWAYS_DIRECT = False
+
+# Backend selector. The api backend uses anthropic.AsyncAnthropic with
+# an api key (per-token billing). The claude_code_pipe backend shells
+# out to `claude -p` and runs against the principal's logged-in
+# subscription (no api key, subscription-bounded cost). The two
+# backends have been verified to produce equivalent output for the
+# call sites in this codebase.
+BACKEND_ANTHROPIC_API = "anthropic_api"
+BACKEND_CLAUDE_CODE_PIPE = "claude_code_pipe"
+_KNOWN_BACKENDS = frozenset({BACKEND_ANTHROPIC_API, BACKEND_CLAUDE_CODE_PIPE})
+DEFAULT_BACKEND = BACKEND_ANTHROPIC_API
+
+# Named LLM call sites. Per-site backend + model can be overridden via
+# `[llm.<site>]` sections in the INI; sites not overridden inherit
+# the global `[claude].backend` and the call site's own default model.
+#
+# Add new site names here as they ship in production code. Do NOT add
+# names for hypothetical future sites — the resolver fails loudly on
+# unknown sections to catch typos, and an empty placeholder section
+# would make a typo silent.
+LLM_SITE_TRIAGE = "triage"
+LLM_SITE_SCOPE_CLASSIFIER = "scope_classifier"
+LLM_SITE_PRINCIPAL_INTERPRET = "principal_interpret"
+KNOWN_LLM_SITES = frozenset({
+    LLM_SITE_TRIAGE,
+    LLM_SITE_SCOPE_CLASSIFIER,
+    LLM_SITE_PRINCIPAL_INTERPRET,
+})
+
+
+@dataclass(frozen=True)
+class LlmSiteConfig:
+    """Per-call-site backend and model override.
+
+    None on either field means "inherit from the global default":
+      - backend=None  -> use [claude].backend
+      - model=None    -> use the call site's own default model
+        (config.default_model for triage/principal_interpret,
+         config.scope_classifier_model for scope_classifier).
+
+    Set fields override the inherited value. This shape lets an
+    operator override only what they want to change (e.g. flip
+    triage to the pipe backend without touching the model, or run
+    sleep-cycle on Opus while leaving the backend on api).
+    """
+    backend: str | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +259,18 @@ class ClaudeConfig:
     even side-effect queries get an inline prose answer that suggests
     the deterministic verb to issue manually, instead of a structured
     plan that lands in the approval queue. Off by default.
+
+    `backend` selects the execution path. `anthropic_api` (default)
+    uses the Anthropic SDK and requires `api_key`. `claude_code_pipe`
+    shells out to `claude -p` against the principal's logged-in
+    subscription; `api_key` may be empty in that mode. Toggle this
+    to move off per-token API billing onto subscription-bounded usage.
+
+    `per_site` holds optional per-call-site overrides parsed from
+    `[llm.<site>]` sections. Each override may set `backend` and/or
+    `model`; whichever fields are unset inherit from the global
+    defaults. See `LlmSiteConfig` for the shape and `KNOWN_LLM_SITES`
+    for the legal site names.
     """
     api_key: str
     default_model: str = DEFAULT_CLAUDE_MODEL
@@ -199,6 +286,28 @@ class ClaudeConfig:
     # a stronger model only if classification accuracy on real
     # contacts proves a problem.
     scope_classifier_model: str = DEFAULT_SCOPE_CLASSIFIER_MODEL
+    backend: str = DEFAULT_BACKEND
+    per_site: dict[str, LlmSiteConfig] = field(default_factory=dict)
+
+    def model_for_site(self, site: str) -> str:
+        """Resolve the model a given call site should use. Per-site
+        override (`[llm.<site>].model`) wins; otherwise the call site's
+        own default — `scope_classifier_model` for the classifier,
+        `default_model` for everything else."""
+        site_cfg = self.per_site.get(site)
+        if site_cfg is not None and site_cfg.model is not None:
+            return site_cfg.model
+        if site == LLM_SITE_SCOPE_CLASSIFIER:
+            return self.scope_classifier_model
+        return self.default_model
+
+    def backend_for_site(self, site: str) -> str:
+        """Resolve the backend a given call site should use. Per-site
+        override wins; otherwise the global default."""
+        site_cfg = self.per_site.get(site)
+        if site_cfg is not None and site_cfg.backend is not None:
+            return site_cfg.backend
+        return self.backend
 
 
 @dataclass(frozen=True)
@@ -214,11 +323,48 @@ class SecurityConfig:
     and TOTP (time-based, useful when you want codes to auto-expire).
     The shared base32 secret is reused either way; only the verification
     primitive changes.
+
+    `secondary_hotp_secret` is the off-machine second factor for the
+    `do` verb (the principal-agent path that hands free-form requests
+    straight to claude -p). The seed is stored alongside the primary
+    here for ergonomic config loading, but the OPERATIONAL discipline
+    is that the seed itself lives off-machine — on a hardware token, a
+    paper list, or an authenticator app — and only the daemon's copy
+    sits in secrets.toml. Empty disables the `do` verb entirely.
     """
     totp_secret: str
     dead_mans_switch_window_minutes: int
     dead_mans_switch_threshold: int
     auth_mode: str = DEFAULT_AUTH_MODE
+    secondary_hotp_secret: str = ""
+
+
+DEFAULT_AGENT_NAME = "Nightjar"
+DEFAULT_AGENT_PERSONALITY = (
+    "Crisp and direct. Reports facts before opinions, acts before "
+    "explaining. Will riff if invited but does not perform "
+    "enthusiasm. Uses the principal's first name; refers to itself "
+    "by its configured agent name. No emoji."
+)
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Identity and voice for the principal-agent path.
+
+    `name` is what the agent calls itself in replies and how the
+    principal addresses it. Defaults to "Nightjar"; override in
+    `[agent].name` if you want a different mascot.
+
+    `personality` is the *voice-and-demeanour* override: tone,
+    pacing, level of formality. It is *not* a security control.
+    The system prompt fences this section explicitly so a personality
+    string cannot widen the agent's actual capabilities, and the
+    personality cannot be set from inbound mail — only from the
+    operator's INI at install time.
+    """
+    name: str = DEFAULT_AGENT_NAME
+    personality: str = DEFAULT_AGENT_PERSONALITY
 
 
 @dataclass(frozen=True)
@@ -229,6 +375,7 @@ class Config:
     security: SecurityConfig | None = None
     smtp: SmtpConfig | None = None
     claude: ClaudeConfig | None = None
+    agent: AgentConfig = field(default_factory=AgentConfig)
     address_index: dict[str, str] = field(default_factory=dict)
     """Maps lowercased email address to contact_id. Built at load time."""
     scopes: dict[str, str] = field(default_factory=dict)
@@ -766,11 +913,22 @@ def load(
             raise ConfigError(
                 f"[security].auth_mode must be one of {AUTH_MODES}, got: {auth_mode!r}"
             )
+        # Optional secondary HOTP seed for the `do` verb's two-secret
+        # gate. Same secrets-vs-INI dual-source rule as the primary.
+        secondary_secret = _secret("security", "secondary_hotp_secret")
+        secondary_ini = sec_section.get("secondary_hotp_secret", "").strip()
+        if secondary_secret is not None and secondary_ini:
+            raise ConfigError(
+                "[security].secondary_hotp_secret is in both nightjar.conf "
+                f"and secrets.toml; remove it from {path}."
+            )
+        secondary_hotp_secret = secondary_secret or secondary_ini
         security = SecurityConfig(
             totp_secret=totp_secret,
             dead_mans_switch_window_minutes=window_minutes,
             dead_mans_switch_threshold=threshold,
             auth_mode=auth_mode,
+            secondary_hotp_secret=secondary_hotp_secret,
         )
 
     smtp: SmtpConfig | None = None
@@ -815,6 +973,12 @@ def load(
     claude: ClaudeConfig | None = None
     if "claude" in parser:
         claude_section = parser["claude"]
+        backend = claude_section.get("backend", DEFAULT_BACKEND).strip()
+        if backend not in _KNOWN_BACKENDS:
+            raise ConfigError(
+                f"[claude].backend must be one of "
+                f"{sorted(_KNOWN_BACKENDS)!r}; got {backend!r}"
+            )
         api_key_secret = _secret("claude", "api_key")
         api_key_ini = claude_section.get("api_key", "").strip()
         if api_key_secret is not None and api_key_ini:
@@ -823,16 +987,23 @@ def load(
                 f"secrets.toml; remove it from {path}."
             )
         api_key = api_key_secret or api_key_ini
-        if not api_key:
-            raise ConfigError(
-                "[claude].api_key is required (set it in "
-                f"{secrets_path} or nightjar.conf)"
-            )
-        if not (api_key.startswith("sk-ant-") and len(api_key) > 50):
-            raise ConfigError(
-                "[claude].api_key does not look like an Anthropic API key "
-                "(expected prefix 'sk-ant-' and length > 50)"
-            )
+        if backend == BACKEND_ANTHROPIC_API:
+            if not api_key:
+                raise ConfigError(
+                    "[claude].api_key is required when backend = "
+                    f"{BACKEND_ANTHROPIC_API!r} (set it in "
+                    f"{secrets_path} or nightjar.conf)"
+                )
+            if not (api_key.startswith("sk-ant-") and len(api_key) > 50):
+                raise ConfigError(
+                    "[claude].api_key does not look like an Anthropic API key "
+                    "(expected prefix 'sk-ant-' and length > 50)"
+                )
+        else:
+            # claude_code_pipe — api_key not used. If one is set, leave
+            # it on the dataclass for harmless visibility but don't
+            # require or validate it.
+            pass
         default_model = claude_section.get("default_model", DEFAULT_CLAUDE_MODEL).strip()
         if not default_model:
             raise ConfigError("[claude].default_model must not be empty")
@@ -882,6 +1053,53 @@ def load(
             raise ConfigError(
                 "[claude].principal_hard_kill_multiplier must be >= 1"
             )
+        # Per-site overrides — `[llm.<site>]` sections. Optional; any
+        # site not overridden inherits from the global defaults.
+        per_site: dict[str, LlmSiteConfig] = {}
+        for section_name in parser.sections():
+            if not section_name.startswith("llm."):
+                continue
+            site_name = section_name.split(".", 1)[1].strip()
+            if not site_name:
+                raise ConfigError(
+                    f"llm section has empty name: {section_name!r}"
+                )
+            if site_name not in KNOWN_LLM_SITES:
+                raise ConfigError(
+                    f"[{section_name}] names an unknown LLM call site "
+                    f"{site_name!r}; expected one of "
+                    f"{sorted(KNOWN_LLM_SITES)!r}"
+                )
+            site_section = parser[section_name]
+            site_backend: str | None = None
+            if "backend" in site_section:
+                site_backend = site_section.get("backend", "").strip()
+                if site_backend not in _KNOWN_BACKENDS:
+                    raise ConfigError(
+                        f"[{section_name}].backend must be one of "
+                        f"{sorted(_KNOWN_BACKENDS)!r}; got {site_backend!r}"
+                    )
+                # If a per-site override flips to anthropic_api but the
+                # global has no api_key, fail loudly. Catching this at
+                # config load is much less confusing than catching it on
+                # the first call to that site.
+                if site_backend == BACKEND_ANTHROPIC_API and not api_key:
+                    raise ConfigError(
+                        f"[{section_name}].backend = {BACKEND_ANTHROPIC_API!r} "
+                        f"requires [claude].api_key (set it in {secrets_path} "
+                        "or nightjar.conf)"
+                    )
+            site_model: str | None = None
+            if "model" in site_section:
+                site_model = site_section.get("model", "").strip()
+                if not site_model:
+                    raise ConfigError(
+                        f"[{section_name}].model must not be empty if set"
+                    )
+            per_site[site_name] = LlmSiteConfig(
+                backend=site_backend, model=site_model,
+            )
+
         claude = ClaudeConfig(
             api_key=api_key,
             default_model=default_model,
@@ -891,7 +1109,21 @@ def load(
             principal_hard_kill_multiplier=kill_multiplier,
             principal_always_direct=always_direct,
             scope_classifier_model=scope_classifier_model,
+            backend=backend,
+            per_site=per_site,
         )
+
+    agent_name = DEFAULT_AGENT_NAME
+    agent_personality = DEFAULT_AGENT_PERSONALITY
+    if "agent" in parser:
+        agent_section = parser["agent"]
+        raw_name = agent_section.get("name", "").strip()
+        if raw_name:
+            agent_name = raw_name
+        raw_personality = agent_section.get("personality", "").strip()
+        if raw_personality:
+            agent_personality = raw_personality
+    agent = AgentConfig(name=agent_name, personality=agent_personality)
 
     return Config(
         daemon=daemon,
@@ -900,6 +1132,7 @@ def load(
         security=security,
         smtp=smtp,
         claude=claude,
+        agent=agent,
         address_index=address_index,
         scopes=scopes,
         facets=facets,

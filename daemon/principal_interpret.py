@@ -512,7 +512,7 @@ async def interpret_principal_request(
 
     try:
         response = await client.call(
-            model=config.default_model,
+            model=config.model_for_site("principal_interpret"),
             system=system,
             user=user,
             tools=[INTERPRET_REQUEST_TOOL],

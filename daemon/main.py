@@ -115,16 +115,25 @@ async def _main_async(config: Config) -> int:
         claude_configured=config.claude is not None,
     )
 
-    # Construct the Claude client once, share across watchers. None when
-    # [claude] is missing from config; in that case the contact-mail
-    # branch falls through to RECEIVED with disposition "no_claude_config"
-    # and no triage runs. The daemon does NOT refuse to start without a
-    # [claude] section: the principal command path (Steps 1-4) still
-    # works and is independently useful.
-    claude_client = None
+    # Construct one Claude client per named call site, share across
+    # watchers. Empty dict when [claude] is missing from config; in
+    # that case the contact-mail branch falls through to RECEIVED
+    # with disposition "no_claude_config" and no triage runs. The
+    # daemon does NOT refuse to start without a [claude] section:
+    # the principal command path (Steps 1-4) still works and is
+    # independently useful.
+    claude_clients: dict[str, object] = {}
     if config.claude is not None:
-        from .triage import AnthropicClient
-        claude_client = AnthropicClient(api_key=config.claude.api_key)
+        from .cc_executor import build_claude_client_for
+        from .config import KNOWN_LLM_SITES
+        for site in sorted(KNOWN_LLM_SITES):
+            claude_clients[site] = build_claude_client_for(site, config.claude)
+            logger.event(
+                "claude_backend_selected",
+                site=site,
+                backend=config.claude.backend_for_site(site),
+                model=config.claude.model_for_site(site),
+            )
 
     stop = asyncio.Event()
     panic_reason: dict[str, str] = {}  # mutable holder for the on_panic callback
@@ -145,7 +154,7 @@ async def _main_async(config: Config) -> int:
     watchers = [
         InboxWatcher(
             inbox=ic, config=config, state=state, logger=logger,
-            on_panic=_on_panic, claude_client=claude_client,
+            on_panic=_on_panic, claude_clients=claude_clients,
         )
         for ic in config.inboxes.values()
     ]
@@ -235,6 +244,15 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="with --setup-auth: overwrite an existing secret",
+    )
+    parser.add_argument(
+        "--secondary",
+        action="store_true",
+        help=(
+            "with --setup-auth: provision the secondary HOTP seed used by "
+            "the agent path's two-secret gate. Default is to provision "
+            "the primary."
+        ),
     )
     parser.add_argument(
         "--principal",
@@ -336,7 +354,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.setup_auth:
         from . import setup_auth
-        return setup_auth.run(args.config, force=args.force)
+        target = (
+            setup_auth.TARGET_SECONDARY if args.secondary
+            else setup_auth.TARGET_PRIMARY
+        )
+        return setup_auth.run(
+            args.config, force=args.force, target=target,
+        )
 
     if args.revive:
         from . import revive

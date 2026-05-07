@@ -273,7 +273,7 @@ async def classify_scope(
 
     try:
         response = await client.call(
-            model=config.scope_classifier_model,
+            model=config.model_for_site("scope_classifier"),
             system=_CLASSIFIER_SYSTEM_PROMPT,
             user=user,
             tools=[tool],
@@ -688,7 +688,7 @@ async def classify_two_axis(
 
     try:
         response = await client.call(
-            model=config.scope_classifier_model,
+            model=config.model_for_site("scope_classifier"),
             system=_TWO_AXIS_SYSTEM_PROMPT,
             user=user,
             tools=[tool],

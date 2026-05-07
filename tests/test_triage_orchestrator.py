@@ -149,7 +149,8 @@ def test_unscoped_contact_skips_classifier(tmp_path: Path) -> None:
         body="quick question",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -181,7 +182,8 @@ def test_unscoped_contact_includes_full_notes(tmp_path: Path) -> None:
         body="quick question",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -203,7 +205,8 @@ def test_unscoped_contact_no_notes_file_yields_empty_block(tmp_path: Path) -> No
         body="b",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -232,7 +235,8 @@ def test_in_scope_runs_classifier_then_triage(tmp_path: Path) -> None:
         body="here's the mix",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -270,7 +274,8 @@ def test_in_scope_passes_safe_notes_to_classifier(tmp_path: Path) -> None:
         body="b",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -309,7 +314,8 @@ def test_in_scope_passes_scope_filtered_notes_to_triage(tmp_path: Path) -> None:
         body="b",
         structure=_structure(),
         config=_make_config(),
-        client=client,
+        triage_client=client,
+        classifier_client=client,
         prompts_dir=PROMPTS_DIR,
         notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
@@ -332,7 +338,8 @@ def test_combined_cost_summed_across_passes(tmp_path: Path) -> None:
     ])
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -354,7 +361,8 @@ def test_out_of_scope_classification_returns_synthetic_plan(tmp_path: Path) -> N
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -375,7 +383,8 @@ def test_out_of_scope_decline_body_lists_allowed_topics(tmp_path: Path) -> None:
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -403,7 +412,8 @@ def test_classifier_sdk_error_returns_synthetic_decline(tmp_path: Path) -> None:
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
         structure=_structure(), config=_make_config(),
-        client=_RaisingClient(),  # type: ignore[arg-type]
+        triage_client=_RaisingClient(),  # type: ignore[arg-type]
+        classifier_client=_RaisingClient(),  # type: ignore[arg-type]
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -423,7 +433,8 @@ def test_classifier_unknown_scope_returns_synthetic_decline(tmp_path: Path) -> N
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -446,7 +457,8 @@ def test_classifier_error_carries_classifier_tokens(tmp_path: Path) -> None:
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry=_REGISTRY,
     ))
@@ -523,7 +535,8 @@ def test_two_axis_in_scope_runs_classifier_then_triage(tmp_path: Path) -> None:
     result = _run(triage_with_scope(
         contact=contact, sender="fraser@example.com",
         subject="track 3 demo", body="when can we sync about the demo?",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -548,7 +561,8 @@ def test_two_axis_full_out_of_scope_returns_decline(tmp_path: Path) -> None:
     result = _run(triage_with_scope(
         contact=contact, sender="fraser@example.com",
         subject="hi", body="random thing not in scope",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -576,7 +590,8 @@ def test_two_axis_facets_only_routes_to_triage(tmp_path: Path) -> None:
     result = _run(triage_with_scope(
         contact=contact, sender="fraser@example.com",
         subject="when free?", body="schedule check",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -614,7 +629,8 @@ def test_two_axis_project_filters_notes_by_hierarchy(tmp_path: Path) -> None:
     _run(triage_with_scope(
         contact=contact, sender="fraser@example.com",
         subject="s", body="b", structure=_structure(),
-        config=_make_config(), client=client,
+        config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -651,7 +667,8 @@ def test_two_axis_classifier_error_returns_decline(tmp_path: Path) -> None:
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -677,7 +694,8 @@ def test_two_axis_combined_token_accounting(tmp_path: Path) -> None:
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -706,7 +724,8 @@ def test_two_axis_decline_body_lists_facets_and_projects(
 
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -744,7 +763,8 @@ def test_two_axis_safe_notes_passed_to_classifier(tmp_path: Path) -> None:
     _run(triage_with_scope(
         contact=contact, sender="fraser@example.com",
         subject="s", body="b", structure=_structure(),
-        config=_make_config(), client=client,
+        config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,
@@ -776,7 +796,8 @@ def test_two_axis_classifier_sdk_failure_fails_closed(tmp_path: Path) -> None:
     client = _RaisingClient()
     result = _run(triage_with_scope(
         contact=contact, sender="x@y.z", subject="s", body="b",
-        structure=_structure(), config=_make_config(), client=client,
+        structure=_structure(), config=_make_config(),
+        triage_client=client, classifier_client=client,
         prompts_dir=PROMPTS_DIR, notes_dir=notes_dir,
         scopes_registry={},
         facets_registry=_FACETS_REGISTRY,

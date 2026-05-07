@@ -646,13 +646,138 @@ def test_set_last_catchup_at_rejects_negative(tmp_path: Path) -> None:
 
 
 
-def test_schema_version_is_10(tmp_path: Path) -> None:
+def test_schema_version_is_11(tmp_path: Path) -> None:
     """Schema version pin. Bumps require a migration plan."""
     import sqlite3
     s = make_state(tmp_path)
     conn = sqlite3.connect(s.db_path)
     try:
         row = conn.execute("SELECT version FROM schema_version").fetchone()
-        assert row[0] == 10
+        assert row[0] == 11
     finally:
         conn.close()
+
+
+# ---- Secondary HOTP counter (V11) -----------------------------------------
+
+
+def test_secondary_hotp_counter_starts_at_zero(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    assert s.get_secondary_hotp_counter() == 0
+
+
+def test_secondary_hotp_counter_advance(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.set_secondary_hotp_counter(7)
+    assert s.get_secondary_hotp_counter() == 7
+    # Independent of primary counter.
+    assert s.get_hotp_counter() == 0
+    s.set_hotp_counter(3)
+    assert s.get_hotp_counter() == 3
+    assert s.get_secondary_hotp_counter() == 7
+
+
+def test_secondary_hotp_counter_rejects_negative(tmp_path: Path) -> None:
+    import pytest
+    s = make_state(tmp_path)
+    with pytest.raises(ValueError):
+        s.set_secondary_hotp_counter(-1)
+
+
+# ---- agent_sessions (V11) -------------------------------------------------
+
+
+def test_agent_session_create_and_get(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<orig@example.com>",
+        started_at=1_700_000_000,
+    )
+    row = s.agent_session_get("sess-1")
+    assert row is not None
+    assert row["session_id"] == "sess-1"
+    assert row["originating_message_id"] == "<orig@example.com>"
+    assert row["last_message_id"] == "<orig@example.com>"
+    assert row["started_at"] == 1_700_000_000
+    assert row["completed_at"] is None
+    assert row["status"] == "in_progress"
+
+
+def test_agent_session_advance_updates_last_message(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<orig@example.com>",
+        started_at=1_700_000_000,
+    )
+    s.agent_session_advance(session_id="sess-1", last_message_id="<reply@example.com>")
+    row = s.agent_session_get("sess-1")
+    assert row is not None
+    assert row["last_message_id"] == "<reply@example.com>"
+
+
+def test_agent_session_lookup_by_last_message(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<orig@example.com>",
+        started_at=1_700_000_000,
+    )
+    s.agent_session_advance(
+        session_id="sess-1", last_message_id="<reply@example.com>",
+    )
+    found = s.agent_session_lookup_by_last_message("<reply@example.com>")
+    assert found is not None
+    assert found["session_id"] == "sess-1"
+    miss = s.agent_session_lookup_by_last_message("<not-a-message@example.com>")
+    assert miss is None
+
+
+def test_agent_session_complete_sets_terminal(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<orig@example.com>",
+        started_at=1_700_000_000,
+    )
+    s.agent_session_complete(
+        session_id="sess-1", status="completed", completed_at=1_700_000_500,
+    )
+    row = s.agent_session_get("sess-1")
+    assert row is not None
+    assert row["status"] == "completed"
+    assert row["completed_at"] == 1_700_000_500
+
+
+def test_agent_session_complete_rejects_unknown_status(tmp_path: Path) -> None:
+    import pytest
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<orig@example.com>",
+        started_at=1_700_000_000,
+    )
+    with pytest.raises(ValueError):
+        s.agent_session_complete(
+            session_id="sess-1", status="weird", completed_at=1,
+        )
+
+
+def test_agent_sessions_in_progress_filters(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    s.agent_session_create(
+        session_id="sess-1",
+        originating_message_id="<a@example.com>",
+        started_at=1,
+    )
+    s.agent_session_create(
+        session_id="sess-2",
+        originating_message_id="<b@example.com>",
+        started_at=2,
+    )
+    s.agent_session_complete(
+        session_id="sess-1", status="completed", completed_at=10,
+    )
+    in_progress = s.agent_sessions_in_progress()
+    assert [r["session_id"] for r in in_progress] == ["sess-2"]
