@@ -567,7 +567,4 @@ edits.
 
 ## License
 
-All rights reserved until v1. See [LICENSE](./LICENSE) for the full
-text. The intent is to flip to a permissive open-source license
-(likely MIT) once the implementation is far enough along to be
-useful to other people.
+MIT. See [LICENSE](./LICENSE) for the full text.
