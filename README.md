@@ -272,14 +272,13 @@ project.
   by the daemon, not the LLM. They cannot fail because the model
   misunderstood them, and they don't depend on the operator
   approving.
-- **Disclosure, never concealment.** A new correspondent's first
-  email from Nightjar will be a one-time disclosure: who Nightjar
-  is, what it's used for, where data goes, what their rights are.
-  Until they reply acknowledging, no further mail is sent. The
-  footer reminds them on every subsequent message. (The
-  first-contact ceremony is designed but not yet shipped; today,
-  unknown senders are silently dropped and surfaced to the operator
-  only via the status report. See "Status" below.)
+- **Disclosure, never concealment.** Every outbound message from
+  Nightjar carries a footer naming what it is, what it does, and
+  where the data goes, so a correspondent always knows they're
+  talking to an assistant. Unknown senders who haven't been added
+  as contacts are silently dropped and surfaced to the operator
+  only via the status report — Nightjar refuses to engage with
+  anyone who hasn't been deliberately enrolled.
 - **No covert observation.** Nightjar will not be configured to
   read mail from people who haven't been told it's reading mail.
 
@@ -418,48 +417,37 @@ principles here are a starting position, not a destination.
 
 ## Status
 
-v0.4-ish, mid-Step-7. The security perimeter, the principal control
-plane, and the contact-mediation path are all live. Rapport notes
-with provenance tagging and scope-aware triage are live. The
-first-contact ceremony for unknown senders is the next significant
-piece of work.
+Phase 1 is feature-complete as of May 2026. The principal-agent `do`
+verb (latest commit) was the planned closing capability — the daemon
+runs end-to-end as a single-principal email assistant.
 
-736 unit and integration tests pass on `main`.
+964 unit and integration tests pass on `main`.
 
-| Step | Subject | Status |
-|------|---------|--------|
-| 1 | IMAP IDLE watcher, contact lookup, state DB | shipped + live |
-| 2 | HOTP/TOTP auth + dead-man's-switch | shipped + live (tripped + recovered live) |
-| 3 | SMTP notifier + audit copy + hardcoded footer | shipped + live |
-| 4a-d | Tier-1 commands, tier-2 verbs + approval queue, tier-4 add/remove with atomic config rewrite, bare-code subject prefix | shipped + live |
-| 5a-b | Triage module + `[claude]` config + spend ledger; full round-trip with DMARC + reply executor + outbound log | shipped + live |
-| 6 | Real `forward_to_principal` with `message/rfc822` attachment; hidden-content sweep; jlogger plumbing | shipped + live |
-| 6b | Reply-format overhaul (code at end of subject, verdict in body, curated synonym list) | shipped + live |
-| 6c | Contacts and secrets extracted from `nightjar.conf` to per-file TOMLs and a machine-id-bound obfuscated secrets file; auto-migrated on first start | shipped + live |
-| 6d | Hidden-content false-positive fix (split `total_size_bytes` into plain/html sizes) | shipped + live |
-| 6e | Receipt reliability: `SINCE`-bounded catchup, per-inbox watermark, Message-ID dedup, first-run 30-day reconciliation | shipped + live |
-| 6f | Drop the "yes interpret" gate; principal-interpret pass with tiered output and soft + hard cost backstops | shipped + live |
-| 6g | Status-report overhaul (7 sections including out-of-band IMAP walk) and `pickup <message-id>` verb | shipped + live |
-| 7a | Notes infrastructure: notes_store, scope-tagged Markdown sidecars, `show notes` verb | shipped + live |
-| 7b | Two-pass scope-aware triage: pass-1 classifier → pass-2 triage; out-of-scope decline path; scope-filtered notes injection | shipped + live |
-| 7d | Autonomous note writes from triage's `note_proposals` (per Step 8 memory architecture; the original 7d approval-queue design was reframed and dropped) | shipped + live |
-| 7-w2 | Provenance tagging on notes (`[meta: src; attr=observed\|asserted\|self]`) + skeptic prompt rule + audit-view ⚠ markers | shipped + live |
-| 7-w3a | Read-side provenance defence: read-aware skeptic clause + verb-side notes-enumeration gate that downgrades a reply to `flag_for_review` if it enumerates an unverified bullet | shipped + live |
-| 7c | First-contact ceremony for unknown senders | designed, not yet built |
-| 7-w3b | Skeptic rule extension to unnamed implicit consensus ("we agreed", "as we discussed"); hallucination-nudge carve-out for procedural-coordination questions | designed, not yet built |
-| 8 | Memory architecture (per-contact + principal-only + project + action-ledger rings) | design phase |
+What works:
 
-A closed-circuit testing harness (`tools/sim_harness.py`) routes
-classifier and triage calls through Claude Code sub-agents instead
-of the live API, so red-team probes and regression sweeps can run
-without touching the inbox or the spend ledger. The first
-auto-redteam loop using it found the persistent-self-poisoning lane
-that wave 3a closed.
+- IMAP IDLE watcher with TCP keepalive and dead-peer detection.
+- HOTP/TOTP authentication with dead-man's-switch.
+- SMTP notifier with audit copy and tier-tagged outbound paths.
+- Tier-1 through tier-4 principal verbs with approval queue and
+  atomic config rewrites.
+- Triage with DMARC, hidden-content sweeps, message/rfc822 forward,
+  spend ledger and cost backstops.
+- Reply-format conventions tuned for at-a-glance reading.
+- Receipt reliability: SINCE-bounded catchup, watermark, dedup,
+  first-run reconciliation.
+- Two-pass scope-aware triage with out-of-scope decline.
+- Notes infrastructure with provenance tagging, scope-filtered
+  injection, and read-side defence against bullet enumeration.
+- Principal-agent `do` verb: free-form work routed to a `claude -p`
+  subprocess against the principal's logged-in subscription.
+- Closed-circuit testing harness (`tools/sim_harness.py`) for
+  red-team probes and regression sweeps without touching the inbox.
 
-This README will be updated as the implementation lands. Where the
-design and the code disagree, the **code is right and the design
-should be updated to match**. `DESIGN.md` is a working document,
-not a contract carved in stone.
+Active development has moved to a private adjacent project. Same
+problem domain, different shape, not ready to talk about yet. This
+repo stays as a working record of what Phase 1 became; it is not
+abandoned, but it is not actively extended either. Issues and pull
+requests are welcome but may receive only ad-hoc attention.
 
 ---
 
