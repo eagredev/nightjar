@@ -240,6 +240,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="send a test email via the notifier path; pair with --principal or --contact",
     )
+    mode.add_argument(
+        "--show-config",
+        action="store_true",
+        help="print the active config with provenance (default vs from file); secrets redacted",
+    )
+    mode.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="run the config loader and print OK + summary, or a friendly error",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -266,6 +276,18 @@ def main(argv: list[str] | None = None) -> int:
         help="with --test-notify: target this contact (audit + footer; prompts to confirm)",
     )
     args = parser.parse_args(argv)
+
+    # Read-only inspection commands short-circuit BEFORE any side-effecting
+    # paths — no migrator, no machine-id check, no daemon spawn. They
+    # exist precisely so an operator can `--validate-config` on a
+    # half-set-up install or `--show-config` on a system where the
+    # daemon is wedged. They run the same loader the daemon uses.
+    if args.show_config:
+        from . import config_inspect
+        return config_inspect.show(args.config)
+    if args.validate_config:
+        from . import config_inspect
+        return config_inspect.validate(args.config)
 
     # Run the contacts/secrets migrator BEFORE config.load(). It is
     # idempotent and a no-op once migration has run; on first start
@@ -375,6 +397,24 @@ def main(argv: list[str] | None = None) -> int:
     code = _check_panic_preflight(config)
     if code is not None:
         return code
+
+    # Boot-time smoke test: confirm the compose_reply MCP server is
+    # spawnable and registers its tool. Catches deployment regressions
+    # (broken script, missing imports, environment issues) up-front
+    # rather than as a silent per-session degradation. Per-session
+    # fallback to final_text still applies if this somehow passes
+    # boot but fails at runtime.
+    from . import compose_reply_smoke
+    try:
+        compose_reply_smoke.probe_mcp_server()
+    except compose_reply_smoke.ComposeReplyProbeError as e:
+        print(
+            f"nightjar: compose_reply MCP probe failed at boot: {e}\n"
+            f"  Refusing to start. Run "
+            f"`python -m daemon.compose_reply_smoke` to reproduce.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         return asyncio.run(_main_async(config))

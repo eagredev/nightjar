@@ -705,3 +705,147 @@ def test_catchup_default_wake_reason_is_startup(tmp_path: Path) -> None:
 
     events = _read_log_events(log_path)
     assert not [e for e in events if e.get("event") == "poll_caught_missed_push"]
+
+
+# ---- IDLE handshake hard cap (silent-wedge incident 2026-05-07) ---------
+
+
+class _IdleStartHangsIMAP:
+    """Stub whose idle_start() coroutine never resolves, simulating
+    aioimaplib's unbounded `await wait_for_idle_response()` against
+    a half-open SSL transport. Provides only the surface _idle_once
+    touches before the handshake await."""
+    def __init__(self) -> None:
+        self.idle_start_calls = 0
+
+    async def idle_start(self, timeout: float):  # noqa: ARG002
+        self.idle_start_calls += 1
+        # Block longer than any plausible test cap so the wait_for
+        # wrapper is forced to time out.
+        await asyncio.sleep(60)
+        return None  # unreachable
+
+
+def test_idle_once_raises_on_idle_start_handshake_timeout(
+    tmp_path: Path,
+) -> None:
+    """If aioimaplib.idle_start() never resolves (half-open SSL
+    transport, no `+ idling` continuation from the server), the
+    asyncio.wait_for wrapper must time out within
+    IDLE_HANDSHAKE_HARD_CAP_SECONDS, log idle_handshake_timeout, and
+    raise so the outer run() loop reconnects."""
+    watcher, _, log_dir = _make_watcher(tmp_path)
+    import daemon.inbox_watcher as iw
+    orig_cap = iw.IDLE_HANDSHAKE_HARD_CAP_SECONDS
+    iw.IDLE_HANDSHAKE_HARD_CAP_SECONDS = 0.05
+    try:
+        stub = _IdleStartHangsIMAP()
+        with pytest.raises(RuntimeError, match="imap idle_start timed out"):
+            asyncio.run(watcher._idle_once(stub))
+    finally:
+        iw.IDLE_HANDSHAKE_HARD_CAP_SECONDS = orig_cap
+
+    events = _read_log_events(log_dir)
+    timeout_events = [
+        e for e in events if e.get("event") == "idle_handshake_timeout"
+    ]
+    assert len(timeout_events) == 1
+    e = timeout_events[0]
+    assert e["level"] == "warn"
+    assert "Reconnecting" in e["detail"]
+    assert stub.idle_start_calls == 1
+
+
+# ---- Probe runs before catchup (Bug C, silent-wedge incident) -----------
+
+
+class _RunOnceStubResp:
+    def __init__(self, result: str = "OK") -> None:
+        self.result = result
+        self.lines: list[bytes] = []
+
+
+class _RunOnceStubClient:
+    """A fake aioimaplib client that records the order of operations
+    so we can verify _probe_socket_alive runs after login+select but
+    before _catch_up. login, select, and noop all return OK; idle_start
+    then raises so _run_once exits cleanly without running a full IDLE
+    cycle."""
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def wait_hello_from_server(self):
+        self.calls.append("wait_hello_from_server")
+
+    async def login(self, user: str, password: str):  # noqa: ARG002
+        self.calls.append("login")
+        return _RunOnceStubResp("OK")
+
+    async def select(self, mailbox: str):  # noqa: ARG002
+        self.calls.append("select")
+        return _RunOnceStubResp("OK")
+
+    async def noop(self):
+        self.calls.append("noop")
+        return _RunOnceStubResp("OK")
+
+    async def uid_search(self, query: str):  # noqa: ARG002
+        self.calls.append("uid_search")
+        return ("OK", [b""])
+
+    async def idle_start(self, timeout: float):  # noqa: ARG002
+        # Force _idle_once to bail on its own timeout — we only care
+        # that we GOT here, in the right order, after probe.
+        self.calls.append("idle_start")
+        raise RuntimeError("test stop: do not actually IDLE")
+
+    async def logout(self):
+        self.calls.append("logout")
+        return _RunOnceStubResp("OK")
+
+
+def test_run_once_probes_socket_before_catchup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_run_once must call _probe_socket_alive (which calls noop)
+    after login+select but BEFORE _catch_up (which calls uid_search).
+    This catches a half-open SSL transport before it can blast through
+    100+ failing fetches and wedge the watcher."""
+    watcher, state, _ = _make_watcher(tmp_path)
+    # Pretend we already did one catchup so the next pass uses a tight
+    # window rather than the 30-day first-run sweep.
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    stub = _RunOnceStubClient()
+
+    # Replace the IMAP4_SSL constructor with a factory that returns
+    # our stub. _run_once's `aioimaplib.IMAP4_SSL(host=..., port=...)`
+    # call will get the stub instead of a real network client.
+    import daemon.inbox_watcher as iw
+    monkeypatch.setattr(
+        iw.aioimaplib, "IMAP4_SSL",
+        lambda *args, **kwargs: stub,  # accepts host, port, timeout, etc.
+    )
+
+    # _run_once will raise from idle_start (our stub forces this) —
+    # we expect that, and we don't care about the exception itself,
+    # only the call order recorded up to that point.
+    with pytest.raises(RuntimeError, match="test stop"):
+        asyncio.run(watcher._run_once())
+
+    # The order that matters: login -> select -> NOOP probe -> uid_search.
+    # If probe ran AFTER uid_search, a degraded transport would have
+    # silently chewed through fetches before we noticed.
+    assert "noop" in stub.calls, "probe (noop) was never called"
+    noop_idx = stub.calls.index("noop")
+    select_idx = stub.calls.index("select")
+    assert noop_idx > select_idx, (
+        "probe must run AFTER select (otherwise we're probing an "
+        f"unauthenticated socket). calls={stub.calls}"
+    )
+    if "uid_search" in stub.calls:
+        search_idx = stub.calls.index("uid_search")
+        assert noop_idx < search_idx, (
+            "probe must run BEFORE catchup's uid_search to catch a "
+            f"half-open transport before fetches start. calls={stub.calls}"
+        )

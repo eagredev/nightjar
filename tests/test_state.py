@@ -781,3 +781,136 @@ def test_agent_sessions_in_progress_filters(tmp_path: Path) -> None:
     )
     in_progress = s.agent_sessions_in_progress()
     assert [r["session_id"] for r in in_progress] == ["sess-2"]
+
+
+# ---- QUEUED_DEFERRED plumbing --------------------------------------------
+
+
+def _record_received(s: State, message_id: str, *, received_at: int = 100) -> None:
+    s.record_message(
+        message_id=message_id,
+        inbox="nightjar",
+        from_addr="me@example.com",
+        subject=None,
+        contact_id="dylan",
+        state="RECEIVED",
+        received_at=received_at,
+    )
+
+
+def test_mark_deferred_persists_payload_and_transitions(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-1@example.com>")
+    s.mark_deferred(
+        message_id="<msg-1@example.com>",
+        from_state="RECEIVED",
+        deferred_payload={
+            "kind": "ok_agent_init",
+            "request_body": "what's the weather like in shoreditch",
+            "session_id": None,
+        },
+        at=12345,
+    )
+    rows = s.select_deferred_messages()
+    assert len(rows) == 1
+    assert rows[0]["message_id"] == "<msg-1@example.com>"
+    assert rows[0]["from_addr"] == "me@example.com"
+    assert rows[0]["payload"]["request_body"] == "what's the weather like in shoreditch"
+    assert rows[0]["payload"]["kind"] == "ok_agent_init"
+    assert rows[0]["deferred_at"] == 12345
+    counts = s.count_by_state()
+    assert counts == {"QUEUED_DEFERRED": 1}
+
+
+def test_mark_deferred_no_op_if_state_doesnt_match(tmp_path: Path) -> None:
+    """Guarded by from_state — won't move a message that's already
+    in some other state (e.g. previously dropped)."""
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-2@example.com>")
+    s.transition(
+        message_id="<msg-2@example.com>",
+        from_state="RECEIVED",
+        to_state="DROPPED",
+    )
+    s.mark_deferred(
+        message_id="<msg-2@example.com>",
+        from_state="RECEIVED",
+        deferred_payload={"kind": "ok_agent_init", "request_body": "x"},
+    )
+    counts = s.count_by_state()
+    assert counts == {"DROPPED": 1}
+
+
+def test_select_deferred_messages_orders_by_received_at(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-late@example.com>", received_at=200)
+    _record_received(s, "<msg-early@example.com>", received_at=100)
+    for mid in ("<msg-late@example.com>", "<msg-early@example.com>"):
+        s.mark_deferred(
+            message_id=mid,
+            from_state="RECEIVED",
+            deferred_payload={"kind": "ok_agent_init", "request_body": "x"},
+        )
+    rows = s.select_deferred_messages()
+    assert [r["message_id"] for r in rows] == [
+        "<msg-early@example.com>",
+        "<msg-late@example.com>",
+    ]
+
+
+def test_select_deferred_messages_handles_missing_or_bad_payload(
+    tmp_path: Path,
+) -> None:
+    """A row with NULL or unparseable plan_json doesn't crash the
+    selector — it gets returned with an empty payload dict."""
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-3@example.com>")
+    s.mark_deferred(
+        message_id="<msg-3@example.com>",
+        from_state="RECEIVED",
+        deferred_payload={"kind": "ok_agent_init", "request_body": "x"},
+    )
+    # Corrupt the plan_json directly.
+    with s._connect() as conn:
+        conn.execute(
+            "UPDATE messages SET plan_json = ? WHERE id = ?",
+            ("{{not valid json", "<msg-3@example.com>"),
+        )
+    rows = s.select_deferred_messages()
+    assert len(rows) == 1
+    assert rows[0]["payload"] == {}
+
+
+def test_mark_deferred_running_atomically_claims(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-4@example.com>")
+    s.mark_deferred(
+        message_id="<msg-4@example.com>",
+        from_state="RECEIVED",
+        deferred_payload={"kind": "ok_agent_init", "request_body": "x"},
+    )
+    # First claim succeeds.
+    claimed = s.mark_deferred_running(message_id="<msg-4@example.com>")
+    assert claimed is True
+    # Second claim is a no-op (state is now AGENT_RUNNING).
+    claimed_again = s.mark_deferred_running(message_id="<msg-4@example.com>")
+    assert claimed_again is False
+    counts = s.count_by_state()
+    assert counts == {"AGENT_RUNNING": 1}
+
+
+def test_mark_deferred_running_clears_payload(tmp_path: Path) -> None:
+    s = make_state(tmp_path)
+    _record_received(s, "<msg-5@example.com>")
+    s.mark_deferred(
+        message_id="<msg-5@example.com>",
+        from_state="RECEIVED",
+        deferred_payload={"kind": "ok_agent_init", "request_body": "x"},
+    )
+    s.mark_deferred_running(message_id="<msg-5@example.com>")
+    with s._connect() as conn:
+        row = conn.execute(
+            "SELECT plan_json FROM messages WHERE id = ?",
+            ("<msg-5@example.com>",),
+        ).fetchone()
+    assert row["plan_json"] is None

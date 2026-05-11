@@ -25,12 +25,14 @@ This module is stdlib-only: smtplib + email.message.EmailMessage.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import smtplib
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
-from typing import Iterable
+from pathlib import Path
+from typing import Iterable, Sequence
 
 from .config import SmtpConfig
 from .log import JSONLLogger
@@ -58,6 +60,22 @@ class SmtpNotConfiguredError(RuntimeError):
 
 class NotifierError(RuntimeError):
     """Raised when an outbound primitive fails terminally (both sends down)."""
+
+
+@dataclass(frozen=True)
+class AttachmentSpec:
+    """A file to attach to an outbound message.
+
+    Notifier-local mirror of `principal_agent.AgentAttachment` — the
+    watcher translates one to the other when calling notify_principal,
+    so notifier.py stays self-contained (no import cycle into
+    principal_agent). All fields except path are optional with
+    sensible defaults.
+    """
+    path: Path
+    filename: str | None = None
+    maintype: str | None = None
+    subtype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +118,37 @@ def _build_message(
         msg["References"] = " ".join(references) if references else in_reply_to
     msg.set_content(body)
     return msg
+
+
+def _attach_files(msg: EmailMessage, attachments: Sequence["AttachmentSpec"]) -> None:
+    """Attach files to a built message.
+
+    Each attachment is read fresh from disk here — the agent or
+    daemon may have written it just before SMTP send, so caching the
+    bytes upstream would be premature. If the file is missing or
+    unreadable at this point, the exception propagates and the
+    caller treats the send as failed.
+
+    MIME type defaults: explicit maintype/subtype on the spec wins;
+    otherwise mimetypes.guess_type(path) is used; otherwise
+    application/octet-stream as a known-safe fallback.
+    """
+    for spec in attachments:
+        data = spec.path.read_bytes()
+        if spec.maintype and spec.subtype:
+            maintype, subtype = spec.maintype, spec.subtype
+        else:
+            guessed, _ = mimetypes.guess_type(spec.path.name)
+            if guessed and "/" in guessed:
+                maintype, subtype = guessed.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=spec.filename or spec.path.name,
+        )
 
 
 def _smtp_send(smtp: SmtpConfig, msg: EmailMessage) -> None:
@@ -188,6 +237,7 @@ def notify_principal(
     in_reply_to: str | None = None,
     state: State | None = None,
     related_message_id: str | None = None,
+    attachments: Sequence["AttachmentSpec"] = (),
 ) -> SendResult:
     """Send to the principal. No footer, no audit copy.
 
@@ -199,6 +249,11 @@ def notify_principal(
     outbound_log (the unified audit register). `related_message_id`
     pins the row to the inbound mail that triggered this send when
     applicable.
+
+    `attachments`, when non-empty, are attached as MIME parts before
+    the SMTP send. Each spec's file is read fresh from disk; missing
+    or unreadable files raise and the send is treated as failed.
+    Default empty tuple preserves the existing call-site behaviour.
     """
     if smtp is None:
         raise SmtpNotConfiguredError(
@@ -213,6 +268,8 @@ def notify_principal(
     )
     primary_id = msg["Message-ID"]
     try:
+        if attachments:
+            _attach_files(msg, attachments)
         _smtp_send(smtp, msg)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"

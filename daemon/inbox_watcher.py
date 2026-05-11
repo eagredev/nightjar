@@ -23,6 +23,7 @@ import contextlib
 import email
 import email.utils
 import random
+import re
 import secrets
 import socket
 import time
@@ -44,6 +45,7 @@ from . import (
     principal_handlers,
     principal_interpret,
     status_report,
+    system_load,
     triage,
 )
 from .config import InboxConfig, Config
@@ -86,9 +88,23 @@ MAX_BACKOFF_SECONDS = 300.0
 # doesn't round-trip within this window, the socket is presumed dead
 # (typical cause: Steam Deck sleep timed out the TCP connection on
 # Gmail's side without us noticing). The watcher raises so the outer
-# run() loop reconnects. 5s is enough headroom for normal Gmail
-# latency without dragging out a known-dead connection.
-NOOP_HEALTH_TIMEOUT_SECONDS = 5.0
+# run() loop reconnects. Was 5s — that proved too tight against
+# Gmail's tail latency on 2026-05-08 evening, where every NOOP took
+# ~10s and the probe false-positived every cycle, wedging the
+# watcher in a noop_timeout / reconnect loop without ever serving
+# IDLE. 15s is comfortably above observed Gmail tail and still tight
+# enough that a genuinely-dead socket fails over inside one minute.
+NOOP_HEALTH_TIMEOUT_SECONDS = 15.0
+
+# Per-IMAP-command timeout for aioimaplib (login/select/search/fetch).
+# The library's default is 10s, which is too aggressive against Gmail's
+# tail latency — observed 2026-05-08 evening: select INBOX consistently
+# took ~10s and was tripping the timeout on every reconnect, wedging
+# the watcher in an idle_error / backoff loop without ever completing
+# catchup. 30s gives comfortable headroom over Gmail's tail while
+# still bailing on a genuinely dead socket within one minute.
+# (NOOP keeps its own tighter 5s budget — it's the dead-socket probe.)
+IMAP_COMMAND_TIMEOUT_SECONDS = 30.0
 
 # TCP keepalive parameters for the IMAP socket (Issue #42 fix).
 # Without these the kernel won't probe a silent peer for ~2 hours,
@@ -114,6 +130,40 @@ IDLE_PUSH_SLICE_SECONDS = 30
 # resolve after sending DONE. On a dead socket this future will
 # never complete. 10s is generous for a healthy server.
 IDLE_TEARDOWN_HARD_CAP_SECONDS = 10
+
+# Catchup error-rate threshold. If a single catchup pass logs this
+# many fetch failures, we presume the IMAP transport is degraded and
+# raise mid-loop so the run() loop tears down and reconnects rather
+# than thrashing on a dead socket for 100+ more 10s timeouts. The
+# `max(N, candidates // K)` shape keeps tiny windows from tripping
+# while still catching the typical failure (silent-wedge incident
+# 2026-05-07 saw 72/128 fetches fail before the loop completed).
+CATCHUP_ABORT_MIN_ERRORS = 4
+CATCHUP_ABORT_ERROR_FRACTION = 4  # trip at 1/4 of candidates
+
+# Catchup dedup pre-filter. Before doing per-UID full-header fetches
+# (each a sequential IMAP round-trip — ~3s on Gmail), batch-fetch
+# just MESSAGE-ID for all candidates in one round-trip and drop any
+# whose ID is already in state-db. Skipping the batch on tiny windows
+# avoids the parsing overhead when there's nothing to gain. Observed
+# 2026-05-08: a 137-candidate catchup with 136 dedup hits took
+# ~7m43s; with this pre-filter the same workload should complete in
+# seconds because only the genuinely-new UIDs trigger the slow path.
+CATCHUP_BATCH_DEDUP_MIN_CANDIDATES = 8
+
+# Used by _batch_dedup_known_uids to parse aioimaplib batch fetch
+# descriptors of the shape: "<seq> FETCH (UID <uid> BODY[...] {<size>}".
+_BATCH_FETCH_UID_RE = re.compile(rb"\bUID (\d+)\b")
+_BATCH_FETCH_SIZE_RE = re.compile(rb"\{(\d+)\}")
+
+# Hard cap on aioimaplib.IMAP4.idle_start(). The library awaits
+# `wait_for_idle_response()` (an asyncio.Event) without any timeout
+# of its own, so a half-open SSL transport that never delivers the
+# `+ idling` continuation will block the watcher forever (silent
+# wedge incident 2026-05-07). 30s is well over normal Gmail latency
+# and below the 60s poll interval, so a dead handshake fails loudly
+# and the run() loop reconnects.
+IDLE_HANDSHAKE_HARD_CAP_SECONDS = 30
 
 # Max plaintext body bytes the watcher will hand to triage. Anything
 # longer is truncated and a "body_truncated" flag is added to the plan's
@@ -289,7 +339,11 @@ class InboxWatcher:
         One full reconnect cycle. The outer run() loop will call this
         again after backoff if it raises.
         """
-        client = aioimaplib.IMAP4_SSL(host=self.inbox.imap_host, port=self.inbox.imap_port)
+        client = aioimaplib.IMAP4_SSL(
+            host=self.inbox.imap_host,
+            port=self.inbox.imap_port,
+            timeout=IMAP_COMMAND_TIMEOUT_SECONDS,
+        )
         await client.wait_hello_from_server()
         self.logger.event("idle_connect", inbox=self.inbox.name, host=self.inbox.imap_host)
 
@@ -301,6 +355,14 @@ class InboxWatcher:
             select_response = await client.select("INBOX")
             if select_response.result != "OK":
                 raise RuntimeError(f"select failed: {select_response.result} {select_response.lines!r}")
+
+            # Probe the freshly-authenticated socket before running
+            # catchup. login()/select() can succeed against a degraded
+            # transport that then fails on the per-UID fetches; finding
+            # out via 100+ 10s CommandTimeout errors is the slow,
+            # noisy way (silent-wedge incident 2026-05-07). A NOOP with
+            # a hard timeout is the cheap, fast way.
+            await self._probe_socket_alive(client)
 
             await self._catch_up(client)
 
@@ -382,9 +444,54 @@ class InboxWatcher:
         processed = 0
         skipped = 0
         errors = 0
+        # Trip threshold: bail when error count reaches the larger of
+        # the absolute floor and 1/Nth of the candidate set. The fetch
+        # path itself uses a 10s aioimaplib timeout, so leaving a dead
+        # socket to drain 100+ UIDs would block catchup for >15 minutes.
+        # Tripping early surfaces the failure to run() which reconnects.
+        abort_threshold = max(
+            CATCHUP_ABORT_MIN_ERRORS,
+            len(uids) // CATCHUP_ABORT_ERROR_FRACTION,
+        )
+
+        # Fast path: one IMAP round-trip pulls only the Message-ID
+        # for every candidate, then we filter against state-db locally.
+        # The slow per-UID loop below only runs for genuinely-new UIDs.
+        # Skip the batch on tiny windows where the parse overhead is
+        # bigger than the win.
+        known_uids: set[str] = set()
+        if len(uids) >= CATCHUP_BATCH_DEDUP_MIN_CANDIDATES:
+            uid_strs = [u.decode("ascii") for u in uids]
+            known_uids = await self._batch_dedup_known_uids(client, uid_strs)
+            if known_uids:
+                # Telemetry is per-UID at debug level so log diffing
+                # against the pre-batch behaviour stays consistent.
+                # The per-UID `catchup_skipped_existing` rows (one per
+                # known UID) are what existing tooling expects.
+                for u in uid_strs:
+                    if u in known_uids:
+                        self.logger.event(
+                            "catchup_skipped_existing",
+                            inbox=self.inbox.name,
+                            level="debug",
+                            uid=u,
+                            detail="batch_dedup",
+                        )
+                self.logger.event(
+                    "catchup_batch_dedup",
+                    inbox=self.inbox.name,
+                    candidates=len(uids),
+                    pre_filtered=len(known_uids),
+                    remaining=len(uids) - len(known_uids),
+                )
+                skipped += len(known_uids)
+
         for uid in uids:
+            uid_s = uid.decode("ascii")
+            if uid_s in known_uids:
+                continue
             try:
-                outcome = await self._fetch_and_record(client, uid.decode("ascii"))
+                outcome = await self._fetch_and_record(client, uid_s)
                 if outcome == "processed":
                     processed += 1
                 elif outcome == "skipped":
@@ -400,9 +507,31 @@ class InboxWatcher:
                     "catchup_fetch_error",
                     inbox=self.inbox.name,
                     level="warn",
-                    uid=uid.decode("ascii", "replace"),
+                    uid=uid_s,
                     error=type(e).__name__,
                     message=str(e),
+                )
+            if errors >= abort_threshold:
+                # Watermark deliberately not advanced: we never
+                # reconciled this window, so the next pass (after
+                # reconnect) should re-search it.
+                self.logger.event(
+                    "catchup_aborted_high_error_rate",
+                    inbox=self.inbox.name,
+                    level="warn",
+                    candidates=len(uids),
+                    processed=processed,
+                    skipped=skipped,
+                    errors=errors,
+                    threshold=abort_threshold,
+                    detail=(
+                        "fetch error rate above threshold; presuming "
+                        "transport degraded. Reconnecting."
+                    ),
+                )
+                raise RuntimeError(
+                    f"catchup aborted: {errors} fetch errors "
+                    f"(threshold {abort_threshold} of {len(uids)} candidates)"
                 )
 
         # Watermark advances on every successful pass, even if every
@@ -487,7 +616,30 @@ class InboxWatcher:
         # drop) can keep wait_server_push() blocked indefinitely.
         _enable_tcp_keepalive(client)
 
-        idle_task = await client.idle_start(timeout=IDLE_REFRESH_SECONDS + 30)
+        # aioimaplib's idle_start() has no internal timeout on the
+        # `+ idling` continuation handshake — `wait_for_idle_response()`
+        # is an unbounded `await event.wait()`. On a half-open SSL
+        # transport this blocks forever and silently wedges the watcher
+        # (see incidents/silent-wedge-2026-05-07T18-43.md). Wrap in our
+        # own hard cap so a dead handshake surfaces as TimeoutError, the
+        # outer run() loop reconnects, and the daemon stays loud.
+        try:
+            idle_task = await asyncio.wait_for(
+                client.idle_start(timeout=IDLE_REFRESH_SECONDS + 30),
+                timeout=IDLE_HANDSHAKE_HARD_CAP_SECONDS,
+            )
+        except asyncio.TimeoutError as e:
+            self.logger.event(
+                "idle_handshake_timeout",
+                inbox=self.inbox.name,
+                level="warn",
+                detail=(
+                    f"IDLE handshake did not complete within "
+                    f"{IDLE_HANDSHAKE_HARD_CAP_SECONDS}s; presuming "
+                    f"socket dead. Reconnecting."
+                ),
+            )
+            raise RuntimeError("imap idle_start timed out") from e
         wake_reason = "refresh"  # default if loop body never reassigns
         try:
             # Race four conditions: server push (activity, with
@@ -580,6 +732,11 @@ class InboxWatcher:
         # 'poll_caught_missed_push' telemetry event when a poll wake
         # actually finds new mail (i.e. IDLE silently dropped it).
         await self._catch_up(client, wake_reason=wake_reason)
+        # After every catchup, drain QUEUED_DEFERRED if the system is
+        # free now. Cheap (one loginctl call) and re-dispatches as
+        # many messages as the IDLE poll can chew through. Bounded by
+        # poll_interval_seconds (60s default).
+        await self._drain_deferred_if_free()
 
     async def _probe_socket_alive(self, client: aioimaplib.IMAP4_SSL) -> None:
         """Verify the IMAP socket is responsive with a NOOP under a
@@ -666,6 +823,98 @@ class InboxWatcher:
                 # Server-pushed empty: keep waiting unless we've been told to stop.
                 continue
             return  # any non-empty push counts as activity
+
+    async def _batch_dedup_known_uids(
+        self, client: aioimaplib.IMAP4_SSL, uids: list[str],
+    ) -> set[str]:
+        """One-round-trip filter: which of these UIDs are already in state-db?
+
+        Catchup's bottleneck is doing a full per-UID `UID FETCH BODY[HEADER]`
+        round-trip (~3s on Gmail) before checking the dedup table. With
+        a typical IMAP search window of 100+ messages and a state-db that
+        already knows almost all of them, that's hundreds of seconds wasted
+        per cycle. Batch-fetching only the Message-ID for all candidates
+        in one IMAP command, then doing the dedup check locally, collapses
+        that to a single round-trip.
+
+        Returns the subset of `uids` whose Message-ID is already in
+        state-db. Caller skips the slow per-UID path for those.
+
+        On parse failure or IMAP error, returns the empty set — the
+        caller's slow path remains correct, just slow. Never blocks the
+        catchup completing.
+        """
+        if not uids:
+            return set()
+        uid_list = ",".join(uids)
+        try:
+            result, data = await client.uid(
+                "fetch", uid_list,
+                "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+            )
+        except Exception as e:
+            self.logger.event(
+                "catchup_batch_dedup_failed",
+                inbox=self.inbox.name,
+                level="warn",
+                error=type(e).__name__,
+                message=str(e),
+                detail="batch dedup unavailable; falling back to per-UID fetch",
+            )
+            return set()
+        if result != "OK":
+            self.logger.event(
+                "catchup_batch_dedup_failed",
+                inbox=self.inbox.name,
+                level="warn",
+                result=str(result),
+                detail="batch dedup unavailable; falling back to per-UID fetch",
+            )
+            return set()
+
+        # Response shape (per UID): header bytes "<seq> FETCH (UID <uid> ... {<size>}",
+        # then bytes/bytearray payload of <size>, then b")". A trailing
+        # "Success" token follows the whole batch. Walk the list and pair.
+        known_uids: set[str] = set()
+        i = 0
+        while i < len(data):
+            chunk = data[i]
+            if not isinstance(chunk, (bytes, bytearray)):
+                i += 1
+                continue
+            text = bytes(chunk)
+            if b" FETCH " not in text or b"UID " not in text:
+                i += 1
+                continue
+            # Extract the UID from the descriptor line.
+            uid_m = _BATCH_FETCH_UID_RE.search(text)
+            if uid_m is None:
+                i += 1
+                continue
+            this_uid = uid_m.group(1).decode("ascii")
+            # Find the literal size and pair with the next chunk of that size.
+            size_m = _BATCH_FETCH_SIZE_RE.search(text)
+            if size_m is None:
+                i += 1
+                continue
+            expected_size = int(size_m.group(1))
+            payload: bytes | None = None
+            for j in range(i + 1, min(i + 4, len(data))):
+                cand = data[j]
+                if isinstance(cand, (bytes, bytearray)) and len(cand) == expected_size:
+                    payload = bytes(cand)
+                    i = j + 1
+                    break
+            if payload is None:
+                i += 1
+                continue
+            # Parse just the Message-ID line from the tiny header blob.
+            msg = email.message_from_bytes(payload)
+            message_id = (msg.get("Message-ID") or "").strip()
+            if message_id and self.state.message_exists(message_id):
+                known_uids.add(this_uid)
+
+        return known_uids
 
     async def _fetch_and_record(self, client: aioimaplib.IMAP4_SSL, uid: str) -> str | None:
         """Fetch headers for one UID, look up sender, persist a message row.
@@ -1216,6 +1465,29 @@ class InboxWatcher:
         # request is meaningless. Send the principal a hint reply.
         request_text = classification.request_body.strip()
         if not request_text:
+            # Empty-request branch handled below; busy-check skipped on
+            # purpose — the deterministic-empty reply is cheap and the
+            # principal needs to know the request was malformed
+            # regardless of system load.
+            pass
+
+        # Defer the dispatch when the system is busy (gaming mode by
+        # default; other thresholds opt-in via [agent.dispatch]). The
+        # message is recorded as QUEUED_DEFERRED with its request body
+        # stashed in plan_json; the IDLE-loop drain task wakes it back
+        # up when the system is free again.
+        if request_text:
+            busy, reason = system_load.is_system_busy(self.config.agent.dispatch)
+            if busy:
+                self._defer_agent_request(
+                    message_id=message_id,
+                    from_addr=from_addr,
+                    classification=classification,
+                    reason=reason,
+                )
+                return
+
+        if not request_text:
             self.logger.event(
                 "agent_empty_request",
                 inbox=self.inbox.name,
@@ -1360,6 +1632,153 @@ class InboxWatcher:
                 detail="outbound reply send failed; continuations to this session will not route",
             )
 
+    def _defer_agent_request(
+        self,
+        *,
+        message_id: str,
+        from_addr: str,
+        classification: "agent_router.AgentClassification",
+        reason: str,
+    ) -> None:
+        """Persist the message as QUEUED_DEFERRED and send the
+        principal a deterministic 'queued' reply. The IDLE-loop drain
+        picks this up and re-dispatches when the system is free.
+
+        Stash the request_body + classification kind + session_id on
+        the message row (in plan_json) so the drain doesn't need to
+        re-fetch from IMAP.
+        """
+        is_continuation = (
+            classification.kind == agent_router.CLASS_AGENT_CONTINUATION
+        )
+        self.state.mark_deferred(
+            message_id=message_id,
+            from_state="RECEIVED",
+            deferred_payload={
+                "request_body": classification.request_body,
+                "kind": classification.kind,
+                "session_id": (
+                    classification.session_id if is_continuation else None
+                ),
+            },
+        )
+        self.logger.event(
+            "agent_dispatch_deferred",
+            inbox=self.inbox.name,
+            message_id=message_id,
+            from_addr=from_addr,
+            reason=reason,
+            kind="continuation" if is_continuation else "init",
+        )
+        # Send a one-shot acknowledgement so the principal knows the
+        # request is queued, not lost. The state machine treats this
+        # as a side-effect of mark_deferred (which already moved the
+        # row). _send_deterministic_reply transitions RECEIVED→X on
+        # success, but the row is in QUEUED_DEFERRED now — so we
+        # call notify_principal directly and skip the transition.
+        if self.config.smtp is None:
+            self.logger.event(
+                "principal_reply_skipped",
+                level="warn",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                reason="no_smtp_config",
+            )
+            return
+        try:
+            notifier.notify_principal(
+                smtp=self.config.smtp,
+                principal_addr=from_addr,
+                subject="Nightjar: queued",
+                body=(
+                    f"Your request is queued — {reason}. "
+                    f"Nightjar will run it as soon as the system is free, "
+                    f"usually within a minute. No action needed.\n"
+                ),
+                jlogger=self.logger,
+                state=self.state,
+                related_message_id=message_id,
+                in_reply_to=message_id,
+            )
+        except Exception as e:
+            self.logger.event(
+                "agent_dispatch_deferred_reply_failed",
+                level="warn",
+                inbox=self.inbox.name,
+                message_id=message_id,
+                error=type(e).__name__,
+                message=str(e),
+            )
+
+    async def _drain_deferred_if_free(self) -> None:
+        """If any messages are QUEUED_DEFERRED and the system is no
+        longer busy, claim and re-dispatch them oldest-first.
+
+        Called at the tail of `_idle_once`, after every catchup pass.
+        Uses `mark_deferred_running` to atomically claim each row
+        before dispatching, so a stray second IDLE wake can't
+        double-fire.
+
+        Each re-dispatch walks the same path as a fresh inbound: it
+        constructs an `AgentClassification` from the stashed payload
+        and calls `_dispatch_agent_request`. The busy check inside
+        will short-circuit again if the system became busy between
+        the drain and the dispatch (race-safe).
+        """
+        deferred = self.state.select_deferred_messages()
+        if not deferred:
+            return
+        busy, reason = system_load.is_system_busy(self.config.agent.dispatch)
+        if busy:
+            self.logger.event(
+                "agent_dispatch_drain_skipped",
+                inbox=self.inbox.name,
+                count=len(deferred),
+                reason=reason,
+                level="debug",
+            )
+            return
+        self.logger.event(
+            "agent_dispatch_drain_started",
+            inbox=self.inbox.name,
+            count=len(deferred),
+        )
+        for row in deferred:
+            payload = row["payload"]
+            request_body = payload.get("request_body")
+            kind = payload.get("kind")
+            session_id = payload.get("session_id")
+            if not isinstance(request_body, str) or kind not in (
+                agent_router.CLASS_AGENT_INIT,
+                agent_router.CLASS_AGENT_CONTINUATION,
+            ):
+                self.logger.event(
+                    "agent_dispatch_drain_skipped_bad_payload",
+                    level="warn",
+                    inbox=self.inbox.name,
+                    message_id=row["message_id"],
+                )
+                continue
+            if not self.state.mark_deferred_running(
+                message_id=row["message_id"],
+            ):
+                # Lost the race or state mutated under us — skip.
+                continue
+            classification = agent_router.AgentClassification(
+                kind=kind,
+                request_body=request_body,
+                session_id=(
+                    session_id
+                    if kind == agent_router.CLASS_AGENT_CONTINUATION
+                    else None
+                ),
+            )
+            await self._dispatch_agent_request(
+                message_id=row["message_id"],
+                from_addr=row["from_addr"],
+                classification=classification,
+            )
+
     def _principal_display_name(self) -> str | None:
         """Look up the principal contact's display name. None if not
         configured (shouldn't happen, since this code only runs on
@@ -1393,8 +1812,21 @@ class InboxWatcher:
             f"Reply with one HOTP code on the first line to continue.\n"
         )
         if result.status == "completed":
-            subject = "Nightjar agent: response"
-            body = (result.final_text or "(agent produced no text)") + footer
+            # Prefer the agent's compose_reply tool argument when
+            # present; fall back to final_text for backwards
+            # compatibility (and adoption-tracking via the
+            # `_audit_compose_reply_missing` event in the audit log).
+            # composed_body / composed_subject and attachments are
+            # completed-path-only; the killed/errored branches below
+            # intentionally ignore them — a partial run hasn't earned
+            # the right to claim "this is the final reply."
+            subject = result.composed_subject or "Nightjar agent: response"
+            body = (
+                result.composed_body
+                if result.composed_body is not None
+                else (result.final_text or "(agent produced no text)")
+            ) + footer
+            completed_attachments = result.attachments
         elif result.status == "killed":
             subject = f"Nightjar agent: session killed ({session_short})"
             body = (
@@ -1404,6 +1836,7 @@ class InboxWatcher:
                 + (result.final_text or "(no text was produced before kill)")
                 + footer
             )
+            completed_attachments = ()
         else:  # errored
             subject = f"Nightjar agent: session errored ({session_short})"
             body = (
@@ -1413,6 +1846,7 @@ class InboxWatcher:
                 + (result.final_text or "(no text was produced)")
                 + footer
             )
+            completed_attachments = ()
         return self._send_deterministic_reply(
             message_id=originating_message_id,
             from_addr=from_addr,
@@ -1420,6 +1854,7 @@ class InboxWatcher:
             body=body,
             next_state="RESPONDED",
             event_name="agent_replied",
+            attachments=completed_attachments,
         )
 
     def _trip_dead_mans_switch(self, reason: str) -> None:
@@ -2562,6 +2997,7 @@ class InboxWatcher:
         next_state: str,
         event_name: str,
         detail: str = "",
+        attachments: tuple["principal_agent.AgentAttachment", ...] = (),
     ) -> str | None:
         """Common path: notify_principal + state transition + log event.
 
@@ -2573,6 +3009,12 @@ class InboxWatcher:
         Robust to SMTP failures: logs + transitions to RESPONDED_FAILED
         if the send didn't go out. The inbound message stays recorded
         regardless.
+
+        `attachments`, when non-empty, are translated from
+        principal_agent.AgentAttachment to notifier.AttachmentSpec
+        and passed through to notify_principal. The notifier reads
+        each file fresh from disk at SMTP send time; missing files
+        cause the send to fail (caught below as principal_reply_error).
         """
         if self.config.smtp is None:
             self.logger.event(
@@ -2583,6 +3025,15 @@ class InboxWatcher:
                 reason="no_smtp_config",
             )
             return None
+        notifier_attachments = tuple(
+            notifier.AttachmentSpec(
+                path=a.path,
+                filename=a.filename,
+                maintype=a.maintype,
+                subtype=a.subtype,
+            )
+            for a in attachments
+        )
         try:
             send = notifier.notify_principal(
                 smtp=self.config.smtp,
@@ -2591,6 +3042,7 @@ class InboxWatcher:
                 body=body,
                 jlogger=self.logger, state=self.state, related_message_id=message_id,
                 in_reply_to=message_id,
+                attachments=notifier_attachments,
             )
         except Exception as e:
             self.logger.event(

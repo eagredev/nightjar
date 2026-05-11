@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import auth
+from . import system_load
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/nightjar/nightjar.conf").expanduser()
@@ -365,6 +366,12 @@ class AgentConfig:
     """
     name: str = DEFAULT_AGENT_NAME
     personality: str = DEFAULT_AGENT_PERSONALITY
+    dispatch: system_load.DispatchPolicy = field(
+        default_factory=system_load.DispatchPolicy,
+    )
+    """Operator-tunable thresholds for deferring agent dispatch when
+    the system is busy. See [agent.dispatch] section in nightjar.conf;
+    default is "never defer" so existing installs are unchanged."""
 
 
 @dataclass(frozen=True)
@@ -1123,7 +1130,46 @@ def load(
         raw_personality = agent_section.get("personality", "").strip()
         if raw_personality:
             agent_personality = raw_personality
-    agent = AgentConfig(name=agent_name, personality=agent_personality)
+    dispatch_policy = system_load.DispatchPolicy()
+    if "agent.dispatch" in parser:
+        ds = parser["agent.dispatch"]
+        try:
+            defer_gaming = ds.getboolean(
+                "defer_when_gaming_mode",
+                fallback=dispatch_policy.defer_when_gaming_mode,
+            )
+        except ValueError as e:
+            raise ConfigError(
+                f"[agent.dispatch].defer_when_gaming_mode must be true/false: {e}"
+            ) from e
+        try:
+            defer_load = float(ds.get(
+                "defer_when_load_above",
+                str(dispatch_policy.defer_when_load_above),
+            ))
+        except ValueError as e:
+            raise ConfigError(
+                f"[agent.dispatch].defer_when_load_above must be a number: {e}"
+            ) from e
+        try:
+            defer_mem = int(ds.get(
+                "defer_when_memavail_below_mb",
+                str(dispatch_policy.defer_when_memavail_below_mb),
+            ))
+        except ValueError as e:
+            raise ConfigError(
+                f"[agent.dispatch].defer_when_memavail_below_mb must be an integer: {e}"
+            ) from e
+        dispatch_policy = system_load.DispatchPolicy(
+            defer_when_gaming_mode=defer_gaming,
+            defer_when_load_above=defer_load,
+            defer_when_memavail_below_mb=defer_mem,
+        )
+    agent = AgentConfig(
+        name=agent_name,
+        personality=agent_personality,
+        dispatch=dispatch_policy,
+    )
 
     return Config(
         daemon=daemon,

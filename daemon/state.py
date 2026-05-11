@@ -397,6 +397,104 @@ class State:
             row = conn.execute("SELECT 1 FROM messages WHERE id = ?", (message_id,)).fetchone()
             return row is not None
 
+    def mark_deferred(
+        self,
+        *,
+        message_id: str,
+        from_state: str,
+        deferred_payload: dict,
+        at: int | None = None,
+    ) -> None:
+        """Move a message into QUEUED_DEFERRED and stash the payload
+        the drain task will need to re-dispatch it (request body,
+        kind, session_id, sender, etc).
+
+        Stored as JSON in the existing `plan_json` column — no
+        schema migration. The payload shape is the caller's
+        responsibility; `select_deferred_messages` returns it
+        verbatim.
+        """
+        at = at if at is not None else int(time.time())
+        payload = json.dumps(deferred_payload, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE messages SET state = ?, plan_json = ?, updated_at = ? "
+                "WHERE id = ? AND state = ?",
+                ("QUEUED_DEFERRED", payload, at, message_id, from_state),
+            )
+            conn.execute(
+                """
+                INSERT INTO transitions (message_id, from_state, to_state, at, detail)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (message_id, from_state, "QUEUED_DEFERRED", at, "deferred_for_busy_system"),
+            )
+
+    def select_deferred_messages(self) -> list[dict]:
+        """Return all currently-deferred messages oldest-first.
+
+        Each row is `{message_id, from_addr, payload, deferred_at}`.
+        `payload` is the dict that was passed to `mark_deferred`.
+        Rows whose `plan_json` is missing or unparseable are skipped
+        with a payload of `{}` — the drain task can still attempt
+        re-dispatch (it has from_addr) but will probably bail.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, from_addr, plan_json, updated_at FROM messages "
+                "WHERE state = 'QUEUED_DEFERRED' "
+                "ORDER BY received_at ASC"
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                payload = json.loads(r["plan_json"]) if r["plan_json"] else {}
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            out.append({
+                "message_id": r["id"],
+                "from_addr": r["from_addr"],
+                "payload": payload,
+                "deferred_at": r["updated_at"],
+            })
+        return out
+
+    def mark_deferred_running(
+        self,
+        *,
+        message_id: str,
+        at: int | None = None,
+    ) -> bool:
+        """Atomically transition QUEUED_DEFERRED → AGENT_RUNNING.
+
+        Returns True if the row was actually moved, False if the
+        precondition didn't hold (already running, or some other
+        state). Used by the drain task to claim a message before
+        dispatching, so two concurrent drains can't double-fire.
+
+        Clears `plan_json` on success — the deferred payload has
+        been consumed.
+        """
+        at = at if at is not None else int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE messages SET state = ?, plan_json = NULL, updated_at = ? "
+                "WHERE id = ? AND state = 'QUEUED_DEFERRED'",
+                ("AGENT_RUNNING", at, message_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            conn.execute(
+                """
+                INSERT INTO transitions (message_id, from_state, to_state, at, detail)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (message_id, "QUEUED_DEFERRED", "AGENT_RUNNING", at, "drained_after_busy"),
+            )
+            return True
+
     def count_by_state(self) -> dict[str, int]:
         with self._connect() as conn:
             rows = conn.execute(

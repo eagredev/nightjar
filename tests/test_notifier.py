@@ -126,6 +126,135 @@ def test_notify_principal_returns_error_on_smtp_failure(tmp_path: Path) -> None:
     assert "ConnectionRefusedError" in (result.error or "")
 
 
+# --- notify_principal attachments ------------------------------------------
+
+
+def test_notify_principal_with_attachment_round_trips(tmp_path: Path) -> None:
+    """One attachment → wire message is multipart/mixed with the
+    text body and one attachment part with the right filename and
+    contents."""
+    target = tmp_path / "report.txt"
+    target.write_text("hello principal")
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="here is your file",
+            body="see attached",
+            attachments=(notifier.AttachmentSpec(path=target),),
+        )
+    msg = FakeSMTP.instances[0].sent_messages[0]
+    assert msg.is_multipart()
+    parts = msg.get_payload()
+    # First part is the text body; second is the attachment.
+    assert any("see attached" in p.get_payload() for p in parts
+               if not p.is_multipart() and p.get_content_maintype() == "text")
+    attach_parts = [p for p in parts if p.get_filename() is not None]
+    assert len(attach_parts) == 1
+    assert attach_parts[0].get_filename() == "report.txt"
+    assert attach_parts[0].get_payload(decode=True) == b"hello principal"
+
+
+def test_notify_principal_attachment_uses_explicit_filename(
+    tmp_path: Path,
+) -> None:
+    """`filename` on the spec wins over the path's basename."""
+    target = tmp_path / "internal-name.txt"
+    target.write_text("payload")
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="x",
+            body="x",
+            attachments=(notifier.AttachmentSpec(
+                path=target, filename="display.txt"),),
+        )
+    msg = FakeSMTP.instances[0].sent_messages[0]
+    parts = [p for p in msg.get_payload() if p.get_filename() is not None]
+    assert parts[0].get_filename() == "display.txt"
+
+
+def test_notify_principal_attachment_guesses_mime_type(
+    tmp_path: Path,
+) -> None:
+    """A .pdf file gets application/pdf without explicit maintype/subtype."""
+    target = tmp_path / "report.pdf"
+    target.write_bytes(b"%PDF-1.4 fake content")
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="x",
+            body="x",
+            attachments=(notifier.AttachmentSpec(path=target),),
+        )
+    msg = FakeSMTP.instances[0].sent_messages[0]
+    parts = [p for p in msg.get_payload() if p.get_filename() is not None]
+    ctype = parts[0].get_content_type()
+    assert ctype == "application/pdf"
+
+
+def test_notify_principal_multiple_attachments_round_trip(
+    tmp_path: Path,
+) -> None:
+    """Three attachments → three attachment parts in order."""
+    files = []
+    for name, content in [("a.txt", "first"), ("b.txt", "second"),
+                          ("c.txt", "third")]:
+        p = tmp_path / name
+        p.write_text(content)
+        files.append(notifier.AttachmentSpec(path=p))
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="x", body="x",
+            attachments=tuple(files),
+        )
+    msg = FakeSMTP.instances[0].sent_messages[0]
+    attach_parts = [p for p in msg.get_payload()
+                    if p.get_filename() is not None]
+    assert [p.get_filename() for p in attach_parts] == [
+        "a.txt", "b.txt", "c.txt",
+    ]
+
+
+def test_notify_principal_no_attachments_keeps_simple_message(
+    tmp_path: Path,
+) -> None:
+    """Empty attachments tuple → single-part message, not multipart.
+    Backwards-compat for the common case."""
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="x", body="hello",
+        )
+    msg = FakeSMTP.instances[0].sent_messages[0]
+    assert not msg.is_multipart()
+    assert "hello" in msg.get_payload()
+
+
+def test_notify_principal_missing_attachment_raises_at_send(
+    tmp_path: Path,
+) -> None:
+    """File missing at SMTP-send time → notify_principal returns
+    a SendResult with primary_sent=False (the FileNotFoundError
+    is caught inside notify_principal)."""
+    missing = tmp_path / "deleted-after-tool-call.txt"
+    # Don't create the file.
+    with patch.object(notifier.smtplib, "SMTP", FakeSMTP):
+        result = notifier.notify_principal(
+            smtp=SMTP_CONFIG,
+            principal_addr="me@example.com",
+            subject="x", body="x",
+            attachments=(notifier.AttachmentSpec(path=missing),),
+        )
+    assert result.primary_sent is False
+    assert "FileNotFoundError" in (result.error or "")
+
+
 # --- send_to_contact -------------------------------------------------------
 
 

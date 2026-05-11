@@ -146,6 +146,28 @@ class _StubIMAP:
 
     async def uid(self, verb: str, uid: str, spec: str):
         assert verb == "fetch"
+        # Batch dedup pre-filter: comma-separated UID list. Reply with
+        # a multi-message FETCH response shaped the way real Gmail
+        # delivers it (see _batch_dedup_known_uids parser).
+        if "," in uid:
+            self.fetched_uids.append(uid)  # record the batch as one event
+            chunks: list[bytes | bytearray] = []
+            for u in uid.split(","):
+                blob = self._headers_by_uid.get(u)
+                if blob is None:
+                    continue
+                # Synthesize a Message-ID-only blob from the full header
+                # blob the test fixture provides — _batch_dedup_known_uids
+                # only reads the Message-ID line so we can pass the
+                # whole header through.
+                chunks.append(
+                    f"1 FETCH (UID {u} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{len(blob)}}}".encode("ascii")
+                )
+                chunks.append(bytearray(blob))
+                chunks.append(b")")
+            chunks.append(b"Success")
+            return ("OK", chunks)
+        # Single-UID slow path.
         self.fetched_uids.append(uid)
         if uid not in self._headers_by_uid:
             return ("NO", [])
@@ -416,3 +438,370 @@ def test_no_messageid_falls_back_to_synthetic_id(tmp_path: Path) -> None:
     )
     asyncio.run(watcher._catch_up(stub))
     assert state.message_exists("<no-msgid-nightjar-uid99>")
+
+
+# ---------------------------------------------------------------------------
+# Catchup error-rate threshold (silent-wedge incident 2026-05-07).
+# When a half-open SSL transport makes most fetches fail with
+# CommandTimeout, _catch_up must abort, leave the watermark unchanged,
+# and raise so run() reconnects rather than blasting through the rest
+# of the window for 100+ more 10s timeouts.
+# ---------------------------------------------------------------------------
+
+
+class _FetchRaisingIMAP:
+    """Stub whose uid_search returns a configurable list of UIDs but
+    whose uid('fetch', ...) call raises a configurable exception
+    every time. Models the production failure: SINCE search succeeds
+    (server is talking), then per-UID fetches all time out (transport
+    is degraded).
+
+    `batch_attempts` counts comma-separated UID fetches (the dedup
+    pre-filter). `fetch_attempts` counts single-UID fetches (the
+    slow per-UID path). Both raise the same exception so the catchup
+    abort threshold tests behave the same with or without the batch
+    pre-filter — the pre-filter swallows its own failure, falls back,
+    and the slow path then trips the threshold as before."""
+    def __init__(
+        self,
+        *,
+        uids: list[bytes],
+        fetch_raises: BaseException,
+    ) -> None:
+        self._uids = list(uids)
+        self._fetch_raises = fetch_raises
+        self.searches: list[str] = []
+        self.fetch_attempts: int = 0
+        self.batch_attempts: int = 0
+
+    async def uid_search(self, query: str):
+        self.searches.append(query)
+        return ("OK", [b" ".join(self._uids)] if self._uids else [b""])
+
+    async def uid(self, verb: str, uid: str, spec: str):  # noqa: ARG002
+        assert verb == "fetch"
+        if "," in uid:
+            self.batch_attempts += 1
+        else:
+            self.fetch_attempts += 1
+        raise self._fetch_raises
+
+
+def _read_jsonl_events(log_dir: Path) -> list[dict]:
+    """JSONL reader (separate from _read_log_events in the sibling
+    file because tests in this module write into the JSONLLogger's
+    file-mode rather than directory-mode)."""
+    import json
+    events: list[dict] = []
+    if log_dir.is_file():
+        log_files = [log_dir]
+    else:
+        log_files = sorted(log_dir.glob("*.jsonl"))
+    for p in log_files:
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return events
+
+
+def test_catchup_aborts_on_high_error_rate(tmp_path: Path) -> None:
+    """Threshold trip: 1/4 of the candidates failing with raises is
+    enough to abort. The function raises RuntimeError, the watermark
+    does NOT advance, and a catchup_aborted_high_error_rate event is
+    logged at warn level."""
+    watcher, state = _make_watcher(tmp_path)
+    initial_watermark = int(time.time()) - 600
+    state.set_last_catchup_at("nightjar", initial_watermark)
+
+    # 8 UIDs; CATCHUP_ABORT_MIN_ERRORS=4 will trip after the 4th raise.
+    stub = _FetchRaisingIMAP(
+        uids=[b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8"],
+        fetch_raises=RuntimeError("simulated CommandTimeout"),
+    )
+
+    with pytest.raises(RuntimeError, match="catchup aborted: 4 fetch errors"):
+        asyncio.run(watcher._catch_up(stub))
+
+    # Threshold of max(4, 8//4) = 4. Should bail after the 4th attempt
+    # (not push through all 8).
+    assert stub.fetch_attempts == 4
+
+    # Watermark must NOT have advanced — the next pass should re-search
+    # this window, not skip past it.
+    assert state.get_last_catchup_at("nightjar") == initial_watermark
+
+
+def test_catchup_aborts_logs_warn_event(tmp_path: Path) -> None:
+    """The abort path logs a single catchup_aborted_high_error_rate
+    event at warn level with the failure totals so the operator can
+    see it in the JSONL log."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    state = State(db_path=tmp_path / "state.db")
+    inbox = _make_inbox()
+    config = _make_config(tmp_path)
+    logger = JSONLLogger(log_dir)
+    watcher = InboxWatcher(
+        inbox=inbox, config=config, state=state, logger=logger,
+    )
+    state.set_last_catchup_at("nightjar", int(time.time()) - 600)
+
+    stub = _FetchRaisingIMAP(
+        uids=[b"1", b"2", b"3", b"4", b"5", b"6"],
+        fetch_raises=RuntimeError("simulated CommandTimeout"),
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(watcher._catch_up(stub))
+
+    events = _read_jsonl_events(log_dir)
+    abort_events = [
+        e for e in events if e.get("event") == "catchup_aborted_high_error_rate"
+    ]
+    assert len(abort_events) == 1
+    e = abort_events[0]
+    assert e["level"] == "warn"
+    assert e["errors"] == 4
+    assert e["candidates"] == 6
+    assert e["threshold"] == 4
+    # No catchup_complete on the abort path — that event would mislead
+    # the operator into thinking the pass succeeded.
+    assert not [
+        e for e in events if e.get("event") == "catchup_complete"
+    ]
+
+
+def test_catchup_does_not_abort_on_low_error_count(tmp_path: Path) -> None:
+    """Below the absolute floor (CATCHUP_ABORT_MIN_ERRORS=4), a
+    handful of fetch failures are normal — fold them into the totals
+    and let catchup complete. Otherwise a single transient failure on
+    a small window would loop the watcher indefinitely."""
+    watcher, state = _make_watcher(tmp_path)
+    state.set_last_catchup_at("nightjar", int(time.time()) - 600)
+
+    # 3 candidates, all fail. errors = 3, threshold = max(4, 3//4) = 4.
+    # 3 < 4 → no trip.
+    stub = _FetchRaisingIMAP(
+        uids=[b"1", b"2", b"3"],
+        fetch_raises=RuntimeError("transient"),
+    )
+
+    # Should NOT raise.
+    asyncio.run(watcher._catch_up(stub))
+    assert stub.fetch_attempts == 3
+    # Watermark advances — we did finish the window, even with errors.
+    assert state.get_last_catchup_at("nightjar") > int(time.time()) - 60
+
+
+def test_catchup_threshold_scales_with_window(tmp_path: Path) -> None:
+    """For larger windows, the trip threshold scales as 1/4 of
+    candidates. With 100 UIDs the threshold is 25 — we should fail
+    fast at 25, not blast through all 100."""
+    watcher, state = _make_watcher(tmp_path)
+    state.set_last_catchup_at("nightjar", int(time.time()) - 600)
+
+    uids = [str(i).encode("ascii") for i in range(1, 101)]
+    stub = _FetchRaisingIMAP(
+        uids=uids,
+        fetch_raises=RuntimeError("simulated CommandTimeout"),
+    )
+
+    with pytest.raises(RuntimeError, match="catchup aborted: 25 fetch errors"):
+        asyncio.run(watcher._catch_up(stub))
+
+    assert stub.fetch_attempts == 25  # not 100
+    # The batch-dedup pre-filter also tried (and raised); it counts
+    # as a separate, swallowed attempt that doesn't change the trip
+    # behaviour but tells us the pre-filter was reached.
+    assert stub.batch_attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# Batch dedup pre-filter tests (2026-05-08 fix for slow catchup).
+#
+# Prior behaviour: catchup did a per-UID `UID FETCH BODY[HEADER]` round-trip
+# for every candidate before checking state-db dedup. With ~100 known
+# candidates and a Gmail RTT around 3s, that produced 5-8 minute catchup
+# cycles even when nothing was new. Fix: one batch fetch of MESSAGE-ID
+# for all candidates, drop the known ones locally, then the slow per-UID
+# fetch only runs for genuinely-new UIDs.
+# ---------------------------------------------------------------------------
+
+
+def test_batch_dedup_filters_known_uids_before_per_uid_fetch(tmp_path: Path) -> None:
+    """When state-db already knows N of the M candidates, the slow
+    per-UID fetch loop should run M-N times, not M times."""
+    watcher, state = _make_watcher(tmp_path)
+    # Seed state-db with 9 of 10 candidates as already-known.
+    headers: dict[str, bytes] = {}
+    for i in range(1, 10):  # UIDs 1-9 are known
+        msgid = f"<known-{i}@example.com>"
+        state.record_message(
+            message_id=msgid, inbox="nightjar",
+            from_addr="me@example.com", subject="ping",
+            contact_id="principal", state="RECEIVED",
+        )
+        headers[str(i)] = _header_blob(msgid)
+    # UID 10 is genuinely new.
+    headers["10"] = _header_blob("<new@example.com>")
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    stub = _StubIMAP(
+        search_replies=[("OK", [str(i).encode("ascii") for i in range(1, 11)])],
+        headers_by_uid=headers,
+    )
+    asyncio.run(watcher._catch_up(stub))
+
+    # First fetched_uids entry is the batch dedup (comma-separated).
+    # The slow path runs only for UID 10 (multiple fetches against
+    # UID 10 are fine — _fetch_and_record may itself fetch the body
+    # via the principal-agent path).
+    assert "," in stub.fetched_uids[0]  # batch
+    slow_path_uids = {u for u in stub.fetched_uids if "," not in u}
+    assert slow_path_uids == {"10"}
+
+
+def test_batch_dedup_skipped_below_threshold(tmp_path: Path) -> None:
+    """With fewer than CATCHUP_BATCH_DEDUP_MIN_CANDIDATES UIDs, the
+    pre-filter is bypassed (parse overhead isn't worth the win on
+    tiny windows). The slow path runs as before."""
+    watcher, state = _make_watcher(tmp_path)
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    headers = {str(i): _header_blob(f"<msg-{i}@example.com>") for i in range(1, 4)}
+    stub = _StubIMAP(
+        search_replies=[("OK", [b"1", b"2", b"3"])],
+        headers_by_uid=headers,
+    )
+    asyncio.run(watcher._catch_up(stub))
+
+    # No comma in any fetched_uids entry → no batch fetch happened.
+    assert all("," not in u for u in stub.fetched_uids)
+    # All three UIDs were touched by the slow path (multiple fetches
+    # per UID is fine — _fetch_and_record may also pull the body).
+    assert {"1", "2", "3"} <= set(stub.fetched_uids)
+
+
+def test_batch_dedup_failure_falls_back_to_slow_path(tmp_path: Path) -> None:
+    """A failing batch dedup fetch must not break catchup — the slow
+    per-UID path should still run for every candidate. This is the
+    safety net that lets us ship the optimisation without making it
+    load-bearing."""
+    watcher, state = _make_watcher(tmp_path)
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    # 8 candidates, none known to state-db. Stub will return "NO" on
+    # the batch dedup attempt (simulating a transient IMAP error or
+    # an unsupported FETCH spec on this server). Slow path must still
+    # process all 8.
+    class _BatchFailingStub(_StubIMAP):
+        async def uid(self, verb: str, uid: str, spec: str):
+            if "," in uid:
+                return ("NO", [])  # batch failure
+            return await super().uid(verb, uid, spec)
+
+    headers = {str(i): _header_blob(f"<msg-{i}@example.com>") for i in range(1, 9)}
+    stub = _BatchFailingStub(
+        search_replies=[("OK", [str(i).encode("ascii") for i in range(1, 9)])],
+        headers_by_uid=headers,
+    )
+    asyncio.run(watcher._catch_up(stub))
+
+    # All 8 messages should have been processed via the slow path.
+    for i in range(1, 9):
+        assert state.message_exists(f"<msg-{i}@example.com>")
+
+
+def test_batch_dedup_logs_skip_events_per_uid(tmp_path: Path) -> None:
+    """Telemetry parity: the new batch path should still emit one
+    catchup_skipped_existing event per known UID so existing log
+    diffing/alerting tools keep working. Plus a single
+    catchup_batch_dedup summary event."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    state = State(db_path=tmp_path / "state.db")
+    inbox = _make_inbox()
+    config = _make_config(tmp_path)
+    logger = JSONLLogger(log_dir)
+    watcher = InboxWatcher(
+        inbox=inbox, config=config, state=state, logger=logger,
+    )
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    # 10 candidates, 8 known.
+    headers: dict[str, bytes] = {}
+    for i in range(1, 9):
+        msgid = f"<known-{i}@example.com>"
+        state.record_message(
+            message_id=msgid, inbox="nightjar",
+            from_addr="me@example.com", subject="ping",
+            contact_id="principal", state="RECEIVED",
+        )
+        headers[str(i)] = _header_blob(msgid)
+    for i in (9, 10):
+        headers[str(i)] = _header_blob(f"<new-{i}@example.com>")
+
+    stub = _StubIMAP(
+        search_replies=[("OK", [str(i).encode("ascii") for i in range(1, 11)])],
+        headers_by_uid=headers,
+    )
+    asyncio.run(watcher._catch_up(stub))
+
+    events = _read_jsonl_events(log_dir)
+    # 8 per-UID skip events, all marked detail=batch_dedup.
+    skip_events = [e for e in events if e.get("event") == "catchup_skipped_existing"
+                   and e.get("detail") == "batch_dedup"]
+    assert len(skip_events) == 8
+    # One summary event with the right totals.
+    summary = [e for e in events if e.get("event") == "catchup_batch_dedup"]
+    assert len(summary) == 1
+    assert summary[0]["candidates"] == 10
+    assert summary[0]["pre_filtered"] == 8
+    assert summary[0]["remaining"] == 2
+
+
+def test_batch_dedup_skipped_count_in_catchup_complete(tmp_path: Path) -> None:
+    """The catchup_complete event's `skipped` total must include
+    batch-dedup skips, not just per-UID dedup skips. Otherwise an
+    operator looking at the telemetry would see candidates=N,
+    processed=0, skipped=0 and wonder where the work went."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    state = State(db_path=tmp_path / "state.db")
+    inbox = _make_inbox()
+    config = _make_config(tmp_path)
+    logger = JSONLLogger(log_dir)
+    watcher = InboxWatcher(
+        inbox=inbox, config=config, state=state, logger=logger,
+    )
+    state.set_last_catchup_at("nightjar", int(time.time()) - 60)
+
+    # 10 known, 0 new.
+    headers: dict[str, bytes] = {}
+    for i in range(1, 11):
+        msgid = f"<known-{i}@example.com>"
+        state.record_message(
+            message_id=msgid, inbox="nightjar",
+            from_addr="me@example.com", subject="ping",
+            contact_id="principal", state="RECEIVED",
+        )
+        headers[str(i)] = _header_blob(msgid)
+
+    stub = _StubIMAP(
+        search_replies=[("OK", [str(i).encode("ascii") for i in range(1, 11)])],
+        headers_by_uid=headers,
+    )
+    asyncio.run(watcher._catch_up(stub))
+
+    events = _read_jsonl_events(log_dir)
+    complete = [e for e in events if e.get("event") == "catchup_complete"]
+    assert len(complete) == 1
+    assert complete[0]["candidates"] == 10
+    assert complete[0]["processed"] == 0
+    assert complete[0]["skipped"] == 10  # all 10 came via batch dedup
+    assert complete[0]["errors"] == 0

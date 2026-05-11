@@ -1390,3 +1390,61 @@ def test_contact_rejects_duplicate_project(tmp_path: Path) -> None:
     """)
     with pytest.raises(ConfigError, match="duplicate project"):
         load_config(path)
+
+
+# ---- [agent.dispatch] section --------------------------------------------
+
+
+def test_agent_dispatch_section_absent_uses_defaults(tmp_path: Path) -> None:
+    """No [agent.dispatch] = no deferral. Backwards compat."""
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path))
+    cfg = load_config(path)
+    assert cfg.agent.dispatch.defer_when_gaming_mode is False
+    assert cfg.agent.dispatch.defer_when_load_above == 0.0
+    assert cfg.agent.dispatch.defer_when_memavail_below_mb == 0
+
+
+def test_agent_dispatch_enable_gaming_mode(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [agent.dispatch]
+        defer_when_gaming_mode = true
+    """)
+    cfg = load_config(path)
+    assert cfg.agent.dispatch.defer_when_gaming_mode is True
+
+
+def test_agent_dispatch_full_policy(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [agent.dispatch]
+        defer_when_gaming_mode = true
+        defer_when_load_above = 4.0
+        defer_when_memavail_below_mb = 2048
+    """)
+    cfg = load_config(path)
+    p = cfg.agent.dispatch
+    assert p.defer_when_gaming_mode is True
+    assert p.defer_when_load_above == 4.0
+    assert p.defer_when_memavail_below_mb == 2048
+
+
+def test_agent_dispatch_rejects_bad_load_value(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [agent.dispatch]
+        defer_when_load_above = nope
+    """)
+    with pytest.raises(ConfigError, match="defer_when_load_above"):
+        load_config(path)
+
+
+def test_agent_dispatch_rejects_bad_mem_value(tmp_path: Path) -> None:
+    write_principal(tmp_path)
+    path = write_conf(tmp_path, _minimal_inbox_block(tmp_path) + """
+        [agent.dispatch]
+        defer_when_memavail_below_mb = lots
+    """)
+    with pytest.raises(ConfigError, match="defer_when_memavail_below_mb"):
+        load_config(path)

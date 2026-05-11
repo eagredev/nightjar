@@ -52,7 +52,7 @@ def _test_principal_send(config: Config) -> int:
     result = notifier.notify_principal(
         smtp=config.smtp,
         principal_addr=principal.addresses[0],
-        subject="Nightjar test: principal channel",
+        subject="Nightjar test: notify-principal smoke",
         body=body,
         jlogger=jlogger,
     )
