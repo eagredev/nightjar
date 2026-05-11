@@ -234,6 +234,31 @@ Rules enforced at tool-call time:
 - Completed-path-only: if the run errors or is killed before
   finishing, attachments are NOT sent.
 
+### ...convert a markdown file before attaching it to the principal?
+
+Use the `render_markdown` MCP tool when the principal will be
+reading on a phone and the source is `.md`. Mobile mail clients do
+not render markdown (raw `#` and `-` arrive as literal characters);
+HTML renders inline.
+
+```
+render_markdown(input_path="/abs/path/in.md", format="html")
+  -> returns "/tmp/nightjar-render-<uuid>.html"
+```
+
+Then pass the returned path to `attach_to_reply`. Do NOT call this
+for every attachment — only when format conversion is genuinely
+useful. If the principal asked for the raw `.md`, attach the raw
+`.md`.
+
+Formats:
+- `"html"` — recommended for phone reading. Standalone document
+  with inline CSS sized for mobile.
+- `"text"` — strip markdown syntax to plain prose. Rarely useful;
+  fallback for clients that mangle HTML.
+- `"pdf"` — requires `wkhtmltopdf`. Returns an `isError` result if
+  the binary is missing — use `"html"` in that case.
+
 ### ...send mail from a non-Nightjar address?
 
 The daemon will only send to the principal. Anything else, you
@@ -719,6 +744,7 @@ async def execute(
     # reads that file after claude exits and prefers its body+subject
     # over the legacy "last assistant text block" reply.
     mcp_script = Path(__file__).parent / "compose_reply_mcp.py"
+    render_script = Path(__file__).parent / "render_markdown_mcp.py"
     mcp_config = json.dumps({
         "mcpServers": {
             "nightjar-reply": {
@@ -729,6 +755,11 @@ async def execute(
                     "NIGHTJAR_COMPOSE_REPLY_LOG": str(compose_reply_log_path),
                     "NIGHTJAR_ATTACHMENTS_LOG": str(attachments_log_path),
                 },
+            },
+            "nightjar-render": {
+                "type": "stdio",
+                "command": "python3",
+                "args": [str(render_script)],
             },
         },
     })
