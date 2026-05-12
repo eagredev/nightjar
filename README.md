@@ -7,6 +7,11 @@ means to use AI seriously.
 > motionless. It hunts at the edges of light, audible only when it
 > chooses to be. The software here is meant to behave the same way.
 
+Built in spare time as a serious investigation of what it would take
+to let an LLM agent act on someone's behalf without surrendering the
+safety properties that make personal email trustworthy. Not a
+product, not a hobby. The detailed reasoning is below.
+
 ---
 
 ## What this is
@@ -443,11 +448,12 @@ What works:
 - Closed-circuit testing harness (`tools/sim_harness.py`) for
   red-team probes and regression sweeps without touching the inbox.
 
-Active development has moved to a private adjacent project. Same
-problem domain, different shape, not ready to talk about yet. This
-repo stays as a working record of what Phase 1 became; it is not
-abandoned, but it is not actively extended either. Issues and pull
-requests are welcome but may receive only ad-hoc attention.
+Active development has moved to a research-flavoured continuation
+of the same problem space, focused on how an agent should ask
+permission for high-stakes actions when the operator can't be
+trusted to read every prompt carefully. It's not ready to talk about
+publicly. The Phase 1 work in this repo stands on its own. Issues
+and pull requests are welcome but may receive only ad-hoc attention.
 
 ---
 
