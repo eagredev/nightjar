@@ -6,6 +6,12 @@ requires-python = ">=3.13"
 dependencies = [
     "aioimaplib>=2.0.0",
     "anthropic>=0.40.0",
+    # inkmd: pure-Python markdown -> PDF compiler.
+    # Used by daemon/render_markdown_mcp.py for the PDF format.
+    # Not yet on PyPI (v0.1.0 unreleased); install editable from a
+    # local checkout: pip install -e ~/inkmd. Bump to a real version
+    # pin (e.g. "inkmd>=0.1") once published.
+    "inkmd",
 ]
 
 [project.optional-dependencies]

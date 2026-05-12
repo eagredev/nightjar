@@ -112,14 +112,38 @@ def test_render_file_unwritable_output_dir_raises(tmp_path: Path) -> None:
         rm.render_file(str(src), "html", "/nonexistent-dir-xyz/out.html")
 
 
-def test_render_file_pdf_without_wkhtmltopdf_raises_RenderError(
+def test_render_file_pdf_produces_valid_pdf(tmp_path: Path) -> None:
+    src = tmp_path / "in.md"
+    src.write_text("# Hi\n\nA paragraph.\n")
+    target = tmp_path / "out.pdf"
+    out = rm.render_file(str(src), "pdf", str(target))
+    assert out == str(target)
+    assert target.exists()
+    head = target.read_bytes()[:5]
+    assert head == b"%PDF-", f"not a PDF header: {head!r}"
+
+
+def test_render_file_pdf_without_inkmd_raises_RenderError(
     tmp_path: Path,
 ) -> None:
+    """If inkmd is uninstalled (e.g. on a fresh checkout that hasn't
+    yet pulled the dep), the PDF path surfaces a clean RenderError
+    rather than a bare ImportError."""
     src = tmp_path / "in.md"
     src.write_text("# Hi\n")
     target = tmp_path / "out.pdf"
-    with mock.patch.object(rm.shutil, "which", return_value=None):
-        with pytest.raises(rm.RenderError, match="wkhtmltopdf not installed"):
+
+    real_import = __builtins__["__import__"] if isinstance(
+        __builtins__, dict,
+    ) else __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "inkmd":
+            raise ImportError("forced for test")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        with pytest.raises(rm.RenderError, match="inkmd not installed"):
             rm.render_file(str(src), "pdf", str(target))
 
 

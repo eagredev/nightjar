@@ -256,8 +256,9 @@ Formats:
   with inline CSS sized for mobile.
 - `"text"` — strip markdown syntax to plain prose. Rarely useful;
   fallback for clients that mangle HTML.
-- `"pdf"` — requires `wkhtmltopdf`. Returns an `isError` result if
-  the binary is missing — use `"html"` in that case.
+- `"pdf"` — pure-Python rendering via `inkmd`. No system binary
+  required; produces deterministic, kerned PDFs. Good for things
+  the principal might want to print, archive, or hash.
 
 ### ...send mail from a non-Nightjar address?
 

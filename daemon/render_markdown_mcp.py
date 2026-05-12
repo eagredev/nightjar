@@ -14,10 +14,10 @@ no daemon round-trip. Keeping it isolated means it can ship without
 touching the reply contract and can be used standalone via the
 CLI mode for humans and tests.
 
-Stdlib only on the critical path. The `markdown` package is used
-when importable for higher-fidelity HTML; otherwise a stdlib
-fallback renderer fires. PDF output shells out to wkhtmltopdf and
-returns a clear error when the binary is absent.
+Stdlib only on the critical path for HTML and text. The `markdown`
+package is used when importable for higher-fidelity HTML; otherwise
+a stdlib fallback renderer fires. PDF output goes through
+``inkmd.compile`` — pure-Python, no system binary, deterministic.
 """
 from __future__ import annotations
 
@@ -26,9 +26,7 @@ import html as html_lib
 import json
 import os
 import re
-import shutil
 import stat as stat_mod
-import subprocess
 import sys
 import tempfile
 import uuid
@@ -62,11 +60,12 @@ RENDER_MARKDOWN_TOOL_SCHEMA = {
         "raw .md.\n"
         "\n"
         "Formats: 'html' (recommended for phone reading), 'text' "
-        "(strip markdown syntax), 'pdf' (requires wkhtmltopdf; "
-        "returns an error if missing — use html in that case). "
-        "Output is written to a /tmp tempfile by default; supply "
-        "output_path for a specific destination. Pass the returned "
-        "path to attach_to_reply to send the rendered file."
+        "(strip markdown syntax), 'pdf' (pure-Python via inkmd; "
+        "produces deterministic, kerned PDFs with no system "
+        "dependency). Output is written to a /tmp tempfile by "
+        "default; supply output_path for a specific destination. "
+        "Pass the returned path to attach_to_reply to send the "
+        "rendered file."
     ),
     "inputSchema": {
         "type": "object",
@@ -335,31 +334,26 @@ def _render_markdown_to_text(md_text: str) -> str:
 
 
 def _render_markdown_to_pdf(md_text: str, title: str, output_path: str) -> None:
-    """Render markdown -> HTML -> PDF via wkhtmltopdf.
+    """Render markdown -> PDF via inkmd (pure Python, no system deps).
 
-    Raises FileNotFoundError if wkhtmltopdf is not on PATH (caller
-    converts this to an isError tool result). Raises
-    subprocess.CalledProcessError if the conversion itself fails.
+    The ``title`` arg is currently unused: inkmd doesn't accept a
+    document title and the file's content provides its own headings.
+    Kept in the signature for parity with the HTML / text helpers and
+    for forward-compat when inkmd grows a title field.
     """
-    if shutil.which("wkhtmltopdf") is None:
-        raise FileNotFoundError("wkhtmltopdf")
-    html = _render_markdown_to_html(md_text, title)
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".html", delete=False, encoding="utf-8",
-    ) as fh:
-        fh.write(html)
-        html_path = fh.name
+    del title  # see docstring
     try:
-        subprocess.run(
-            ["wkhtmltopdf", "--quiet", html_path, output_path],
-            check=True,
-            capture_output=True,
-        )
-    finally:
-        try:
-            os.unlink(html_path)
-        except OSError:
-            pass
+        import inkmd
+    except ImportError as exc:
+        raise RenderError(
+            "inkmd not installed in this Python environment; "
+            "PDF rendering unavailable. Install with "
+            "`pip install inkmd` (or pip-install the local "
+            "checkout). HTML and text formats still work."
+        ) from exc
+    pdf_bytes = inkmd.compile(md_text)
+    with open(output_path, "wb") as fh:
+        fh.write(pdf_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -453,20 +447,7 @@ def render_file(input_path: str, fmt: str, output_path: str | None) -> str:
         with open(output_path, "w", encoding="utf-8") as fh:
             fh.write(text)
     elif fmt == "pdf":
-        try:
-            _render_markdown_to_pdf(md_text, title, output_path)
-        except FileNotFoundError:
-            raise RenderError(
-                "wkhtmltopdf not installed; render to html or text "
-                "instead. On Arch/SteamOS, install via pacman or a "
-                "flatpak; on the immutable rootfs you may need an "
-                "overlay or a flatpak."
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-            raise RenderError(
-                f"wkhtmltopdf failed (exit {exc.returncode}): {stderr.strip() or 'no stderr'}"
-            )
+        _render_markdown_to_pdf(md_text, title, output_path)
     return output_path
 
 

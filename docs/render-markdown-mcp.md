@@ -87,17 +87,19 @@ render_markdown(input_path, format, output_path?)
 
 ### PDF
 
-- Implementation: shell out to `wkhtmltopdf` reading the HTML
-  pipeline's output. This means PDF = HTML rendered first, then
-  printed. No second markdown→PDF path.
-- If `wkhtmltopdf` is not on PATH at tool-call time, return
-  `isError: true` with text:
-  `"wkhtmltopdf not installed; render to html or text instead."`
-  No silent fallback to HTML — the agent asked for PDF, and a
-  silent fallback would surprise the principal.
-- Document the install hint in the error: on Arch / SteamOS,
-  `pacman -S wkhtmltopdf`; user is on the immutable rootfs so they
-  may need a flatpak or pacman-with-overlay route.
+- Implementation: `inkmd.compile(md_text)`. inkmd is a sister
+  project at `~/inkmd/` (eventually `github.com/eagredev/inkmd`,
+  PyPI `inkmd`) — pure-Python, zero system dependencies, MIT
+  licensed, deterministic byte-identical output. Replaces the
+  earlier wkhtmltopdf shell-out, which required a 50MB binary
+  abandoned upstream since 2023 and didn't survive the immutable
+  SteamOS rootfs.
+- inkmd is a regular Python dep declared in `pyproject.toml`. On
+  any host with Nightjar's Python env, PDF "just works."
+- If `import inkmd` fails (fresh checkout that hasn't pulled the
+  dep), the PDF path raises `RenderError("inkmd not installed...")`
+  surfaced as `isError: true` so the agent can fall back to HTML.
+  No silent fallback — the agent asked for PDF.
 
 ## Server registration
 
@@ -141,8 +143,7 @@ attachment — only when format conversion is genuinely useful. If the
 principal asked for the raw .md, attach the raw .md.
 
 Formats: "html" (default for phone reading), "text" (strip syntax),
-"pdf" (requires wkhtmltopdf; returns an error if missing — use html
-in that case).
+"pdf" (pure-Python via inkmd; deterministic, kerned, no system dep).
 ```
 
 The phrase "Do NOT call this for every attachment" enforces the
@@ -171,9 +172,9 @@ shape as `compose_reply_mcp.py`).
   at tool-call time. Same fail-at-the-boundary as `attach_to_reply`.
 - **Output path's parent directory missing** → JSON-RPC error.
 - **`format` not in {html, text, pdf}** → JSON-RPC error.
-- **PDF requested, `wkhtmltopdf` missing** → tool result `isError`
-  with install hint. Agent should fall back to HTML or surface the
-  problem to the principal.
+- **PDF requested, `inkmd` not importable** → tool result `isError`
+  with "inkmd not installed" hint. Agent should fall back to HTML
+  or surface the problem to the principal.
 - **`markdown` package missing** → stdlib fallback fires silently
   (logged once to stderr). Not an error; just lower-fidelity HTML.
 - **Output already exists at chosen path** → overwrite. The default
@@ -190,8 +191,9 @@ New test file: `tests/test_render_markdown_mcp.py`. Covers:
 1. CLI mode: convert known markdown → HTML, assert output contains
    expected tags.
 2. CLI mode: convert → text, assert markdown delimiters are stripped.
-3. CLI mode: convert → pdf with `wkhtmltopdf` absent (mock by
-   patching `shutil.which`), assert non-zero exit and clear error.
+3. PDF rendering: convert markdown → PDF, assert output starts
+   with the %PDF- byte sequence. Plus a separate test that mocks
+   `import inkmd` to fail and asserts RenderError surfaces.
 4. MCP mode: drive the stdio JSON-RPC loop directly with three
    fixtures (init → tools/list → tools/call), assert the returned
    path exists and is readable.
