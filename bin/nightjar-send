@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Launcher for the nightjar-send CLI. Uses the project venv if present.
+# Resolves through symlinks so a `~/.local/bin/nightjar-send` symlink works.
+set -euo pipefail
+SCRIPT="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+cd "$ROOT"
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    exec "$ROOT/.venv/bin/python" -m daemon.send_cli "$@"
+else
+    exec python3 -m daemon.send_cli "$@"
+fi
